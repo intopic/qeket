@@ -74,9 +74,12 @@ jobs:
         env:
           RPC_URL: http://127.0.0.1:8899
         run: |
-          solana-test-validator --bind-address 127.0.0.1 --ledger "$RUNNER_TEMP/ledger" --mint "$RUNNER_TEMP/devnet-keys/payer" > "$RUNNER_TEMP/validator.log" 2>&1 &
-          trap 'kill "$!" 2>/dev/null || true' EXIT
+          sudo sysctl -w kernel.io_uring_disabled=0
+          solana-test-validator --bind-address 127.0.0.1 --ledger "$RUNNER_TEMP/ledger" --mint "$(solana-keygen pubkey "$RUNNER_TEMP/devnet-keys/payer")" > "$RUNNER_TEMP/validator.log" 2>&1 &
+          validator=$!
+          trap 'tail -40 "$RUNNER_TEMP/validator.log"; tail -40 "$RUNNER_TEMP/ledger/validator.log" || true; kill "$validator" 2>/dev/null || true' EXIT
           for i in {1..90}; do
+            kill -0 "$validator" || exit 1
             if solana -u "$RPC_URL" slot >/dev/null 2>&1; then break; fi
             sleep 1
           done
