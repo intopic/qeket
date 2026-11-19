@@ -63,7 +63,7 @@ def finalized(sig):
 
 def receipt(label, sig):
     finalized(sig)
-    url = f"https://explorer.solana.com/tx/{sig}?cluster=devnet"
+    url = f"https://explorer.solana.com/tx/{sig}?cluster=devnet" if os.environ.get("GITHUB_EVENT_NAME") != "push" else sig
     with (OUT / "transactions.md").open("a") as f:
         print(f"- [{label}]({url})", file=f)
     return sig
@@ -83,7 +83,8 @@ def account(value):
 
 
 def run():
-    if rpc("getGenesisHash") != GENESIS:
+    rehearsal = os.environ.get("GITHUB_EVENT_NAME") == "push" and os.environ.get("RPC_URL") == "http://127.0.0.1:8899"
+    if not rehearsal and rpc("getGenesisHash") != GENESIS:
         raise ValueError("expected Devnet")
     OUT.mkdir(parents=True, exist_ok=True)
     gate, target, buf, payer, counter, traffic = [key(n).pubkey() for n in ("gate","target","buffer","payer","counter","traffic")]
@@ -119,6 +120,10 @@ def run():
         if sigs:
             receipt("program verified: "+name, sigs[0]["signature"])
     cli("write buffer", ["program","write-buffer",candidate,"--buffer",PRIVATE/"buffer","--use-rpc"])
+    for _ in range(90):
+        if get(buf):
+            break
+        time.sleep(1)
     cfg, pd = pda(b"gatekeeper_cfg",target), pda(target,owner=loader)
     votes = [key("vote"+str(i)) for i in range(3)]
     span = 96

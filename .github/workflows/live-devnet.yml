@@ -35,6 +35,11 @@ jobs:
           test -n "$RPC_URL" && test -n "$DEVNET_PAYER" || { echo "Set RPC_URL and DEVNET_PAYER in Actions secrets"; exit 1; }
           umask 077
           python scripts/live_cycle.py prepare
+      - name: Prepare disposable validator identities
+        if: github.event_name == 'push'
+        run: |
+          umask 077
+          DEVNET_PAYER="$(python -c 'from solders.keypair import Keypair;print(Keypair().to_json())')" python scripts/live_cycle.py prepare
       - name: Prepare pinned platform tools
         run: |
           rustup toolchain install 1.95.0 --profile minimal
@@ -58,13 +63,24 @@ jobs:
           cargo +"$CANARY_SBF_TOOLCHAIN" build --offline --locked --target sbpf-solana-solana --release -p canary-upgrade-gate
           cargo build --offline --locked -p svm-canary-runner
           python -m py_compile scripts/live_capture.py scripts/live_cycle.py
-      - name: Install Devnet deploy CLI
-        if: github.event_name == 'workflow_dispatch'
+      - name: Install deploy CLI
         run: |
           curl -fsSL --retry 3 https://github.com/anza-xyz/agave/releases/download/v2.3.13/solana-release-x86_64-unknown-linux-gnu.tar.bz2 -o "$RUNNER_TEMP/cli.tbz"
           echo "c43539ebdf6942472e8b87635d6ea55f428a51e3d0219f7b6f720fc6b19fade0  $RUNNER_TEMP/cli.tbz" | sha256sum -c -
           tar xf "$RUNNER_TEMP/cli.tbz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"
+      - name: Rehearse complete cycle on disposable validator
+        if: github.event_name == 'push'
+        env:
+          RPC_URL: http://127.0.0.1:8899
+        run: |
+          solana-test-validator --bind-address 127.0.0.1 --ledger "$RUNNER_TEMP/ledger" --mint "$RUNNER_TEMP/devnet-keys/payer" > "$RUNNER_TEMP/validator.log" 2>&1 &
+          trap 'kill "$!" 2>/dev/null || true' EXIT
+          for i in {1..90}; do
+            if solana -u "$RPC_URL" slot >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          python scripts/live_cycle.py run
       - name: Run finalized cycle
         if: github.event_name == 'workflow_dispatch'
         env:
