@@ -8,6 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from solders.compute_budget import set_compute_unit_limit
 from solders.hash import Hash
 from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
@@ -107,7 +108,8 @@ def run():
     gate_so = ROOT/"target/sbpf-solana-solana/release/canary_upgrade_gate.so"
     for name, address, binary in [("gate",gate,gate_so),("target",target,base)]:
         if not get(address):
-            cli("deploy "+name, ["program","deploy",binary,"--program-id",PRIVATE/name,"--use-rpc"])
+            capacity = max(base.stat().st_size, candidate.stat().st_size) if name == "target" else binary.stat().st_size
+            cli("deploy "+name, ["program","deploy",binary,"--max-len",str(capacity),"--program-id",PRIVATE/name,"--use-rpc"])
             for _ in range(90):
                 if get(address):
                     break
@@ -173,8 +175,13 @@ def run():
         msg=b"CANARY_GATE_M1__"+bytes(target)+bytes(8)+bytes(buf)+pack("<QQ",start,span)+sha+bytes(evidence["diff_root"])+pack("<IIHQ",1,0,evidence["max_cu_delta_bps"],rpc("getSlot",FINAL)+500)
         ed=Instruction(Pubkey.from_string("Ed25519SigVerify111111111111111111111111111"),pack("<BB7H",1,0,48,65535,16,65535,112,len(msg),65535)+bytes(voter.pubkey())+bytes(voter.sign_message(msg))+msg,[])
         send("submit_verified_attestation",[ed,ix("submit_verified_attestation",[meta(cfg),meta(proposal,True),meta(Pubkey.from_string("Sysvar1nstructions1111111111111111111111111"))])])
-    time.sleep(6)
-    send("execute_gated_upgrade",[ix("execute_gated_upgrade",[meta(cfg),meta(proposal,True),meta(target,True),meta(pd,True),meta(buf,True),meta(payer,True),meta(Pubkey.from_string("SysvarRent111111111111111111111111111111111")),meta(clock_id),meta(loader)])])
+    ready_at = struct.unpack_from("<q",base64.b64decode(get(proposal)["data"][0]),-9)[0]
+    deadline = time.monotonic() + 120
+    while struct.unpack("<QqQQq",base64.b64decode(get(clock_id)["data"][0]))[-1] < ready_at + 5:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("finalized clock did not reach proposal timelock")
+        time.sleep(1)
+    send("execute_gated_upgrade",[set_compute_unit_limit(1_400_000),ix("execute_gated_upgrade",[meta(cfg),meta(proposal,True),meta(target,True),meta(pd,True),meta(buf,True),meta(payer,True),meta(Pubkey.from_string("SysvarRent111111111111111111111111111111111")),meta(clock_id),meta(loader)])])
     body=base64.b64decode(get(pd)["data"][0])[45:]
     if not body.startswith(rebuilt.read_bytes()) or any(body[rebuilt.stat().st_size:]):
         raise ValueError("final ProgramData mismatch")

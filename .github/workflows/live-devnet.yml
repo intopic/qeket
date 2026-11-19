@@ -102,7 +102,7 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
           if [ -n "$FLY_API_TOKEN" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"; fi
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200
         if: steps.fly.outputs.enabled == 'true'
       - name: Deploy proposal listener
         if: steps.fly.outputs.enabled == 'true'
@@ -115,4 +115,9 @@ jobs:
           app="${FLY_APP:-canary-$(echo "$gate" | cut -c1-16 | tr '[:upper:]' '[:lower:]')}"
           flyctl status -a "$app" >/dev/null 2>&1 || flyctl apps create "$app" --org personal
           printf 'RPC_URL=%s\nGATE_PROGRAM_ID=%s\n' "$RPC_URL" "$gate" | flyctl secrets import --stage -a "$app"
+          context="$RUNNER_TEMP/fly-worker"
+          mkdir -p "$context/scripts" "$context/deploy/fly"
+          cp scripts/{devnet,live_capture}.py "$context/scripts/"
+          cp deploy/fly/* "$context/deploy/fly/"
+          cd "$context"
           flyctl deploy --ha=false --remote-only -c deploy/fly/fly.toml -a "$app"

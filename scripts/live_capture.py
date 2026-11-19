@@ -8,6 +8,7 @@ import re
 import struct
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 from devnet import GATE, GENESIS, from_base58, to_base58
@@ -21,13 +22,25 @@ def rpc(method, *params):
     request = urllib.request.Request(os.environ["RPC_URL"], json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": method, "params": params
     }).encode(), {"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=45) as response:
-        data = response.read(32 * 1024 * 1024 + 1)
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                data = response.read(32 * 1024 * 1024 + 1)
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == 4:
+                raise RuntimeError(f"{method}: HTTP {exc.code}") from None
+        except (TimeoutError, urllib.error.URLError):
+            if attempt == 4:
+                raise RuntimeError(f"{method}: endpoint unavailable") from None
+        time.sleep(2 ** attempt)
     if len(data) > 32 * 1024 * 1024:
         raise ValueError("RPC response exceeds capture limit")
     result = json.loads(data)
     if "error" in result:
-        raise RuntimeError(f"{method} returned RPC error {result['error']['code']}")
+        err = result["error"]
+        logs = (err.get("data") or {}).get("logs") if isinstance(err.get("data"), dict) else None
+        raise RuntimeError(f"{method}: {err.get('code')} {err.get('message')}, logs={logs}")
     return result["result"]
 
 
