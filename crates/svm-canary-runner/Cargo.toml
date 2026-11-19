@@ -13,6 +13,9 @@ anchor-lang.workspace = true
 canary-types.workspace = true
 canary-upgrade-gate = { path = "../../programs/canary_upgrade_gate", features = ["no-entrypoint"] }
 litesvm = "=0.7.1"
+solana-sdk-ids = "=2.2.1"
+solana-compute-budget-interface = "=2.2.2"
+solana-message = "=2.4.0"
 solana-keypair = "=2.2.3"
 solana-signer = "=2.2.1"
 solana-transaction = { version = "=2.2.3", features = ["bincode"] }

@@ -35,6 +35,8 @@ pub struct ProposeBufferUpgrade<'info> {
     #[account(init, payer = payer, space = 8 + UpgradeProposal::INIT_SPACE,
         seeds = [b"proposal", config.target_program.as_ref(), &config.proposal_nonce.to_le_bytes()[..]], bump)]
     pub proposal: Account<'info, UpgradeProposal>,
+    #[account(init, payer = payer, space = 8, seeds = [b"buffer", config.key().as_ref(), buffer.key().as_ref()], bump)]
+    pub reservation: Account<'info, BufferReservation>,
     pub system_program: Program<'info, System>,
 }
 
@@ -114,6 +116,8 @@ pub struct CloseProposal<'info> {
     pub config: Account<'info, GatekeeperConfig>,
     #[account(mut, close = spill, seeds = [b"proposal", config.target_program.as_ref(), &proposal.nonce.to_le_bytes()[..]], bump = proposal.bump)]
     pub proposal: Account<'info, UpgradeProposal>,
+    #[account(mut, close = spill, seeds = [b"buffer", config.key().as_ref(), proposal.buffer_account.as_ref()], bump)]
+    pub reservation: Account<'info, BufferReservation>,
     /// CHECK: fixed rent recipient.
     #[account(mut, address = proposal.spill_account)]
     pub spill: UncheckedAccount<'info>,
@@ -141,4 +145,68 @@ pub struct EmergencyUpgrade<'info> {
     /// CHECK: native executable loader.
     #[account(executable, address = loader::ID)]
     pub loader_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ReclaimBuffer<'info> {
+    pub governance_authority: Signer<'info>,
+    #[account(has_one = governance_authority, seeds = [b"gatekeeper_cfg", config.target_program.as_ref()], bump = config.bump)]
+    pub config: Account<'info, GatekeeperConfig>,
+    #[account(mut, seeds = [b"proposal", config.target_program.as_ref(), &proposal.nonce.to_le_bytes()[..]], bump = proposal.bump)]
+    pub proposal: Account<'info, UpgradeProposal>,
+    /// CHECK: proposal binds address and handler verifies live loader state.
+    #[account(mut, address = proposal.buffer_account)]
+    pub buffer: UncheckedAccount<'info>,
+    /// CHECK: fixed at proposal creation.
+    #[account(mut, address = proposal.spill_account)]
+    pub spill: UncheckedAccount<'info>,
+    /// CHECK: native loader.
+    #[account(executable, address = loader::ID)]
+    pub loader_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct QueueAuthority<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub governance_authority: Signer<'info>,
+    #[account(has_one = governance_authority, seeds = [b"gatekeeper_cfg", config.target_program.as_ref()], bump = config.bump)]
+    pub config: Account<'info, GatekeeperConfig>,
+    #[account(init, payer = payer, space = 8 + PendingAuthority::INIT_SPACE, seeds = [b"authority", config.key().as_ref()], bump)]
+    pub pending: Account<'info, PendingAuthority>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ResolveAuthority<'info> {
+    pub governance_authority: Signer<'info>,
+    #[account(mut, has_one = governance_authority, seeds = [b"gatekeeper_cfg", config.target_program.as_ref()], bump = config.bump)]
+    pub config: Account<'info, GatekeeperConfig>,
+    #[account(mut, close = refund, has_one = refund, seeds = [b"authority", config.key().as_ref()], bump)]
+    pub pending: Account<'info, PendingAuthority>,
+    /// CHECK: fixed original payer.
+    #[account(mut)]
+    pub refund: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RotateAuthority<'info> {
+    pub change: ResolveAuthority<'info>,
+    pub candidate: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct TransferProgramAuthority<'info> {
+    pub authority: Signer<'info>,
+    #[account(mut, seeds = [b"gatekeeper_cfg", config.target_program.as_ref()], bump = config.bump)]
+    pub config: Account<'info, GatekeeperConfig>,
+    pub candidate: Signer<'info>,
+    #[account(mut, address = loader::get_program_data_address(&config.target_program),
+        constraint = program_data.upgrade_authority_address == Some(config.key()) @ GateError::WrongAuthority)]
+    pub program_data: Account<'info, ProgramData>,
+    /// CHECK: native loader.
+    #[account(executable, address = loader::ID)]
+    pub loader_program: UncheckedAccount<'info>,
+    #[account(seeds = [b"authority", config.key().as_ref()], bump)]
+    pub pending: Option<Account<'info, PendingAuthority>>,
 }

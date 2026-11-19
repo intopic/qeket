@@ -9,7 +9,7 @@ use anchor_lang::{
     AccountDeserialize, AnchorSerialize, InstructionData, ToAccountMetas,
 };
 use anyhow::{anyhow, ensure, Context, Result};
-use canary_types::{CanaryAttestationPayload, DOMAIN};
+use canary_types::CanaryAttestationPayload;
 use canary_upgrade_gate::{
     accounts, instruction,
     state::{GatekeeperConfig, Policy, ProposalStatus, UpgradeProposal},
@@ -104,6 +104,46 @@ fn traffic(target: Pubkey, baseline: &[u8], archive: &mut Archive) -> Result<()>
     for (key, a) in &archive.accounts {
         source.set_account(*key, a.clone())?;
     }
+    let router = Pubkey::new_from_array([74; 32]);
+    let programdata_address = loader::get_program_data_address(&router);
+    let mut bytes = bincode::serialize(&loader::UpgradeableLoaderState::ProgramData {
+        slot: 0,
+        upgrade_authority_address: Some(payer.pubkey()),
+    })?;
+    bytes.extend_from_slice(baseline);
+    let executable = bincode::serialize(&loader::UpgradeableLoaderState::Program {
+        programdata_address,
+    })?;
+    let program_account = account(&source, loader::ID, executable, true);
+    let data_account = account(&source, loader::ID, bytes, false);
+    source.set_account(programdata_address, data_account.clone())?;
+    source.set_account(router, program_account.clone())?;
+    // Archive ordering deliberately differs from loader initialization order.
+    archive.accounts.extend([
+        (router, program_account),
+        (programdata_address, data_account),
+    ]);
+    let table_key = Pubkey::new_from_array([75; 32]);
+    let addresses = vec![counter, target];
+    use anchor_lang::solana_program::address_lookup_table::state::{
+        AddressLookupTable, LookupTableMeta,
+    };
+    let table = AddressLookupTable {
+        meta: LookupTableMeta::default(),
+        addresses: (&addresses[..]).into(),
+    };
+    let table_account = account(
+        &source,
+        solana_sdk_ids::address_lookup_table::ID,
+        table.serialize_for_tests()?,
+        false,
+    );
+    source.set_account(table_key, table_account.clone())?;
+    archive.accounts.push((table_key, table_account));
+    let lookup = solana_message::AddressLookupTableAccount {
+        key: table_key,
+        addresses,
+    };
     for i in 0..=archive.replay_slots {
         clock(&mut source, archive.anchor_slot + i, 1000 + i as i64);
         archive.clocks.push(source.get_sysvar());
@@ -111,12 +151,35 @@ fn traffic(target: Pubkey, baseline: &[u8], archive: &mut Archive) -> Result<()>
             let value = (i * 84 + u64::from(index) + 1).to_le_bytes();
             let instruction =
                 Instruction::new_with_bytes(target, &value, vec![AccountMeta::new(counter, false)]);
-            let tx = Transaction::new_signed_with_payer(
-                &[instruction],
-                Some(&payer.pubkey()),
-                &[&payer],
-                source.latest_blockhash(),
-            );
+            let tx = if index == 0 {
+                let router_ix = Instruction::new_with_bytes(
+                    router,
+                    &value,
+                    vec![
+                        AccountMeta::new(counter, false),
+                        AccountMeta::new_readonly(target, false),
+                    ],
+                );
+                let budget = solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(150_000);
+                let msg = solana_message::v0::Message::try_compile(
+                    &payer.pubkey(),
+                    &[budget, router_ix],
+                    std::slice::from_ref(&lookup),
+                    source.latest_blockhash(),
+                )?;
+                solana_transaction::versioned::VersionedTransaction::try_new(
+                    solana_message::VersionedMessage::V0(msg),
+                    &[&payer],
+                )?
+            } else {
+                Transaction::new_signed_with_payer(
+                    &[instruction],
+                    Some(&payer.pubkey()),
+                    &[&payer],
+                    source.latest_blockhash(),
+                )
+                .into()
+            };
             source
                 .send_transaction(tx.clone())
                 .map_err(|e| anyhow!("capturing baseline: {e:?}"))?;
@@ -184,6 +247,7 @@ pub fn run(
         *slot = node.pubkey();
     }
     let policy = Policy {
+        replay_mode: Default::default(),
         verifiers,
         verifier_count: 3,
         threshold: 2,
@@ -233,6 +297,11 @@ pub fn run(
                 program_data: pd,
                 buffer,
                 proposal,
+                reservation: Pubkey::find_program_address(
+                    &[b"buffer", cfg.as_ref(), buffer.as_ref()],
+                    &ID,
+                )
+                .0,
                 system_program: system_program::ID,
             },
             instruction::ProposeBufferUpgrade {
@@ -253,7 +322,10 @@ pub fn run(
         "wrong base program"
     );
     let mut archive = Archive {
-        format_version: 1,
+        format_version: 2,
+        replay_mode: config.policy.replay_mode,
+        slot_hashes: vec![],
+        absent_accounts: vec![],
         transaction_manifest: [0; 32],
         target: p.target_program,
         gate: cfg,
@@ -272,6 +344,7 @@ pub fn run(
         records: vec![],
     };
     traffic(target, baseline, &mut archive)?;
+    check_replay_modes(&archive, baseline, candidate)?;
     clock(&mut vm, 103, 1010);
     let execute = ix(
         accounts::ExecuteGatedUpgrade {
@@ -304,7 +377,7 @@ pub fn run(
             ensure!(previous == &evidence, "verifiers disagree");
         }
         let payload = CanaryAttestationPayload {
-            domain_separator: DOMAIN,
+            domain_separator: evidence.replay_mode.domain(),
             target_program: target,
             proposal_nonce: p.nonce,
             buffer_account: buffer,
@@ -387,6 +460,11 @@ pub fn run(
     );
     let close = ix(
         accounts::CloseProposal {
+            reservation: Pubkey::find_program_address(
+                &[b"buffer", cfg.as_ref(), buffer.as_ref()],
+                &ID,
+            )
+            .0,
             governance_authority: governance.pubkey(),
             config: cfg,
             proposal,
@@ -429,7 +507,9 @@ pub fn run(
         "archive_sha256":hex::encode(hash(&archive_bytes)), "gate_sha256":hex::encode(hash(gate)),
         "diff_root":hex::encode(evidence.diff_root),"replayed_transactions_per_verifier":evidence.replayed_tx_count,"max_cu_delta_bps":evidence.max_cu_delta_bps,
         "attestations_bytes_and_cu":measured,"execution_bytes":execution_bytes,"execution_cu":meta.compute_units_consumed,
-        "quorum":"2/3","deployed_program_data_verified":true,"candidate_invoked":true,"proposal_closed":true,"policy_rotation_checked":true,"emergency_checked":true});
+        "reclaim_cancelled_and_expired_checked":true, "authority_rotation_and_exit_checked":true,
+        "v0_alt_cpi_transactions":archive.records.iter().filter(|record| matches!(record.transaction.message, solana_message::VersionedMessage::V0(_))).count(),
+        "relaxed_mode_checked":true, "quorum":"2/3","deployed_program_data_verified":true,"candidate_invoked":true,"proposal_closed":true,"policy_rotation_checked":true,"emergency_checked":true});
     fs::create_dir_all(out)?;
     fs::write(
         out.join("vote-message.bin"),
@@ -456,9 +536,11 @@ fn check_governance(
     execute: &Instruction,
     close: &Instruction,
 ) -> Result<()> {
+    check_authorities(&vm, payer, gov, emergency, cfg, pd)?;
     let pending = Pubkey::find_program_address(&[b"policy", cfg.as_ref()], &ID).0;
     let mut new = policy.clone();
     new.threshold = 3;
+    new.proposal_expiry_seconds += 500;
     let queue = ix(
         accounts::QueuePolicy {
             payer: payer.pubkey(),
@@ -497,7 +579,64 @@ fn check_governance(
         },
         instruction::CancelProposal {},
     );
-    send(&mut vm, payer, &[gov], &[cancel, close.clone()])?;
+    let reclaim = ix(
+        accounts::ReclaimBuffer {
+            governance_authority: gov.pubkey(),
+            config: cfg,
+            proposal,
+            buffer,
+            spill: payer.pubkey(),
+            loader_program: loader::ID,
+        },
+        instruction::ReclaimBuffer {},
+    );
+    rejected(
+        send(&mut vm, payer, &[gov], std::slice::from_ref(&reclaim)),
+        "WrongStatus",
+    )?;
+    let mut expired = vm.clone();
+    clock(&mut expired, 700, 1600);
+    rejected(
+        send(&mut expired, payer, &[gov], std::slice::from_ref(&reclaim)),
+        "WrongStatus",
+    )?;
+    clock(&mut expired, 701, 1601);
+    send(&mut expired, payer, &[gov], std::slice::from_ref(&reclaim))?;
+    ensure!(
+        expired.get_account(&buffer).is_none(),
+        "expired buffer still exists"
+    );
+    let mut cancelled = vm.clone();
+    send(&mut cancelled, payer, &[gov], std::slice::from_ref(&cancel))?;
+    rejected(
+        send(&mut cancelled, payer, &[gov], std::slice::from_ref(close)),
+        "WrongStatus",
+    )?;
+    let before = cancelled.get_balance(&payer.pubkey()).unwrap();
+    let rent = cancelled.get_balance(&buffer).unwrap();
+    let (_, receipt) = send(
+        &mut cancelled,
+        payer,
+        &[gov],
+        std::slice::from_ref(&reclaim),
+    )?;
+    ensure!(
+        cancelled.get_balance(&payer.pubkey()) == Some(before + rent - 10_000)
+            && cancelled.get_account(&buffer).is_none()
+            && !receipt.inner_instructions.is_empty(),
+        "buffer rent refund mismatch"
+    );
+    rejected(
+        send(
+            &mut cancelled,
+            payer,
+            &[gov],
+            std::slice::from_ref(&reclaim),
+        ),
+        "WrongStatus",
+    )?;
+    send(&mut cancelled, payer, &[gov], std::slice::from_ref(close))?;
+    send(&mut vm, payer, &[gov], &[cancel])?;
     let recover = |signer| {
         ix(
             accounts::EmergencyUpgrade {
@@ -527,4 +666,205 @@ fn check_governance(
         "emergency upgrade missing"
     );
     Ok(())
+}
+
+fn check_authorities(
+    base: &LiteSVM,
+    payer: &Keypair,
+    gov: &Keypair,
+    emergency: &Keypair,
+    cfg: Pubkey,
+    pd: Pubkey,
+) -> Result<()> {
+    use canary_upgrade_gate::state::AuthorityRole;
+    let next = Keypair::new();
+    let pending = Pubkey::find_program_address(&[b"authority", cfg.as_ref()], &ID).0;
+    let resolve = || accounts::ResolveAuthority {
+        governance_authority: gov.pubkey(),
+        config: cfg,
+        pending,
+        refund: payer.pubkey(),
+    };
+    let transfer = |signer, pending| {
+        ix(
+            accounts::TransferProgramAuthority {
+                authority: signer,
+                config: cfg,
+                candidate: next.pubkey(),
+                program_data: pd,
+                loader_program: loader::ID,
+                pending,
+            },
+            instruction::TransferProgramAuthority {},
+        )
+    };
+    let check_exit = |vm: &LiteSVM| -> Result<()> {
+        let raw = vm.get_account(&pd).context("missing ProgramData")?;
+        ensure!(
+            matches!(bincode::deserialize(&raw.data)?, loader::UpgradeableLoaderState::ProgramData { upgrade_authority_address: Some(k), .. } if k == next.pubkey()),
+            "loader authority was not transferred"
+        );
+        Ok(())
+    };
+    let mut vm = base.clone();
+    rejected(
+        send(
+            &mut vm,
+            payer,
+            &[gov, &next],
+            &[transfer(gov.pubkey(), None)],
+        ),
+        "WrongAuthority",
+    )?;
+    send(
+        &mut vm,
+        payer,
+        &[emergency, &next],
+        &[transfer(emergency.pubkey(), None)],
+    )?;
+    check_exit(&vm)?;
+    for role in [
+        AuthorityRole::Governance,
+        AuthorityRole::Emergency,
+        AuthorityRole::ProgramUpgrade,
+    ] {
+        let mut vm = base.clone();
+        let queue = ix(
+            accounts::QueueAuthority {
+                payer: payer.pubkey(),
+                governance_authority: gov.pubkey(),
+                config: cfg,
+                pending,
+                system_program: system_program::ID,
+            },
+            instruction::ProposeAuthorityChange {
+                role,
+                candidate: next.pubkey(),
+            },
+        );
+        send(&mut vm, payer, &[gov], &[queue])?;
+        let apply = if role == AuthorityRole::ProgramUpgrade {
+            transfer(gov.pubkey(), Some(pending))
+        } else {
+            ix(
+                accounts::RotateAuthority {
+                    change: resolve(),
+                    candidate: next.pubkey(),
+                },
+                instruction::ExecuteAuthorityChange {},
+            )
+        };
+        clock(&mut vm, 110, 1069);
+        rejected(
+            send(&mut vm, payer, &[gov, &next], std::slice::from_ref(&apply)),
+            "Timelocked",
+        )?;
+        clock(&mut vm, 111, 1070);
+        send(&mut vm, payer, &[gov, &next], &[apply])?;
+        let config: GatekeeperConfig = load(&vm, cfg)?;
+        ensure!(
+            config.proposal_nonce >> 32 == 1,
+            "old generation remained active"
+        );
+        match role {
+            AuthorityRole::Governance => ensure!(config.governance_authority == next.pubkey()),
+            AuthorityRole::Emergency => ensure!(config.emergency_authority == next.pubkey()),
+            AuthorityRole::ProgramUpgrade => {
+                check_exit(&vm)?;
+                send(
+                    &mut vm,
+                    payer,
+                    &[gov],
+                    &[ix(resolve(), instruction::CancelAuthorityChange {})],
+                )?;
+            }
+        }
+        ensure!(vm.get_account(&pending).is_none());
+    }
+    Ok(())
+}
+
+fn check_replay_modes(captured: &Archive, baseline: &[u8], candidate: &[u8]) -> Result<()> {
+    use canary_upgrade_gate::state::ReplayMode;
+    let mut archive = captured.clone();
+    archive.min_txs = 1;
+    archive.records.truncate(1);
+    let payer = Keypair::new_from_array([72; 32]);
+    let counter = Pubkey::new_from_array([73; 32]);
+    let change = |program| {
+        Transaction::new_signed_with_payer(
+            &[Instruction::new_with_bytes(
+                program,
+                &0u64.to_le_bytes(),
+                vec![AccountMeta::new(counter, false)],
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            LiteSVM::new().latest_blockhash(),
+        )
+        .into()
+    };
+    archive.records[0].transaction = change(archive.target);
+    archive.transaction_manifest = crate::replay::manifest(&archive.records)?;
+    let check_error = |archive: &Archive, reason: &str| -> Result<()> {
+        let err = verify(archive, baseline, candidate)
+            .err()
+            .context("unexpected successful replay")?;
+        ensure!(
+            err.to_string().contains(reason),
+            "expected {reason}, got {err}"
+        );
+        Ok(())
+    };
+    archive.cu_limit_bps = u16::MAX;
+    check_error(&archive, "post-state differs")?;
+    archive.replay_mode = ReplayMode::NoRevertAndCuBound;
+    let first = verify(&archive, baseline, candidate)?;
+    ensure!(
+        first == verify(&archive, baseline, candidate)?,
+        "non-deterministic relaxed evidence"
+    );
+    let mut unchanged = archive.clone();
+    unchanged.expected_elf = hash(baseline);
+    unchanged
+        .buffer
+        .data
+        .truncate(loader::UpgradeableLoaderState::size_of_buffer_metadata());
+    unchanged.buffer.data.extend_from_slice(baseline);
+    let reference = verify(&unchanged, baseline, baseline)?;
+    ensure!(
+        first.diff_root != reference.diff_root,
+        "relaxed root must commit to candidate state"
+    );
+    archive.cu_limit_bps = 0;
+    check_error(&archive, "compute policy exceeded")?;
+    archive.cu_limit_bps = u16::MAX;
+    let counter_state = archive
+        .accounts
+        .iter_mut()
+        .find(|(k, _)| *k == counter)
+        .context("missing counter")?;
+    counter_state.1.data = u64::MAX.to_le_bytes().to_vec();
+    check_error(&archive, "candidate failed")?;
+    // A successful transaction that simply lists the target cannot establish coverage.
+    let mut unrelated =
+        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(80_000);
+    unrelated
+        .accounts
+        .push(AccountMeta::new_readonly(archive.target, false));
+    archive.records[0].transaction = Transaction::new_signed_with_payer(
+        &[unrelated],
+        Some(&payer.pubkey()),
+        &[&payer],
+        LiteSVM::new().latest_blockhash(),
+    )
+    .into();
+    archive.transaction_manifest = crate::replay::manifest(&archive.records)?;
+    check_error(&archive, "target was not invoked")?;
+    archive.records[0] = captured.records[0].clone();
+    archive.transaction_manifest = crate::replay::manifest(&archive.records)?;
+    archive
+        .accounts
+        .retain(|(_, a)| a.owner != solana_sdk_ids::address_lookup_table::ID);
+    check_error(&archive, "missing lookup table")
 }

@@ -29,7 +29,7 @@ pub mod canary_upgrade_gate {
         );
         let target_program = ctx.accounts.target_program.key();
         ctx.accounts.config.set_inner(GatekeeperConfig {
-            version: 1,
+            version: 2,
             bump: ctx.bumps.config,
             target_program,
             governance_authority: governance,
@@ -57,7 +57,9 @@ pub mod canary_upgrade_gate {
         let config = &mut ctx.accounts.config;
         check_buffer(&ctx.accounts.buffer, config.key())?;
         require!(
-            spill != ctx.accounts.buffer.key()
+            spill != ctx.accounts.proposal.key()
+                && spill != ctx.accounts.reservation.key()
+                && spill != ctx.accounts.buffer.key()
                 && spill != ctx.accounts.program_data.key()
                 && spill != config.target_program,
             GateError::WrongLoaderAccount
@@ -88,6 +90,10 @@ pub mod canary_upgrade_gate {
             attestation_bitmap: 0,
             attestation_count: 0,
             created_at: clock.unix_timestamp,
+            expires_at: clock
+                .unix_timestamp
+                .checked_add(config.policy.proposal_expiry_seconds)
+                .ok_or(GateError::Overflow)?,
             ready_at: 0,
             status: ProposalStatus::Pending,
         });
@@ -173,6 +179,7 @@ pub mod canary_upgrade_gate {
             .checked_add(ctx.accounts.config.policy.timelock_seconds)
             .ok_or(GateError::Overflow)?;
         ctx.accounts.pending.set_inner(PendingPolicy {
+            generation_nonce: ctx.accounts.config.proposal_nonce,
             ready_at,
             refund: ctx.accounts.payer.key(),
             policy,
@@ -191,6 +198,9 @@ pub mod canary_upgrade_gate {
         );
         ctx.accounts
             .config
+            .check_generation(ctx.accounts.pending.generation_nonce)?;
+        ctx.accounts
+            .config
             .rotate(ctx.accounts.pending.policy.clone())?;
         emit!(PolicyUpdated {
             config: ctx.accounts.config.key(),
@@ -203,11 +213,136 @@ pub mod canary_upgrade_gate {
         Ok(())
     }
 
+    pub fn reclaim_buffer(ctx: Context<ReclaimBuffer>) -> Result<()> {
+        let a = ctx.accounts;
+        let p = &mut a.proposal;
+        if p.status != ProposalStatus::Cancelled {
+            require!(
+                matches!(p.status, ProposalStatus::Pending | ProposalStatus::Ready),
+                GateError::WrongStatus
+            );
+            require!(
+                Clock::get()?.unix_timestamp > p.expires_at,
+                GateError::WrongStatus
+            );
+        }
+        // An emergency upgrade can have consumed this buffer already.
+        if !(a.buffer.data_is_empty() && a.buffer.owner == &anchor_lang::system_program::ID) {
+            require_keys_eq!(*a.buffer.owner, loader::ID, GateError::WrongLoaderAccount);
+            check_buffer(&a.buffer, a.config.key())?;
+            let ix =
+                loader::close_any(&a.buffer.key(), &a.spill.key(), Some(&a.config.key()), None);
+            invoke_signed(
+                &ix,
+                &[
+                    a.buffer.to_account_info(),
+                    a.spill.to_account_info(),
+                    a.config.to_account_info(),
+                    a.loader_program.to_account_info(),
+                ],
+                &[&[
+                    b"gatekeeper_cfg",
+                    a.config.target_program.as_ref(),
+                    &[a.config.bump],
+                ]],
+            )?;
+        }
+        p.status = ProposalStatus::Reclaimed;
+        Ok(())
+    }
+
+    pub fn propose_authority_change(
+        ctx: Context<QueueAuthority>,
+        role: AuthorityRole,
+        candidate: Pubkey,
+    ) -> Result<()> {
+        let a = ctx.accounts;
+        require!(
+            candidate != Pubkey::default() && candidate != a.config.key(),
+            GateError::WrongAuthority
+        );
+        if role != AuthorityRole::ProgramUpgrade {
+            require!(
+                candidate != a.config.governance_authority
+                    && candidate != a.config.emergency_authority,
+                GateError::WrongAuthority
+            );
+        }
+        let ready_at = Clock::get()?
+            .unix_timestamp
+            .checked_add(a.config.policy.timelock_seconds)
+            .ok_or(GateError::Overflow)?;
+        a.pending.set_inner(PendingAuthority {
+            role,
+            candidate,
+            generation_nonce: a.config.proposal_nonce,
+            ready_at,
+            refund: a.payer.key(),
+        });
+        Ok(())
+    }
+
+    pub fn cancel_authority_change(_ctx: Context<ResolveAuthority>) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn execute_authority_change(ctx: Context<RotateAuthority>) -> Result<()> {
+        let a = &mut ctx.accounts.change;
+        check_change(&a.config, &a.pending, ctx.accounts.candidate.key())?;
+        match a.pending.role {
+            AuthorityRole::Governance => a.config.governance_authority = a.pending.candidate,
+            AuthorityRole::Emergency => a.config.emergency_authority = a.pending.candidate,
+            AuthorityRole::ProgramUpgrade => return err!(GateError::WrongAuthority),
+        }
+        a.config.advance_generation()
+    }
+
+    pub fn transfer_program_authority(ctx: Context<TransferProgramAuthority>) -> Result<()> {
+        let a = ctx.accounts;
+        if a.authority.key() != a.config.emergency_authority {
+            require_keys_eq!(
+                a.authority.key(),
+                a.config.governance_authority,
+                GateError::WrongAuthority
+            );
+            let pending = a.pending.as_ref().ok_or(GateError::WrongAuthority)?;
+            require!(
+                pending.role == AuthorityRole::ProgramUpgrade,
+                GateError::WrongAuthority
+            );
+            check_change(&a.config, pending, a.candidate.key())?;
+        }
+        let next = a.candidate.key();
+        require!(
+            next != a.config.key() && next != Pubkey::default(),
+            GateError::WrongAuthority
+        );
+        let ix =
+            loader::set_upgrade_authority_checked(&a.config.target_program, &a.config.key(), &next);
+        invoke_signed(
+            &ix,
+            &[
+                a.program_data.to_account_info(),
+                a.config.to_account_info(),
+                a.candidate.to_account_info(),
+                a.loader_program.to_account_info(),
+            ],
+            &[&[
+                b"gatekeeper_cfg",
+                a.config.target_program.as_ref(),
+                &[a.config.bump],
+            ]],
+        )?;
+        // Generation invalidation also consumes the queued exit. Governance can
+        // recover its rent with cancel_authority_change.
+        a.config.advance_generation()
+    }
+
     pub fn close_proposal(ctx: Context<CloseProposal>) -> Result<()> {
         require!(
             matches!(
                 ctx.accounts.proposal.status,
-                ProposalStatus::Executed | ProposalStatus::Cancelled
+                ProposalStatus::Executed | ProposalStatus::Reclaimed
             ),
             GateError::WrongStatus
         );
@@ -229,6 +364,20 @@ pub mod canary_upgrade_gate {
         });
         Ok(())
     }
+}
+
+fn check_change(
+    config: &GatekeeperConfig,
+    change: &PendingAuthority,
+    candidate: Pubkey,
+) -> Result<()> {
+    config.check_generation(change.generation_nonce)?;
+    require_keys_eq!(change.candidate, candidate, GateError::WrongAuthority);
+    require!(
+        Clock::get()?.unix_timestamp >= change.ready_at,
+        GateError::Timelocked
+    );
+    Ok(())
 }
 
 fn accept_vote(

@@ -34,6 +34,8 @@ name = "canary-counter"
 version = "0.1.0"
 dependencies = [
  "solana-account-info",
+ "solana-cpi",
+ "solana-instruction",
  "solana-msg",
  "solana-program-entrypoint",
  "solana-program-error",
@@ -293,6 +295,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-cpi"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8dc71126edddc2ba014622fc32d0f5e2e78ec6c5a1e0eb511b85618c09e9ea11"
+dependencies = [
+ "solana-account-info",
+ "solana-define-syscall",
+ "solana-instruction",
+ "solana-program-error",
+ "solana-pubkey",
+ "solana-stable-layout",
+]
+
+[[package]]
 name = "solana-decode-error"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -411,6 +427,16 @@ dependencies = [
  "sha2",
  "solana-define-syscall",
  "solana-hash",
+]
+
+[[package]]
+name = "solana-stable-layout"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f14f7d02af8f2bc1b5efeeae71bc1c2b7f0f65cd75bcc7d8180f2c762a57f54"
+dependencies = [
+ "solana-instruction",
+ "solana-pubkey",
 ]
 
 [[package]]

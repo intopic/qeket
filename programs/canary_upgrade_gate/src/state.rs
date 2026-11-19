@@ -3,6 +3,7 @@ use canary_types::{CanaryAttestationPayload, DOMAIN};
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace)]
 pub struct Policy {
+    pub replay_mode: ReplayMode,
     pub verifiers: [Pubkey; 7],
     pub verifier_count: u8,
     pub threshold: u8,
@@ -11,6 +12,24 @@ pub struct Policy {
     pub min_replay_slots: u64,
     pub timelock_seconds: i64,
     pub proposal_expiry_seconds: i64,
+}
+
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq, InitSpace,
+)]
+pub enum ReplayMode {
+    #[default]
+    StrictEquality,
+    NoRevertAndCuBound,
+}
+
+impl ReplayMode {
+    pub fn domain(self) -> [u8; 16] {
+        match self {
+            Self::StrictEquality => DOMAIN,
+            Self::NoRevertAndCuBound => *b"CANARY_GATE_NR1_",
+        }
+    }
 }
 
 impl Policy {
@@ -66,11 +85,16 @@ impl GatekeeperConfig {
         Ok(())
     }
 
-    pub fn rotate(&mut self, policy: Policy) -> Result<()> {
+    pub fn advance_generation(&mut self) -> Result<()> {
         let generation = ((self.proposal_nonce >> 32) as u32)
             .checked_add(1)
             .ok_or(GateError::Overflow)?;
         self.proposal_nonce = u64::from(generation) << 32;
+        Ok(())
+    }
+
+    pub fn rotate(&mut self, policy: Policy) -> Result<()> {
+        self.advance_generation()?;
         self.policy = policy;
         Ok(())
     }
@@ -79,6 +103,7 @@ impl GatekeeperConfig {
 #[account]
 #[derive(InitSpace)]
 pub struct PendingPolicy {
+    pub generation_nonce: u64,
     pub ready_at: i64,
     pub refund: Pubkey,
     pub policy: Policy,
@@ -90,6 +115,7 @@ pub enum ProposalStatus {
     Ready,
     Executed,
     Cancelled,
+    Reclaimed,
 }
 
 #[account]
@@ -109,6 +135,7 @@ pub struct UpgradeProposal {
     pub attestation_bitmap: u8,
     pub attestation_count: u8,
     pub created_at: i64,
+    pub expires_at: i64,
     pub ready_at: i64,
     pub status: ProposalStatus,
 }
@@ -120,12 +147,8 @@ impl UpgradeProposal {
             .ok_or_else(|| error!(GateError::Overflow))
     }
 
-    fn check_expiry(&self, policy: &Policy, now: i64) -> Result<()> {
-        let expiry = self
-            .created_at
-            .checked_add(policy.proposal_expiry_seconds)
-            .ok_or(GateError::Overflow)?;
-        require!(now <= expiry, GateError::Expired);
+    fn check_expiry(&self, now: i64) -> Result<()> {
+        require!(now <= self.expires_at, GateError::Expired);
         Ok(())
     }
 
@@ -140,14 +163,14 @@ impl UpgradeProposal {
             self.status == ProposalStatus::Pending,
             GateError::WrongStatus
         );
-        self.check_expiry(policy, clock.unix_timestamp)?;
+        self.check_expiry(clock.unix_timestamp)?;
         // The end slot is inclusive. Wait for it to finish before accepting evidence.
         require!(
             clock.slot > self.window_end()? && clock.slot <= payload.expires_at_slot,
             GateError::InvalidWindow
         );
         require!(
-            payload.domain_separator == DOMAIN
+            payload.domain_separator == policy.replay_mode.domain()
                 && payload.target_program == self.target_program
                 && payload.proposal_nonce == self.nonce
                 && payload.buffer_account == self.buffer_account
@@ -184,7 +207,7 @@ impl UpgradeProposal {
 
     pub fn check_execution(&self, policy: &Policy, now: i64, baseline: u64) -> Result<()> {
         require!(self.status == ProposalStatus::Ready, GateError::WrongStatus);
-        self.check_expiry(policy, now)?;
+        self.check_expiry(now)?;
         let earliest = self
             .ready_at
             .checked_add(policy.timelock_seconds)
@@ -232,4 +255,25 @@ pub enum GateError {
     BaselineChanged,
     #[msg("Proposal belongs to a previous policy generation")]
     PolicyChanged,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct BufferReservation {}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
+pub enum AuthorityRole {
+    Governance,
+    Emergency,
+    ProgramUpgrade,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct PendingAuthority {
+    pub role: AuthorityRole,
+    pub candidate: Pubkey,
+    pub generation_nonce: u64,
+    pub ready_at: i64,
+    pub refund: Pubkey,
 }

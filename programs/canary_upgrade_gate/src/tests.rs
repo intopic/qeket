@@ -8,6 +8,7 @@ fn key(byte: u8) -> Pubkey {
 
 fn setup() -> (Policy, UpgradeProposal, CanaryAttestationPayload, Clock) {
     let policy = Policy {
+        replay_mode: Default::default(),
         verifiers: [key(1), key(2), key(3), key(0), key(0), key(0), key(0)],
         verifier_count: 3,
         threshold: 2,
@@ -32,6 +33,7 @@ fn setup() -> (Policy, UpgradeProposal, CanaryAttestationPayload, Clock) {
         attestation_bitmap: 0,
         attestation_count: 0,
         created_at: 400,
+        expires_at: 1000,
         ready_at: 0,
         status: ProposalStatus::Pending,
     };
@@ -374,4 +376,17 @@ fn generation_changes_only_on_rotation() {
     cfg.rotate(policy).unwrap();
     assert!(cfg.check_generation(original).is_err());
     assert_eq!(cfg.next_nonce().unwrap(), 1u64 << 32);
+}
+
+#[test]
+fn signature_domains_bind_the_replay_mode() {
+    let (mut policy, mut proposal, mut payload, clock) = setup();
+    policy.replay_mode = ReplayMode::NoRevertAndCuBound;
+    assert!(proposal
+        .record_vote(&policy, &payload, key(1), &clock)
+        .is_err());
+    payload.domain_separator = policy.replay_mode.domain();
+    proposal
+        .record_vote(&policy, &payload, key(1), &clock)
+        .unwrap();
 }
