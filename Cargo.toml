@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/canary-types", "crates/svm-canary-runner", "programs/canary_upgrade_gate"]
+resolver = "2"
+
+[workspace.dependencies]
+anchor-lang = "=0.31.3"
+canary-types = { path = "crates/canary-types" }
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1

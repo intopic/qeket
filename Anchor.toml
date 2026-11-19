@@ -1,0 +1,6 @@
+[programs.localnet]
+canary_upgrade_gate = "38SJ9rbJgLtibh4bL1VyoGb5uMaEQtSPBJZbTFahYtmz"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
