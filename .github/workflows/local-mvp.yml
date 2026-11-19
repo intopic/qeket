@@ -1,4 +1,4 @@
-name: Local MVP
+name: Canary MVP
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
@@ -9,16 +9,25 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       OPENSSL_NO_VENDOR: "1"
+      CANARY_SBF_TOOLCHAIN: canary-sbf-v1.58
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Prepare pinned compilers
         run: |
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt
           rustup override set 1.95.0
-          cargo install cargo-build-sbf --version 4.5.0 --locked
-          cargo build-sbf --install-only --tools-version v1.58
+          archive="$RUNNER_TEMP/platform-tools.tar.bz2"
+          tools="$RUNNER_TEMP/platform-tools"
+          curl --fail --location --retry 3 --output "$archive" https://github.com/anza-xyz/platform-tools/releases/download/v1.58/platform-tools-linux-x86_64.tar.bz2
+          echo "7b82eb420b5aebd1e5590db0ae25c523eca06724d4238ae02139690535636c37  $archive" | sha256sum --check
+          mkdir -p "$tools"
+          tar -xjf "$archive" -C "$tools"
+          compiler=$(find "$tools" -type f -path '*/rust/bin/rustc' -print -quit)
+          test -x "$compiler"
+          rustup toolchain link "$CANARY_SBF_TOOLCHAIN" "$(dirname "$(dirname "$compiler")")"
+          rustc +"$CANARY_SBF_TOOLCHAIN" --version
       - name: Fetch locked dependencies
         run: |
           cargo fetch --locked
@@ -29,3 +38,13 @@ jobs:
           cargo test --workspace --locked --offline
       - name: Build and run the local upgrade
         run: python3 scripts/mvp.py
+      - name: Preserve verified binaries and replay evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-mvp-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            target/sbpf-solana-solana/release/canary_upgrade_gate.so
+            target/mvp/baseline/sbpf-solana-solana/release/canary_counter.so
+            target/mvp/candidate/sbpf-solana-solana/release/canary_counter.so
+            target/mvp/evidence/
