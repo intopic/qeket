@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 
 ENDPOINT = "https://api.devnet.solana.com"
-GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
 LOADER = "BPFLoaderUpgradeab1e11111111111111111111111"
 GATE = "38SJ9rbJgLtibh4bL1VyoGb5uMaEQtSPBJZbTFahYtmz"
 ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -60,8 +60,9 @@ def check(directory):
     artifact = (directory / "sbpf-solana-solana/release/canary_upgrade_gate.so").read_bytes()
     if hashlib.sha256(artifact).hexdigest() != report["gate_sha256"]:
         raise ValueError("Downloaded gate differs from the artifact tested in LiteSVM")
-    if rpc("getGenesisHash", []) != GENESIS:
-        raise ValueError("Unexpected cluster identity")
+    genesis = rpc("getGenesisHash", [])
+    if genesis != GENESIS:
+        raise ValueError(f"Expected Solana Devnet genesis {GENESIS}, received {genesis}")
     read = {"commitment": "finalized", "encoding": "base64"}
     loader = rpc("getAccountInfo", [LOADER, read])["value"]
     if not loader or not loader["executable"] or loader["owner"] != "NativeLoader1111111111111111111111111111111":
