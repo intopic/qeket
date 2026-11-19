@@ -63,3 +63,18 @@ Arkivi v2 ruan transaksionet e nënshkruara në formatin binar Solana të koduar
 - Konfigurimi on-chain përdor skemën v2 me llogari të inicializuara rishtas. Migrimi në vend i llogarive on-chain v1 kërkon një migrim të veçantë.
 
 Dy verifikuesit janë simulime në të njëjtin kompjuter. Prova përdor çelësa të veçantë lokalë për qeverisjen dhe emergjencën. Për prodhim mbeten operatorë të pavarur, integrimi Squads/Realms dhe KMS/HSM, izolimi hermetik i build-it, marrja e të dhënave të finalizuara nga Yellowstone, validimi i snapshot-eve historike kundrejt të dhënave të finalizuara, fuzzing me Trident, prova afatgjatë në Devnet dhe auditimi i jashtëm.
+
+## Cikli live në Devnet
+
+Te **Settings → Secrets and variables → Actions** vendos:
+
+| Secret | Vlera |
+| --- | --- |
+| `RPC_URL` | HTTPS URL e Helius për Devnet, përfshirë API key |
+| `DEVNET_PAYER` | Array JSON i 64 bajtëve për një portofol të dedikuar, të financuar me SOL testues për rent dhe tarifa |
+| `GATE_PROGRAM_KEYPAIR` (opsional) | Array JSON i keypair-it të programit. Pa të, workflow derivon një adresë të qëndrueshme Devnet nga payer-i dhe ndërton gate-in dhe runner-in për atë adresë. |
+| `FLY_API_TOKEN` (opsional) | Token për deploy të worker-it. Për një aplikacion ekzistues vendos edhe repository variable `FLY_APP`. Për krijim automatik token-i duhet të ketë leje në organizatën `personal`. |
+
+Nis **Actions → Live Devnet counter → Run workflow** në `main`. Një push provon ndërtimin offline. Vetëm nisja manuale aktivizon deploy dhe transaksionet. Dy votuesit Devnet përdorin çelësa të ndryshëm të derivuar në të njëjtin runner. Çdo nisje e re krijon target të ri dhe konsumon rent Devnet. Nëse një nisje dështon pasi ka inicializuar gate-in, artifact-i përmban hapat e finalizuar deri aty. Ruaj payer-in dhe run ID për rikuperimin e autoriteteve.
+
+Artifact-i `devnet-live-<run_id>` përmban `transactions.md` dhe arkivin e replay-it. Snapshot-i i shembullit merret nga RPC para propozimit për counter-in dhe fee payer-in e izoluar. Workflow kërkon pikërisht transaksionin e pritur në dritaren e finalizuar dhe rikonfirmon bytecode-in e instaluar. Counter-i nuk lexon sysvar Clock. Për programe arbitrare, komanda `python scripts/live_capture.py capture SNAPSHOT.json ARCHIVE.json --max-replay-txs 500` kërkon gjendjen historike të fillimit të dritares, përfshirë ALT, ProgramData dhe sysvars përkatëse. `minContextSlot` nuk rikthen gjendjen historike. CLI ekzistuese `canary-gate verify` riekzekuton arkivin. Worker-i Fly ndjek eventet e finalizuara dhe i shkruan në log. Votimi dhe ndërtimi i kandidatit për provën Devnet kryhen në Actions.

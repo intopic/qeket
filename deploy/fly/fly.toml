@@ -1,0 +1,6 @@
+primary_region = "fra"
+[build]
+  dockerfile = "deploy/fly/Dockerfile"
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

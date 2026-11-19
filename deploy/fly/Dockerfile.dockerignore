@@ -1,0 +1,7 @@
+**
+!deploy/
+!deploy/fly/
+!deploy/fly/Dockerfile
+!scripts/
+!scripts/devnet.py
+!scripts/live_capture.py
