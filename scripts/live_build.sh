@@ -5,7 +5,7 @@ tmp=$(mktemp -d)
 cp -r examples/counter/{Cargo.toml,Cargo.lock,src} "$tmp/"
 mkdir "$tmp/.cargo"
 (cd "$tmp" && cargo vendor --locked vendor > .cargo/config.toml)
-compiler=$(rustup which --toolchain "$CANARY_SBF_TOOLCHAIN" rustc)
+compiler=$(realpath "$(rustup which --toolchain "$CANARY_SBF_TOOLCHAIN" rustc)")
 sdk=$(dirname "$(dirname "$compiler")")
 # Install host linker and C runtime before isolating the build. Neither the source
 # tree nor the SDK is in the Docker build context.
