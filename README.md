@@ -4,6 +4,10 @@ MVP lokal për përditësime të kontrolluara të programeve Solana. Një komand
 
 ## Ekzekutimi
 
+Në GitHub hap **Actions → Canary MVP**. Çdo push ose pull request nis testet në Ubuntu. Mund t'i nisësh edhe nga **Run workflow**. Job-i `verify` ndërton me platform-tools v1.58 të kontrolluar me SHA-256, ekzekuton testet Rust dhe provën në LiteSVM, pastaj ruan binarët dhe arkivin si artifact të commit-it.
+
+Job-i `Devnet RPC compatibility` shkarkon po atë artifact, kontrollon identitetin e Devnet-it dhe loader-in v3, dhe kërkon tarifën për mesazhin e votës së testuar me një blockhash të finalizuar. Nëse programi ekziston në adresën e konfiguruar, krahason edhe bajtët e tij me binarin e CI-së. `devnet-report.json` tregon slotin, tarifën dhe nëse kontrata është publikuar. Ky hap është vetëm për lexim dhe funksionon pa kredenciale.
+
 Nga rrënja e projektit, në këtë kompjuter:
 
 ```sh
@@ -43,7 +47,7 @@ Këto matje i përkasin kontratës, programit shembull dhe konfigurimit lokal t�
 - `crates/canary-types` përcakton mesazhin Borsh. `crates/svm-canary-runner` përmban verifikuesin, CLI-në dhe skenarin e plotë LiteSVM.
 - `examples/counter` është programi i provës. V1 dhe V2 shkruajnë të njëjtën gjendje dhe emetojnë mesazhe të ndryshme në log, që ekzekutimi i V2 të dallohet pas përditësimit.
 - `cargo test --workspace --locked` ekzekuton testet Rust. `cargo fmt --all --check` kontrollon formatimin. Në Windows testet e workspace-it përdorin të njëjtat variabla OpenSSL si CLI-ja.
-- `.github/workflows/local-mvp.yml` përgatit të njëjtën provë për CI në Linux. Aktivizimi në GitHub kërkon publikimin e projektit në një repository me Actions.
+- `.github/workflows/local-mvp.yml` përmban hapat e CI dhe të provës RPC në Solana Devnet.
 
 ## Kufijtë e provës lokale
 

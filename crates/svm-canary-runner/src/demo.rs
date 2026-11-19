@@ -297,6 +297,7 @@ pub fn run(
     );
     let mut measured = Vec::new();
     let mut consensus = None;
+    let mut vote_message = None;
     for (node, local_build) in nodes[..2].iter().zip([candidate, rebuilt]) {
         let evidence = verify(&archive, baseline, local_build)?;
         if let Some(previous) = &consensus {
@@ -325,6 +326,11 @@ pub fn run(
         );
         let vote = [verify_ix, submit.clone()];
         let (size, meta) = send(&mut vm, &payer, &[], &vote)?;
+        if vote_message.is_none() {
+            let message =
+                anchor_lang::solana_program::message::Message::new(&vote, Some(&payer.pubkey()));
+            vote_message = Some(message.serialize());
+        }
         ensure!(
             size < 650 && meta.compute_units_consumed < 25_000,
             "attestation exceeded budget: {size} B / {} CU",
@@ -425,6 +431,10 @@ pub fn run(
         "attestations_bytes_and_cu":measured,"execution_bytes":execution_bytes,"execution_cu":meta.compute_units_consumed,
         "quorum":"2/3","deployed_program_data_verified":true,"candidate_invoked":true,"proposal_closed":true,"policy_rotation_checked":true,"emergency_checked":true});
     fs::create_dir_all(out)?;
+    fs::write(
+        out.join("vote-message.bin"),
+        vote_message.context("missing verified vote")?,
+    )?;
     fs::write(out.join("archive.json"), archive_bytes)?;
     fs::write(out.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);

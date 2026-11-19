@@ -48,3 +48,23 @@ jobs:
             target/mvp/baseline/sbpf-solana-solana/release/canary_counter.so
             target/mvp/candidate/sbpf-solana-solana/release/canary_counter.so
             target/mvp/evidence/
+  devnet:
+    name: Devnet RPC compatibility
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: canary-mvp-${{ github.sha }}
+          path: verified
+      - name: Check loader, program address and compact vote fee on Devnet
+        run: python3 scripts/devnet.py verified
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devnet-report-${{ github.sha }}
+          path: devnet-report.json
+          if-no-files-found: error
