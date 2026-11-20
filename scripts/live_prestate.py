@@ -3,8 +3,8 @@ from base64 import b64decode
 from hashlib import sha256
 import struct
 
-from devnet import LOADER, to_base58
-from live_capture import FINAL, GATE, block, rpc
+from devnet import LOADER, from_base58, to_base58
+from live_capture import FINAL, GATE, block, capture, rpc
 
 MAX_PRESTATE_BYTES = 8 * 1024 * 1024
 MAX_ANCHOR_DRIFT = 32
@@ -46,7 +46,35 @@ def program_data_address(account):
         raise PrestateRefused("expected a loader-v3 executable program")
     return to_base58(data[4:])
 
+def check_transaction_prestate(item, accounts):
+    message = item["transaction"]["message"]
+    loaded = item["meta"].get("loadedAddresses") or {}
+    keys = set(message["accountKeys"])
+    keys.update(loaded.get("writable", []))
+    keys.update(loaded.get("readonly", []))
+    lookups = message.get("addressTableLookups") or []
+    if (sum(len(lookup["writableIndexes"]) for lookup in lookups) != len(loaded.get("writable", []))
+            or sum(len(lookup["readonlyIndexes"]) for lookup in lookups) != len(loaded.get("readonly", []))):
+        raise PrestateRefused("finalized transaction is missing resolved ALT addresses")
+    keys.update(lookup["accountKey"] for lookup in lookups)
+    # These runtime programs are supplied by LiteSVM. Other executable accounts
+    # must be present in the captured state, just like transaction data accounts.
+    keys.difference_update({
+        "11111111111111111111111111111111",
+        "ComputeBudget111111111111111111111111111111",
+    })
+    missing = sorted(keys - accounts.keys())
+    if missing:
+        raise PrestateRefused(f"initial state was not captured for {len(missing)} transaction account(s); first: {missing[0]}")
 
+
+def preflight_traffic(event, bundle, limit):
+    snapshot = dict(target=list(from_base58(event["target"])), anchor_slot=event["anchor_slot"],
+                    replay_slots=event["replay_slots"])
+    traffic = capture(snapshot, limit, validate_transaction=lambda item: check_transaction_prestate(
+        item, bundle["accounts"]
+    ))
+    return len(traffic["records"])
 
 def check_captured_accounts_unchanged(anchor, capture_slot, tracked):
     """Disprove possible writes between the inclusive window start and the capture bank."""

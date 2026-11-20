@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from devnet import GENESIS, from_base58, to_base58
 from live_capture import GATE, UnsupportedReplayVersion, capture, rpc, watch
-from live_prestate import PrestateRefused, capture_prestate
+from live_prestate import PrestateRefused, capture_prestate, preflight_traffic
 from worker_http import start_http
 from worker_notify import notify
 
@@ -210,6 +210,11 @@ class Admissions:
         with self.database as db:
             self._record_outcome(db, proposal, "prestate_captured", f"live state captured at slot {slot}")
 
+    def record_traffic_preflight(self, proposal, count):
+        with self.database as db:
+            self._record_outcome(db, proposal, "traffic_preflight_passed",
+                                 f"{count} finalized target transactions checked for initial account coverage")
+
     def cursor(self):
         row = self.database.execute("SELECT next_slot FROM cursors WHERE gate = ?", (GATE,)).fetchone()
         return row[0] if row else None
@@ -268,6 +273,37 @@ def capture_ready(admissions, snapshots, next_slot, now, on_notice=None, live_jo
                               "error": type(exc).__name__}), flush=True)
         # Leave time for event ingestion even when many snapshots are ready.
         break
+
+
+def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice):
+    for event in admissions.active_jobs():
+        proposal = event["proposal"]
+        bundle = live_jobs.get(proposal)
+        if bundle is None:
+            continue
+        policy = admissions.policies.get(event["target"])
+        refusal = None
+        if policy is None or not policy.active or now >= policy.expires:
+            refusal = "customer inactive"
+        elif now.timestamp() > bundle["expires_at"]:
+            refusal = "proposal expired"
+        elif "transaction_count" not in bundle and event["anchor_slot"] + event["replay_slots"] < next_slot:
+            try:
+                count = preflight_traffic(event, bundle, min(policy.max_replay_txs, event["max_replay_txs"]))
+                if count == 0:
+                    raise PrestateRefused("replay window contains no successful target transactions")
+                admissions.record_traffic_preflight(proposal, count)
+                bundle["transaction_count"] = count
+            except (OSError, RuntimeError):
+                print(json.dumps(dict(event="traffic_preflight_retry", proposal=proposal)), flush=True)
+            except ValueError as exc:
+                refusal = str(exc)
+            except (KeyError, TypeError):
+                refusal = "invalid finalized transaction metadata"
+        if refusal is not None:
+            admissions.finish(proposal, now, "refused", refusal)
+            live_jobs.pop(proposal)
+            on_notice("ReplayFailed", dict(proposal=proposal, reason=refusal))
 
 
 def main():
@@ -346,10 +382,7 @@ def main():
             if time.monotonic() >= next_capture:
                 refresh_policies()
                 now = datetime.now(timezone.utc)
-                for proposal, bundle in list(live_jobs.items()):
-                    if now.timestamp() > bundle["expires_at"]:
-                        live_jobs.pop(proposal)
-                        admissions.finish(proposal, now, "refused", "proposal expired")
+                check_live_traffic(admissions, live_jobs, slot, now, notify)
                 capture_ready(admissions, args.snapshots, slot, now, notify, live_jobs)
                 next_capture = time.monotonic() + 30
             if verifier_address and time.monotonic() >= balance_check:

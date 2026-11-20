@@ -141,7 +141,7 @@ class UnsupportedReplayVersion(ValueError):
     pass
 
 
-def capture(snapshot, limit):
+def capture(snapshot, limit, validate_transaction=None):
     start, span = snapshot["anchor_slot"], snapshot["replay_slots"]
     if not 0 < span <= 2048 or limit <= 0 or rpc("getSlot", FINAL) < start + span:
         raise ValueError("invalid or unfinalized replay window")
@@ -178,6 +178,8 @@ def capture(snapshot, limit):
                     matches.append((item["slot"], sig))
                     if len(matches) > limit:
                         raise ValueError("max_replay_txs exceeded")
+                    if validate_transaction is not None:
+                        validate_transaction(item)
         if page[-1]["slot"] < start or len(page) < options["limit"]:
             break
         before = page[-1]["signature"]

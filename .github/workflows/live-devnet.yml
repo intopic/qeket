@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       replay_transactions:
-        description: "Number of Devnet counter transactions (50–100)"
+        description: "Number of Devnet counter transactions (50-100)"
         default: "50"
         type: string
   push:
@@ -69,7 +69,7 @@ jobs:
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           rustup override set 1.95.0
-          curl -fsSL --retry 3 https://github.com/anza-xyz/platform-tools/releases/download/v1.58/platform-tools-linux-x86_64.tar.bz2 -o "$RUNNER_TEMP/tools.tbz"
+          curl -fsSL --retry 3 --retry-all-errors https://github.com/anza-xyz/platform-tools/releases/download/v1.58/platform-tools-linux-x86_64.tar.bz2 -o "$RUNNER_TEMP/tools.tbz"
           echo "7b82eb420b5aebd1e5590db0ae25c523eca06724d4238ae02139690535636c37  $RUNNER_TEMP/tools.tbz" | sha256sum -c -
           mkdir "$RUNNER_TEMP/sdk"
           tar xf "$RUNNER_TEMP/tools.tbz" -C "$RUNNER_TEMP/sdk"
@@ -77,7 +77,7 @@ jobs:
           rustup toolchain link "$CANARY_SBF_TOOLCHAIN" "$(dirname "$(dirname "$compiler")")"
       - name: Install Solana Verify
         run: |
-          curl -fsSL --retry 3 https://github.com/solana-foundation/solana-verifiable-build/releases/download/v0.4.15/solana-verify-0.4.15-linux -o "$HOME/.cargo/bin/solana-verify"
+          curl -fsSL --retry 3 --retry-all-errors https://github.com/solana-foundation/solana-verifiable-build/releases/download/v0.4.15/solana-verify-0.4.15-linux -o "$HOME/.cargo/bin/solana-verify"
           echo "251db253040a3c2637f551eb6627aae792da787a5f8dfdedb59874e13f27c2da  $HOME/.cargo/bin/solana-verify" | sha256sum -c -
           chmod +x "$HOME/.cargo/bin/solana-verify"
       - name: Rebuild counter twice in offline Docker
@@ -90,7 +90,7 @@ jobs:
           python -m py_compile scripts/live_capture.py scripts/live_cycle.py scripts/fly_listener.py
       - name: Install deploy CLI
         run: |
-          curl -fsSL --retry 3 https://github.com/anza-xyz/agave/releases/download/v2.3.13/solana-release-x86_64-unknown-linux-gnu.tar.bz2 -o "$RUNNER_TEMP/cli.tbz"
+          curl -fsSL --retry 3 --retry-all-errors https://github.com/anza-xyz/agave/releases/download/v2.3.13/solana-release-x86_64-unknown-linux-gnu.tar.bz2 -o "$RUNNER_TEMP/cli.tbz"
           echo "c43539ebdf6942472e8b87635d6ea55f428a51e3d0219f7b6f720fc6b19fade0  $RUNNER_TEMP/cli.tbz" | sha256sum -c -
           tar xf "$RUNNER_TEMP/cli.tbz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"

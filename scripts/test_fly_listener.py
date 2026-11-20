@@ -7,13 +7,35 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from devnet import to_base58
-from fly_listener import Admissions, capture_ready, customer_policies
+from fly_listener import Admissions, capture_ready, check_live_traffic, customer_policies
+from live_prestate import PrestateRefused
 
 
 class AdmissionsTest(unittest.TestCase):
+    def test_live_traffic_waits_for_finalization_and_closes_on_missing_state(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        target, proposal = [to_base58(bytes([n]) * 32) for n in (1, 2)]
+        event = dict(target=target, proposal=proposal, anchor_slot=100, replay_slots=10)
+        policies = customer_policies(json.dumps({"client": {"targets": [target], "seed_accounts": []}}))
+        cache = {proposal: {"expires_at": now.timestamp() + 60}}
+        notice = Mock()
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger = Admissions(db, policies)
+            ledger.consume(event, now, enqueue=True)
+            with patch("fly_listener.preflight_traffic", side_effect=PrestateRefused("missing state")) as check:
+                check_live_traffic(ledger, cache, 110, now, notice)
+                check.assert_not_called()
+                check_live_traffic(ledger, cache, 111, now, notice)
+                check.assert_called_once()
+            self.assertEqual(ledger.active_jobs(), [])
+            self.assertEqual(cache, {})
+            self.assertEqual(db.execute("SELECT status, reason FROM job_outcomes").fetchone(),
+                             ("refused", "missing state"))
+        notice.assert_called_once_with("ReplayFailed", {"proposal": proposal, "reason": "missing state"})
+
     def test_quota_and_cursor_survive_restart(self):
         first, second = [to_base58(bytes([n]) * 32) for n in (1, 2)]
         policies = customer_policies(json.dumps({"client": {

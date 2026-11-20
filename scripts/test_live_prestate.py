@@ -4,7 +4,10 @@ import unittest
 from unittest.mock import patch
 
 from devnet import LOADER, to_base58
-from live_prestate import PROPOSAL_TAG, PrestateRefused, capture_prestate, check_captured_accounts_unchanged
+from live_prestate import (
+    PROPOSAL_TAG, PrestateRefused, capture_prestate, check_captured_accounts_unchanged,
+    check_transaction_prestate,
+)
 
 
 def address(n):
@@ -16,6 +19,24 @@ def account(owner, data, executable=False):
 
 
 class LivePrestateTest(unittest.TestCase):
+    def test_requires_static_loaded_and_table_accounts_with_known_prestate(self):
+        payer, target, loaded_key, table = map(address, range(1, 5))
+        item = {
+            "meta": {"loadedAddresses": {"writable": [loaded_key], "readonly": []}},
+            "transaction": {"message": {
+                "accountKeys": [payer, target, "ComputeBudget111111111111111111111111111111"],
+                "addressTableLookups": [{"accountKey": table, "writableIndexes": [0], "readonlyIndexes": []}],
+            }},
+        }
+        captures = dict.fromkeys([payer, target, loaded_key, table])
+        check_transaction_prestate(item, captures)
+        for missing in (payer, loaded_key, table):
+            with self.subTest(missing=missing), self.assertRaisesRegex(PrestateRefused, missing):
+                check_transaction_prestate(item, {key: val for key, val in captures.items() if key != missing})
+        item["meta"].pop("loadedAddresses")
+        with self.assertRaisesRegex(PrestateRefused, "missing resolved ALT"):
+            check_transaction_prestate(item, captures)
+
     def test_capture_requires_one_bank_and_locked_baseline(self):
         target, proposal, gate, buffer, program_data, seed = map(address, range(1, 7))
         event = dict(anchor_slot=100, replay_slots=10, nonce=9, target=target, proposal=proposal)
