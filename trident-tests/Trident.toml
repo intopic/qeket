@@ -1,0 +1,11 @@
+[fuzz.metrics]
+enabled = true
+dashboard = false
+json = false
+
+[fuzz.regression]
+enabled = true
+
+[[fuzz.programs]]
+address = "38SJ9rbJgLtibh4bL1VyoGb5uMaEQtSPBJZbTFahYtmz"
+program = "../target/sbpf-solana-solana/release/canary_upgrade_gate.so"

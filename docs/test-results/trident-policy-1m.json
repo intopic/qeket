@@ -1,0 +1,18 @@
+{
+  "environment": "Fly.io Sprite qeket-test",
+  "engine": "Trident 0.12.0",
+  "instruction": "propose_config_update",
+  "gate_source_commit": "7d572104c27d7377f7d981f17d643726218818af",
+  "gate_elf_sha256": "0c0d7252e45fdbde344aeb55db4640991b39b8ef8656687e8ad40a4be9b80176",
+  "harness_sha256": "aca2d315a83a260485bc54e91f3dab7b07df49d5739b3c853cff66e614d0514c",
+  "cargo_lock_sha256": "d1cc781e295220336c7776c22a07459a120b2dfd3de786fc1f7c2de155392255",
+  "master_seed": "99a3b7907abc9021042f7f221417ce6faa51fc355c6d93d027e836be36ac5075",
+  "iterations": 1000000,
+  "accepted_valid": 23975,
+  "rejected_invalid": 976025,
+  "instruction_panics": 0,
+  "invariants_passed": true,
+  "wall_seconds": 20.381,
+  "user_cpu_seconds": 160.297,
+  "system_cpu_seconds": 0.180
+}

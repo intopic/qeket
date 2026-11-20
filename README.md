@@ -116,3 +116,15 @@ Mund të caktohen `active`, `cooldown_minutes`, `max_upgrades_per_month` dhe `ma
 ### Adapteri Squads v4
 
 `packages/squads-adapter` ndërton instruksionet e gate-it dhe i mbështjell me `vaultTransactionCreate` nga SDK Squads. Kalo adresën e gate-it të publikuar, adresën e multisig-ut, indeksin e Vault-it dhe të dhënat aktuale të propozimit. Vault-i duhet të jetë autoriteti për veprimet e qeverisjes dhe të ketë SOL për llogaritë e përdorura gjatë inicializimit ose propozimit. Ndiq rrjedhën e zakonshme Squads për krijimin e propozimit, miratimet dhe ekzekutimin. Për transferimin e autoritetit, rruga e qeverisjes kërkon `proposeProgramAuthorityTransfer` dhe timelock. Në ekzekutim duhet të sigurohet edhe nënshkrimi i marrësit të ri, sipas mënyrës si ai autoritet nënshkruan. Paketa krijon instruksionet dhe payload-in e Vault-it. Integrimi me një Vault të publikuar kërkon ende test on-chain.
+
+## Provat paralele dhe Trident
+
+- [Tre job-e në Sprite](docs/test-results/sprite-parallel-7d57210.json). Secili ndërton kandidatin dhe e riekzekuton mbi 1,000 transaksione të veta. Matja përdor një namespace Linux pa rrjet. RAM-i i raportuar është maksimumi i një procesi fëmijë.
+- [Kontrolli vetëm për lexim i Orca Mainnet](docs/test-results/orca-mainnet-preflight.json). Ky raport mat marrjen e nënshkrimeve dhe identifikon versionin e transaksionit të mostrës.
+- [Fushata Trident me 1,000,000 iteracione](docs/test-results/trident-policy-1m.json). Harness-i ekzekuton ELF-in SBF të gate-it dhe krahason vendimet e `propose_config_update` me modelin e politikës për rastet e gjeneruara.
+
+Për ta përsëritur fushatën në Linux, ndërto më parë gate-in me komandën e MVP-së. Nga `trident-tests` ekzekuto:
+
+```sh
+CANARY_FUZZ_ITERATIONS=1000000 FUZZING_METRICS=1 cargo run --locked --release --bin fuzz_policy
+```
