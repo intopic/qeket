@@ -12,6 +12,8 @@ on:
       - 'scripts/live_build.sh'
       - 'scripts/live_cycle.py'
       - 'scripts/live_capture.py'
+      - 'scripts/live_prestate.py'
+      - 'scripts/test_live_prestate.py'
       - 'scripts/fly_listener.py'
       - 'scripts/worker_http.py'
       - 'scripts/worker_notify.py'
@@ -149,7 +151,7 @@ jobs:
           python -c 'import json,os,sys; print("RPC_URL="+os.environ["RPC_URL"]); print("GATE_PROGRAM_ID="+sys.argv[1]); print("CANARY_CUSTOMERS="+json.dumps(json.loads(os.environ["CANARY_CUSTOMERS"]))); [print(k+"="+os.environ[k]) for k in ("HELIUS_WEBHOOK_AUTHORIZATION","CANARY_ADMIN_TOKEN","CANARY_SLACK_WEBHOOK","CANARY_TELEGRAM_BOT_TOKEN","CANARY_TELEGRAM_CHAT_ID","CANARY_VERIFIER_PUBKEY") if os.environ.get(k)]' "$gate" | flyctl secrets import --stage -a "$app"
           context="$RUNNER_TEMP/fly-worker"
           mkdir -p "$context/scripts" "$context/deploy/fly"
-          cp scripts/{devnet,live_capture,fly_listener,customer_admin,worker_http,worker_notify}.py "$context/scripts/"
+          cp scripts/{devnet,live_capture,live_prestate,fly_listener,customer_admin,worker_http,worker_notify}.py "$context/scripts/"
           cp deploy/fly/* "$context/deploy/fly/"
           cd "$context"
           flyctl deploy --ha=false --remote-only -c deploy/fly/fly.toml -a "$app"

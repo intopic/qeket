@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--library-name")
     parser.add_argument("--build-subdir")
     parser.add_argument("--webhook-url")
+    parser.add_argument("--live-prestate", action="store_true")
+    parser.add_argument("--seed-account", action="append")
     args = parser.parse_args()
     customers = json.loads(args.file.read_text(encoding="utf-8")) if args.file.exists() else {}
     if args.action == "set":
@@ -34,6 +36,10 @@ def main():
                 entry[field] = value
             elif field in previous:
                 entry[field] = previous[field]
+        if args.seed_account or args.live_prestate:
+            entry["seed_accounts"] = args.seed_account or []
+        elif "seed_accounts" in previous:
+            entry["seed_accounts"] = previous["seed_accounts"]
         customers[args.customer] = entry
     elif args.customer not in customers:
         parser.error("unknown customer")

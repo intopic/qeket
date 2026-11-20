@@ -141,3 +141,11 @@ Konfigurimi i klientit pranon `repo_url` (HTTPS), `library_name`, `build_subdir`
 - RPC kerkon `maxSupportedTransactionVersion: 1` per lexim. Nje transaksion v1 i lidhur me target-in e ben dritaren te paperputhshme me runner-in aktual. Worker-i regjistron refuzimin dhe liron job-in. LiteSVM vazhdon me legacy dhe v0.
 
 Fly mban `auto_stop_machines = "off"` derisa job-et qe presin finalizimin te kene nje mekanizem zgjimi te pavarur nga webhook-u fillestar. Marrja e gjendjes historike, ndertimi nga repoja e klientit dhe votimi automatik mbeten per integrim. Per dritaret e mbeshtetura, worker-i ende lexon snapshot-in e besuar nga volumi.
+
+### Kapja live e gjendjes fillestare
+
+Per klientin qe perdor kapjen live, cakto `seed_accounts` ne konfigurim. Nje liste bosh aktivizon kapjen vetem me llogarite e programit dhe metadatat e upgrade-it. CLI pranon `--live-prestate` dhe `--seed-account PUBKEY` per varësitë e njohura.
+
+Pasi pranohet eventi `ProposalCreated`, worker-i lexon llogarite e programit, varesite e listuara, propozimin, buffer-in dhe ProgramData nga i njejti slot i finalizuar. Kontrollon zinxhirin e blloqeve nga anchor-i deri te kapja dhe refuzon shkrimet e mundshme ne llogarite e kapura. Rezultati `prestate_captured` tregon kapjen fillestare, jo perfundimin e replay-it. Ne Fly, kapja rri vetem ne memorie dhe lirohet kur propozimi skadon ose perfundon. Rinisja regjistron se kapja u humb.
+
+Ky hap ende nuk e shnderron kapjen live ne arkiv te plote per votim. Duhet te lidhet me mbulimin e varesive te zbuluara gjate dritares, sysvar-et, pagesat e transaksioneve dhe krahasimin e baseline-it. `preBalances` jep bilancin, ndersa metadata dhe te dhenat duhen vertetuar perpara se te trajtojme nje llogari si system account pa gjendje.

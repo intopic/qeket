@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from devnet import GENESIS, from_base58, to_base58
 from live_capture import GATE, UnsupportedReplayVersion, capture, rpc, watch
+from live_prestate import PrestateRefused, capture_prestate
 from worker_http import start_http
 from worker_notify import notify
 
@@ -33,6 +34,7 @@ class Policy:
     library_name: str | None
     build_subdir: str | None
     webhook_url: str | None
+    seed_accounts: tuple[str, ...] | None
 
 
 def optional_https(value, field):
@@ -62,7 +64,14 @@ def build_options(policy):
         or PurePosixPath(subdir).is_absolute() or ".." in PurePosixPath(subdir).parts
     ):
         raise ValueError("build_subdir must stay inside the repository")
-    return repo, library, subdir, webhook
+    seed_accounts = policy.get("seed_accounts")
+    if seed_accounts is not None and (
+        not isinstance(seed_accounts, list) or len(seed_accounts) > 96
+        or any(not isinstance(key, str) or len(from_base58(key)) != 32 for key in seed_accounts)
+        or len(set(seed_accounts)) != len(seed_accounts)
+    ):
+        raise ValueError("seed_accounts must contain at most 96 unique public keys")
+    return repo, library, subdir, webhook, None if seed_accounts is None else tuple(seed_accounts)
 
 
 def customer_policies(raw):
@@ -165,7 +174,7 @@ class Admissions:
                     print(json.dumps({"event": "customer_busy_or_cooldown", "customer": customer,
                                       "proposal": event["proposal"]}), flush=True)
                     return None
-                payload = dict(event, max_replay_txs=policy.max_replay_txs)
+                payload = dict(event, max_replay_txs=policy.max_replay_txs, live_prestate=policy.seed_accounts is not None)
                 db.execute("INSERT INTO customer_jobs VALUES (?, ?, ?, ?, ?, NULL)",
                            (GATE, customer, event["proposal"], json.dumps(payload), int(now.timestamp())))
             db.execute("INSERT INTO admissions VALUES (?, ?, ?, ?)",
@@ -187,8 +196,19 @@ class Admissions:
             """, (int(now.timestamp()), GATE, proposal))
             if updated.rowcount != 1:
                 return False
-            db.execute("INSERT INTO job_outcomes VALUES (?, ?, ?, ?)", (GATE, proposal, status, reason))
+            self._record_outcome(db, proposal, status, reason)
             return True
+
+    def _record_outcome(self, db, proposal, status, reason):
+        db.execute("""
+            INSERT INTO job_outcomes VALUES (?, ?, ?, ?)
+            ON CONFLICT(gate, proposal) DO UPDATE
+              SET status = excluded.status, reason = excluded.reason
+        """, (GATE, proposal, status, reason))
+
+    def record_prestate(self, proposal, slot):
+        with self.database as db:
+            self._record_outcome(db, proposal, "prestate_captured", f"live state captured at slot {slot}")
 
     def cursor(self):
         row = self.database.execute("SELECT next_slot FROM cursors WHERE gate = ?", (GATE,)).fetchone()
@@ -202,10 +222,12 @@ class Admissions:
             """, (GATE, slot))
 
 
-def capture_ready(admissions, snapshots, next_slot, now, on_notice=None):
+def capture_ready(admissions, snapshots, next_slot, now, on_notice=None, live_jobs=()):
     """Collect finalized traffic once a trusted pre-state is available."""
     for event in admissions.active_jobs():
         if event["anchor_slot"] + event["replay_slots"] >= next_slot:
+            continue
+        if event["proposal"] in live_jobs:
             continue
         policy = admissions.policies.get(event["target"])
         if policy is None or not policy.active or now >= policy.expires:
@@ -270,6 +292,12 @@ def main():
         raise ValueError("expected Solana Devnet")
     with closing(sqlite3.connect(args.database)) as database:
         admissions = Admissions(database, policies, notify)
+        live_jobs = {}
+        # Time-sensitive live snapshots cannot be recovered from the disk after a restart.
+        for job in admissions.active_jobs():
+            if job.get("live_prestate") or (policies.get(job["target"]) and policies[job["target"]].seed_accounts is not None):
+                admissions.finish(job["proposal"], datetime.now(timezone.utc),
+                                  "refused", "live pre-state was lost on restart")
 
         def refresh_policies():
             admissions.policies = load_policies()
@@ -278,6 +306,24 @@ def main():
             refresh_policies()
             customer = admissions.consume(event, datetime.now(timezone.utc), enqueue=True)
             if customer is not None:
+                policy = admissions.policies[event["target"]]
+                if policy.seed_accounts is not None:
+                    proposal = event["proposal"]
+                    try:
+                        bundle = capture_prestate(event, policy.seed_accounts)
+                        if sum(b["encoded_bytes"] for b in live_jobs.values()) + bundle["encoded_bytes"] > 16 * 1024 * 1024:
+                            raise PrestateRefused("live pre-state cache is full")
+                        live_jobs[proposal] = bundle
+                        admissions.record_prestate(proposal, bundle["capture_slot"])
+                    except PrestateRefused as exc:
+                        admissions.finish(proposal, datetime.now(timezone.utc), "refused", str(exc))
+                        notify("ReplayFailed", dict(proposal=proposal, reason=str(exc)))
+                        return
+                    except (OSError, KeyError, RuntimeError, TypeError, ValueError):
+                        reason = "unable to read consistent live pre-state"
+                        admissions.finish(proposal, datetime.now(timezone.utc), "refused", reason)
+                        notify("ReplayFailed", dict(proposal=proposal, reason=reason))
+                        return
                 print(json.dumps(dict(event, customer=customer)), flush=True)
                 notify("ProposalCreated", dict(event, customer=customer))
 
@@ -285,6 +331,7 @@ def main():
             refresh_policies()
             if event["target"] in admissions.policies:
                 if name == "UpgradeExecuted":
+                    live_jobs.pop(event["proposal"], None)
                     admissions.finish(event["proposal"], datetime.now(timezone.utc), "executed")
                 notify(name, event)
 
@@ -298,7 +345,12 @@ def main():
             admissions.checkpoint(slot)
             if time.monotonic() >= next_capture:
                 refresh_policies()
-                capture_ready(admissions, args.snapshots, slot, datetime.now(timezone.utc), notify)
+                now = datetime.now(timezone.utc)
+                for proposal, bundle in list(live_jobs.items()):
+                    if now.timestamp() > bundle["expires_at"]:
+                        live_jobs.pop(proposal)
+                        admissions.finish(proposal, now, "refused", "proposal expired")
+                capture_ready(admissions, args.snapshots, slot, now, notify, live_jobs)
                 next_capture = time.monotonic() + 30
             if verifier_address and time.monotonic() >= balance_check:
                 balance_check = time.monotonic() + 300

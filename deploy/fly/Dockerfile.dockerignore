@@ -11,3 +11,4 @@
 !scripts/customer_admin.py
 !scripts/worker_http.py
 !scripts/worker_notify.py
+!scripts/live_prestate.py
