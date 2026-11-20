@@ -228,7 +228,13 @@ pub fn run(
     vm.airdrop(&payer.pubkey(), 100_000_000_000)
         .map_err(|e| anyhow!("{e:?}"))?;
     vm.add_program(ID, gate)?;
-    let target = Pubkey::new_from_array([58; 32]);
+    let target_byte = std::env::var("CANARY_FIXTURE_CLIENT")
+        .ok()
+        .map(|client| client.parse::<u8>())
+        .transpose()?
+        .unwrap_or_default();
+    ensure!(target_byte <= 3, "fixture client must be in 0..=3");
+    let target = Pubkey::new_from_array([58 + target_byte; 32]);
     let pd = loader::get_program_data_address(&target);
     let buffer = Pubkey::new_unique();
     let cfg = Pubkey::find_program_address(&[b"gatekeeper_cfg", target.as_ref()], &ID).0;

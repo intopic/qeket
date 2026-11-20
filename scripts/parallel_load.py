@@ -2,6 +2,8 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+import resource
 from pathlib import Path
 import shutil
 import subprocess
@@ -47,7 +49,9 @@ def main():
         start_replay = elapsed()
         command = [runner, "demo", gate, baseline, candidate, rebuilt, version, evidence, regression]
         with (directory / "replay.log").open("wb") as log:
-            subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
+            env = dict(os.environ, CANARY_FIXTURE_CLIENT=str(number))
+            subprocess.run(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                           check=True, timeout=180)
         stop_replay = elapsed()
         result = json.loads((evidence / "report.json").read_bytes())
         if result["replayed_transactions_per_verifier"] != 1000 or result["late_regression"]["expected_transaction_ordinal"] != 901:
@@ -76,7 +80,12 @@ def main():
         clients = list(executor.map(run_client, range(1, 4)))
     if len({client["archive_sha256"] for client in clients}) != 3:
         raise RuntimeError("client archives must be distinct")
-    output = {"fixture": "counter", "source_commit": version, "clients": clients}
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    output = {
+        "fixture": "counter", "source_commit": version, "clients": clients,
+        "total_child_cpu_seconds": usage.ru_utime + usage.ru_stime,
+        "largest_child_peak_rss_kib": usage.ru_maxrss,
+    }
     for phase in ("build", "replay"):
         intervals = [client[f"{phase}_interval_seconds"] for client in clients]
         overlap = min(end for _, end in intervals) - max(start for start, _ in intervals)
