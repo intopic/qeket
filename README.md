@@ -129,6 +129,8 @@ Për ta përsëritur fushatën në Linux, ndërto më parë gate-in me komandën
 CANARY_FUZZ_ITERATIONS=1000000 FUZZING_METRICS=1 cargo run --locked --release --bin fuzz_policy
 ```
 
+Vendos `CANARY_FUZZ_SCENARIO=reclaim_buffer` per fushaten e rikuperimit te buffer-it. [Rezultatet e fushates](docs/test-results/trident-reclaim-1m.json).
+
 ### Ingress dhe statusi i worker-it
 
 Konfigurimi i klientit pranon `repo_url` (HTTPS), `library_name`, `build_subdir` dhe `webhook_url`. Per t'i ruajtur me CLI perdor `--repo-url`, `--library-name`, `--build-subdir` dhe `--webhook-url`. URL-ja e repos nuk duhet te permbaje kredenciale. Konfigurimi ruan burimin per integrimin e builder-it.
@@ -139,4 +141,3 @@ Konfigurimi i klientit pranon `repo_url` (HTTPS), `library_name`, `build_subdir`
 - RPC kerkon `maxSupportedTransactionVersion: 1` per lexim. Nje transaksion v1 i lidhur me target-in e ben dritaren te paperputhshme me runner-in aktual. Worker-i regjistron refuzimin dhe liron job-in. LiteSVM vazhdon me legacy dhe v0.
 
 Fly mban `auto_stop_machines = "off"` derisa job-et qe presin finalizimin te kene nje mekanizem zgjimi te pavarur nga webhook-u fillestar. Marrja e gjendjes historike, ndertimi nga repoja e klientit dhe votimi automatik mbeten per integrim. Per dritaret e mbeshtetura, worker-i ende lexon snapshot-in e besuar nga volumi.
-

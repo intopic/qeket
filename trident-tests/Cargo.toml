@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 anchor-lang = "=0.31.3"
+bincode = "=1.3.3"
 canary-upgrade-gate = { path = "../programs/canary_upgrade_gate", features = ["no-entrypoint"] }
 trident-fuzz = { version = "=0.12.0", features = ["all"] }
 
