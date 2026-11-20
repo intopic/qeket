@@ -1,0 +1,18 @@
+{
+  "environment": "Fly.io Sprite qeket-test",
+  "engine": "Trident 0.12.0",
+  "instruction": "transfer_program_authority",
+  "scenario": "transfer_program_authority_guards",
+  "scope": "Denial paths before the loader CPI. Trident 0.12.0 cannot execute the checked upgradeable-loader authority CPI. The local LiteSVM upgrade demo exercises the authorized paths.",
+  "gate_elf_sha256": "0c0d7252e45fdbde344aeb55db4640991b39b8ef8656687e8ad40a4be9b80176",
+  "harness_sha256": "4ac58eab6481c1a55a0548ad229f928b15b1b406e7eec1a4210775fe5134694d",
+  "cargo_lock_sha256": "766ab59f03d33d6a04fe0be72672180bf8866a6ef8024c76fd8c025493de73d8",
+  "master_seed": "3543cd49e5097aa3f17f284ce9517d888152a9d7647c74e19c3bae7cbd9119cc",
+  "iterations": 1000000,
+  "rejected_invalid": 1000000,
+  "instruction_panics": 0,
+  "program_authority_and_policy_generation_unchanged": true,
+  "wall_seconds": 16.029,
+  "user_cpu_seconds": 125.189,
+  "system_cpu_seconds": 0.136
+}

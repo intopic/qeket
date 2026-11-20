@@ -4,7 +4,10 @@ use anchor_lang::{
 };
 use canary_upgrade_gate::{
     accounts, instruction,
-    state::{GatekeeperConfig, Policy, ProposalStatus, ReplayMode, UpgradeProposal},
+    state::{
+        AuthorityRole, GatekeeperConfig, PendingAuthority, Policy, ProposalStatus, ReplayMode,
+        UpgradeProposal,
+    },
     ID,
 };
 use trident_fuzz::fuzzing::*;
@@ -81,10 +84,10 @@ impl FuzzTest {
 
     #[flow]
     fn exercise_gate(&mut self) {
-        if reclaim_mode() {
-            self.validate_buffer_reclaim();
-        } else {
-            self.validate_policy_updates();
+        match scenario() {
+            Scenario::Policy => self.validate_policy_updates(),
+            Scenario::Reclaim => self.validate_buffer_reclaim(),
+            Scenario::Transfer => self.validate_authority_transfer(),
         }
     }
 
@@ -230,12 +233,103 @@ impl FuzzTest {
             if is_reclaimable { 0 } else { rent }
         );
     }
+
+    fn validate_authority_transfer(&mut self) {
+        let addresses = &self.fuzz_accounts;
+        let emergency = Pubkey::new_from_array([62; 32]);
+        let unrelated = Pubkey::new_from_array([63; 32]);
+        let recipient = Pubkey::new_from_array([64; 32]);
+        let authority =
+            [addresses.governance, emergency, unrelated][self.trident.random_from_range(0..3)];
+        let requested_signature = self.trident.random_from_range(0..4) != 0;
+        let ready = self.trident.random_from_range(-1..=1);
+        let generation = self.trident.random_from_range(0..2u64);
+        let role = if self.trident.random_from_range(0..3) == 0 {
+            AuthorityRole::Governance
+        } else {
+            AuthorityRole::ProgramUpgrade
+        };
+        for signer in [authority, recipient] {
+            self.trident.airdrop(&signer, LAMPORTS_PER_SOL);
+        }
+        let (pending, _) =
+            Pubkey::find_program_address(&[b"authority", addresses.config.as_ref()], &ID);
+        let request = PendingAuthority {
+            role,
+            candidate: recipient,
+            generation_nonce: generation << 32,
+            ready_at: self.trident.get_current_timestamp() + ready,
+            refund: addresses.governance,
+        };
+        let mut request_data = Vec::new();
+        request.try_serialize(&mut request_data).unwrap();
+        let mut request_account = AccountSharedData::new(LAMPORTS_PER_SOL, request_data.len(), &ID);
+        request_account.set_data_from_slice(&request_data);
+        self.trident.set_account_custom(&pending, &request_account);
+        let program_data = loader::get_program_data_address(&addresses.target);
+        let program_state = loader::UpgradeableLoaderState::ProgramData {
+            slot: 0,
+            upgrade_authority_address: Some(addresses.config),
+        };
+        let data = bincode::serialize(&program_state).unwrap();
+        let mut program_account = AccountSharedData::new(LAMPORTS_PER_SOL, data.len(), &loader::ID);
+        program_account.set_data_from_slice(&data);
+        self.trident
+            .set_account_custom(&program_data, &program_account);
+        let mut metas = accounts::TransferProgramAuthority {
+            authority,
+            config: addresses.config,
+            candidate: recipient,
+            program_data,
+            loader_program: loader::ID,
+            pending: Some(pending),
+        }
+        .to_account_metas(None);
+        // Denial-only campaign. Trident 0.12 cannot execute this checked loader CPI.
+        let eligible = authority == emergency
+            || (authority == addresses.governance
+                && role == AuthorityRole::ProgramUpgrade
+                && generation == 0
+                && ready <= 0);
+        metas[2].is_signer = requested_signature && !eligible;
+        let transfer = Instruction {
+            program_id: ID,
+            accounts: metas,
+            data: instruction::TransferProgramAuthority {}.data(),
+        };
+        let result = self
+            .trident
+            .process_transaction(&[transfer], Some("transfer_program_authority"));
+        let unsupported = format!("Program {} not supported by inner instructions", loader::ID);
+        assert!(
+            result.is_error() && !result.logs().contains(&unsupported),
+            "{:?} {}",
+            result.get_result(),
+            result.logs()
+        );
+        let observed = self.trident.get_account(&program_data);
+        let state: loader::UpgradeableLoaderState = bincode::deserialize(observed.data()).unwrap();
+        assert_eq!(state, program_state);
+        let config = self.trident.get_account(&addresses.config);
+        let state = GatekeeperConfig::try_deserialize(&mut config.data().as_ref()).unwrap();
+        assert_eq!(state.proposal_nonce, 0);
+    }
 }
 
-fn reclaim_mode() -> bool {
-    static RECLAIM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *RECLAIM
-        .get_or_init(|| std::env::var("CANARY_FUZZ_SCENARIO").as_deref() == Ok("reclaim_buffer"))
+enum Scenario {
+    Policy,
+    Reclaim,
+    Transfer,
+}
+
+fn scenario() -> &'static Scenario {
+    static SCENARIO: std::sync::OnceLock<Scenario> = std::sync::OnceLock::new();
+    SCENARIO.get_or_init(|| match std::env::var("CANARY_FUZZ_SCENARIO").as_deref() {
+        Err(_) | Ok("propose_config_update") => Scenario::Policy,
+        Ok("reclaim_buffer") => Scenario::Reclaim,
+        Ok("transfer_program_authority_guards") => Scenario::Transfer,
+        Ok(other) => panic!("unknown fuzz scenario: {other}"),
+    })
 }
 
 fn main() {

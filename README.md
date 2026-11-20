@@ -131,6 +131,8 @@ CANARY_FUZZ_ITERATIONS=1000000 FUZZING_METRICS=1 cargo run --locked --release --
 
 Vendos `CANARY_FUZZ_SCENARIO=reclaim_buffer` per fushaten e rikuperimit te buffer-it. [Rezultatet e fushates](docs/test-results/trident-reclaim-1m.json).
 
+Vendos `CANARY_FUZZ_SCENARIO=transfer_program_authority_guards` për kontrollet e refuzimit para CPI-së së transferimit. Prova LiteSVM ushtron rrugët e autorizuara të transferimit. [Rezultatet e fushatës në Sprite](docs/test-results/trident-transfer-guards-1m.json).
+
 ### Ingress dhe statusi i worker-it
 
 Konfigurimi i klientit pranon `repo_url` (HTTPS), `library_name`, `build_subdir` dhe `webhook_url`. Per t'i ruajtur me CLI perdor `--repo-url`, `--library-name`, `--build-subdir` dhe `--webhook-url`. URL-ja e repos nuk duhet te permbaje kredenciale. Konfigurimi ruan burimin per integrimin e builder-it.
