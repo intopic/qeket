@@ -392,11 +392,20 @@ pub fn run(
         },
         instruction::SubmitVerifiedAttestation {},
     );
+    let mut altered_buffer = archive.clone();
+    altered_buffer.buffer.data[loader::UpgradeableLoaderState::size_of_buffer_metadata()] ^= 1;
+    for binary in [candidate, rebuilt, candidate] {
+        let error = verify(&altered_buffer, baseline, binary)
+            .err()
+            .context("changed buffer unexpectedly verified")?;
+        ensure!(error.to_string() == "rebuilt ELF differs from locked buffer");
+    }
     let mut measured = Vec::new();
     let mut consensus = None;
     let mut vote_message = None;
     let mut verifier_ms = Vec::new();
-    for (node, local_build) in nodes[..2].iter().zip([candidate, rebuilt]) {
+    // The middle verifier supplies a conflicting vote and is then unavailable.
+    for (node, local_build) in [&nodes[0], &nodes[2]].into_iter().zip([candidate, rebuilt]) {
         let started = Instant::now();
         let evidence = verify(&archive, baseline, local_build)?;
         verifier_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
@@ -417,14 +426,7 @@ pub fn run(
             max_cu_delta_bps: evidence.max_cu_delta_bps,
             expires_at_slot: 150,
         };
-        let bytes = payload.try_to_vec()?;
-        let signature: [u8; 64] = node.sign_message(&bytes).into();
-        let verify_ix = solana_ed25519_program::new_ed25519_instruction_with_signature(
-            &bytes,
-            &signature,
-            &node.pubkey().to_bytes(),
-        );
-        let vote = [verify_ix, submit.clone()];
+        let vote = verified_vote(node, &payload, &submit)?;
         let (size, meta) = send(&mut vm, &payer, &[], &vote)?;
         if vote_message.is_none() {
             let message =
@@ -439,6 +441,15 @@ pub fn run(
         measured.push((size, meta.compute_units_consumed));
         if consensus.is_none() {
             rejected(send(&mut vm, &payer, &[], &vote), "AlreadyVoted")?;
+            let mut conflict = payload.clone();
+            conflict.diff_root[0] ^= 1;
+            let wrong_vote = verified_vote(&nodes[1], &conflict, &submit)?;
+            rejected(send(&mut vm, &payer, &[], &wrong_vote), "RootMismatch")?;
+            let unchanged: UpgradeProposal = load(&vm, proposal)?;
+            ensure!(
+                unchanged.attestation_count == 1 && unchanged.diff_root == payload.diff_root,
+                "conflicting vote changed the proposal"
+            );
             rejected(
                 send(&mut vm, &payer, &[], std::slice::from_ref(&execute)),
                 "WrongStatus",
@@ -537,7 +548,12 @@ pub fn run(
         "reclaim_cancelled_and_expired_checked":true, "authority_rotation_and_exit_checked":true,
         "v0_alt_cpi_transactions":archive.records.iter().filter(|record| matches!(record.transaction.message, solana_message::VersionedMessage::V0(_))).count(),
         "synthetic_capture_ms":capture_ms, "replay_per_verifier_ms":verifier_ms,
-        "late_regression":regression_result, "relaxed_mode_checked":true, "quorum":"2/3","deployed_program_data_verified":true,"candidate_invoked":true,"proposal_closed":true,"policy_rotation_checked":true,"emergency_checked":true});
+        "late_regression":regression_result,
+        "local_fault_checks": {
+            "conflicting_vote_rejected":true,
+            "quorum_with_middle_verifier_absent":true,
+            "modified_buffer_rejections":3
+        }, "relaxed_mode_checked":true, "quorum":"2/3","deployed_program_data_verified":true,"candidate_invoked":true,"proposal_closed":true,"policy_rotation_checked":true,"emergency_checked":true});
     fs::create_dir_all(out)?;
     fs::write(
         out.join("vote-message.bin"),
@@ -547,6 +563,21 @@ pub fn run(
     fs::write(out.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn verified_vote(
+    node: &Keypair,
+    payload: &CanaryAttestationPayload,
+    submit: &Instruction,
+) -> Result<[Instruction; 2]> {
+    let bytes = payload.try_to_vec()?;
+    let signature: [u8; 64] = node.sign_message(&bytes).into();
+    let verify_ix = solana_ed25519_program::new_ed25519_instruction_with_signature(
+        &bytes,
+        &signature,
+        &node.pubkey().to_bytes(),
+    );
+    Ok([verify_ix, submit.clone()])
 }
 
 #[allow(clippy::too_many_arguments)]
