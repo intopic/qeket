@@ -1,0 +1,46 @@
+"""Manage the customer configuration loaded by a Canary worker."""
+import argparse
+import json
+from pathlib import Path
+
+from fly_listener import PLANS, customer_policies
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--file", type=Path, required=True)
+    parser.add_argument("action", choices=["set", "suspend", "plan"])
+    parser.add_argument("customer")
+    parser.add_argument("--plan", choices=PLANS)
+    parser.add_argument("--target", action="append")
+    parser.add_argument("--cooldown-minutes", type=int, default=0)
+    parser.add_argument("--active-until")
+    args = parser.parse_args()
+    customers = json.loads(args.file.read_text(encoding="utf-8")) if args.file.exists() else {}
+    if args.action == "set":
+        if not args.target or not args.plan:
+            parser.error("set requires --target and --plan")
+        entry = dict(targets=args.target, plan=args.plan, active=True, cooldown_minutes=args.cooldown_minutes)
+        if args.active_until:
+            entry["active_until"] = args.active_until
+        customers[args.customer] = entry
+    elif args.customer not in customers:
+        parser.error("unknown customer")
+    elif args.action == "suspend":
+        customers[args.customer]["active"] = False
+    else:
+        if not args.plan:
+            parser.error("plan requires --plan")
+        entry = customers[args.customer]
+        entry["plan"] = args.plan
+        for field in ("max_upgrades_per_month", "max_replay_txs", "monthly_proposals"):
+            entry.pop(field, None)
+    payload = json.dumps(customers, indent=2)
+    customer_policies(payload)
+    staged = args.file.with_suffix(args.file.suffix + ".tmp")
+    staged.write_text(payload + "\n", encoding="utf-8")
+    staged.replace(args.file)
+
+
+if __name__ == "__main__":
+    main()

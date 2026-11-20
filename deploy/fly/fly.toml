@@ -4,3 +4,8 @@ primary_region = "fra"
 [[vm]]
   size = "shared-cpu-1x"
   memory = "256mb"
+
+[mounts]
+  source = "canary_admissions"
+  destination = "/data"
+  initial_size = "1gb"

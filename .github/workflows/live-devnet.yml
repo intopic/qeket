@@ -1,12 +1,22 @@
 name: Live Devnet counter
 on:
   workflow_dispatch:
+    inputs:
+      replay_transactions:
+        description: "Number of Devnet counter transactions (50–100)"
+        default: "50"
+        type: string
   push:
     paths:
       - '.github/workflows/live-devnet.yml'
       - 'scripts/live_build.sh'
       - 'scripts/live_cycle.py'
       - 'scripts/live_capture.py'
+      - 'scripts/fly_listener.py'
+      - 'scripts/customer_admin.py'
+      - 'packages/squads-adapter/**'
+      - 'scripts/test_fly_listener.py'
+      - 'deploy/fly/**'
 permissions:
   contents: read
 concurrency:
@@ -25,6 +35,16 @@ jobs:
         with:
           persist-credentials: false
       - run: pip install --disable-pip-version-check solders==0.26.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check the Squads instruction adapter
+        working-directory: packages/squads-adapter
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+      - name: Check listener admission policy
+        run: python -m unittest discover -s scripts -p test_fly_listener.py
       - name: Prepare Devnet identities
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -62,7 +82,7 @@ jobs:
           cargo fetch --locked
           cargo +"$CANARY_SBF_TOOLCHAIN" build --offline --locked --target sbpf-solana-solana --release -p canary-upgrade-gate
           cargo build --offline --locked -p svm-canary-runner
-          python -m py_compile scripts/live_capture.py scripts/live_cycle.py
+          python -m py_compile scripts/live_capture.py scripts/live_cycle.py scripts/fly_listener.py
       - name: Install deploy CLI
         run: |
           curl -fsSL --retry 3 https://github.com/anza-xyz/agave/releases/download/v2.3.13/solana-release-x86_64-unknown-linux-gnu.tar.bz2 -o "$RUNNER_TEMP/cli.tbz"
@@ -88,6 +108,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         env:
           RPC_URL: ${{ secrets.RPC_URL }}
+          CANARY_SAMPLE_COUNT: ${{ inputs.replay_transactions }}
         run: python scripts/live_cycle.py run
       - uses: actions/upload-artifact@v4
         if: always() && github.event_name == 'workflow_dispatch'
@@ -109,15 +130,17 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP: ${{ vars.FLY_APP }}
+          CANARY_CUSTOMERS: ${{ secrets.CANARY_CUSTOMERS }}
           RPC_URL: ${{ secrets.RPC_URL }}
         run: |
           gate=$(python -c 'import sys;sys.path.insert(0,"scripts");from live_cycle import key;print(key("gate").pubkey())')
           app="${FLY_APP:-canary-$(echo "$gate" | cut -c1-16 | tr '[:upper:]' '[:lower:]')}"
+          PYTHONPATH=scripts python -c 'import os; from fly_listener import customer_policies; customer_policies(os.environ["CANARY_CUSTOMERS"])'
           flyctl status -a "$app" >/dev/null 2>&1 || flyctl apps create "$app" --org personal
-          printf 'RPC_URL=%s\nGATE_PROGRAM_ID=%s\n' "$RPC_URL" "$gate" | flyctl secrets import --stage -a "$app"
+          python -c 'import json,os,sys; print("RPC_URL="+os.environ["RPC_URL"]); print("GATE_PROGRAM_ID="+sys.argv[1]); print("CANARY_CUSTOMERS="+json.dumps(json.loads(os.environ["CANARY_CUSTOMERS"])))' "$gate" | flyctl secrets import --stage -a "$app"
           context="$RUNNER_TEMP/fly-worker"
           mkdir -p "$context/scripts" "$context/deploy/fly"
-          cp scripts/{devnet,live_capture}.py "$context/scripts/"
+          cp scripts/{devnet,live_capture,fly_listener,customer_admin}.py "$context/scripts/"
           cp deploy/fly/* "$context/deploy/fly/"
           cd "$context"
           flyctl deploy --ha=false --remote-only -c deploy/fly/fly.toml -a "$app"

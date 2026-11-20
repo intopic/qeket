@@ -128,8 +128,11 @@ def run():
         time.sleep(1)
     cfg, pd = pda(b"gatekeeper_cfg",target), pda(target,owner=loader)
     votes = [key("vote"+str(i)) for i in range(3)]
-    span = 96
-    policy = bytes(1)+b"".join(bytes(v.pubkey()) for v in votes)+bytes(128)+pack("<BBHIQqq",3,2,1500,1,span,5,3600)
+    sample_count = int(os.getenv("CANARY_SAMPLE_COUNT", "50"))
+    if not 50 <= sample_count <= 100:
+        raise ValueError("CANARY_SAMPLE_COUNT must be between 50 and 100")
+    span = 256
+    policy = bytes(1)+b"".join(bytes(v.pubkey()) for v in votes)+bytes(128)+pack("<BBHIQqq",3,2,1500,sample_count,span,5,3600)
     send("initialize_gatekeeper",[ix("initialize_gatekeeper",[meta(payer,True,True),meta(payer,False,True),meta(target),meta(pd),meta(cfg,True),meta(system)],policy+bytes(key("emergency").pubkey()))])
     send("transfer upgrade and buffer authorities",[Instruction(loader,pack("<I",4),[meta(k,True),meta(payer,False,True),meta(cfg)]) for k in [pd,buf]])
     rent = rpc("getMinimumBalanceForRentExemption",8)
@@ -148,8 +151,22 @@ def run():
     if event["proposal"] != str(proposal) or event["target"] != str(target) or event["replay_slots"] != span:
         raise ValueError("unexpected proposal event")
     start = event["anchor_slot"]
-    sample = send("counter replay sample",[Instruction(target,pack("<Q",7),[meta(counter,True)])],key("traffic"))
-    while rpc("getSlot", FINAL) <= start+span:
+    traffic_key = key("traffic")
+    bh = Hash.from_string(rpc("getLatestBlockhash", FINAL)["value"]["blockhash"])
+    sample_signatures = []
+    for increment in range(1, sample_count + 1):
+        instructions = [set_compute_unit_limit(50_000),
+                        Instruction(target, pack("<Q", increment), [meta(counter, True)])]
+        tx = Transaction.new_signed_with_payer(instructions, traffic, [traffic_key], bh)
+        sig = rpc("sendTransaction", base64.b64encode(bytes(tx)).decode(),
+                  {"encoding": "base64", "preflightCommitment": "finalized"})
+        sample_signatures.append(sig)
+    for sig in sample_signatures:
+        receipt("counter replay sample", sig)
+    deadline = time.monotonic() + 300
+    while rpc("getSlot", FINAL) <= start + span:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("replay window did not finalize")
         time.sleep(2)
     # This fixture never reads Clock. Populate times for produced slots, carrying
     # the last timestamp over skipped slots. Reject windows crossing an epoch.
@@ -164,15 +181,17 @@ def run():
     archive=capture(dict(target=list(bytes(target)),gate=list(bytes(cfg)),buffer_key=list(bytes(buf)),nonce=0,source_commit=commit,
         expected_elf=list(sha),baseline_elf=list(hashlib.sha256(base.read_bytes()).digest()),buffer=account(accounts[2]),
         accounts=[[list(bytes(k)),account(v)] for k,v in zip([counter,traffic],accounts)], anchor_slot=start,replay_slots=span,
-        min_txs=1,cu_limit_bps=1500,replay_mode="StrictEquality",clocks=clocks),int(os.getenv("MAX_REPLAY_TXS","500")))
+        min_txs=sample_count,cu_limit_bps=1500,replay_mode="StrictEquality",clocks=clocks),int(os.getenv("MAX_REPLAY_TXS","500")))
     records=archive["records"]
-    if len(records)!=1 or bytes.fromhex(records[0]["transaction"])[1:65] != live_capture.from_base58(sample):
+    expected_signatures = {live_capture.from_base58(sig) for sig in sample_signatures}
+    captured_signatures = {bytes.fromhex(record["transaction"])[1:65] for record in records}
+    if len(records) != sample_count or captured_signatures != expected_signatures:
         raise ValueError("unexpected traffic for dedicated counter snapshot")
     path=OUT/"archive.json"
     path.write_text(json.dumps(archive))
     for voter,binary in zip(votes,[candidate,rebuilt]):
         evidence=json.loads(subprocess.check_output(["target/debug/canary-gate","verify",path,base,binary]))
-        msg=b"CANARY_GATE_M1__"+bytes(target)+bytes(8)+bytes(buf)+pack("<QQ",start,span)+sha+bytes(evidence["diff_root"])+pack("<IIHQ",1,0,evidence["max_cu_delta_bps"],rpc("getSlot",FINAL)+500)
+        msg=b"CANARY_GATE_M1__"+bytes(target)+bytes(8)+bytes(buf)+pack("<QQ",start,span)+sha+bytes(evidence["diff_root"])+pack("<IIHQ",evidence["replayed_tx_count"],0,evidence["max_cu_delta_bps"],rpc("getSlot",FINAL)+500)
         ed=Instruction(Pubkey.from_string("Ed25519SigVerify111111111111111111111111111"),pack("<BB7H",1,0,48,65535,16,65535,112,len(msg),65535)+bytes(voter.pubkey())+bytes(voter.sign_message(msg))+msg,[])
         send("submit_verified_attestation",[ed,ix("submit_verified_attestation",[meta(cfg),meta(proposal,True),meta(Pubkey.from_string("Sysvar1nstructions1111111111111111111111111"))])])
     ready_at = struct.unpack_from("<q",base64.b64decode(get(proposal)["data"][0]),-9)[0]

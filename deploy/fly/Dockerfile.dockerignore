@@ -5,3 +5,7 @@
 !scripts/
 !scripts/devnet.py
 !scripts/live_capture.py
+
+!deploy/fly/start.sh
+!scripts/fly_listener.py
+!scripts/customer_admin.py

@@ -66,7 +66,11 @@ def proposals(logs):
                            nonce=nonce, anchor_slot=anchor, replay_slots=span)
 
 
-def watch(start):
+def print_event(event):
+    print(json.dumps(event), flush=True)
+
+
+def watch(start, on_event=print_event, checkpoint=None):
     cursor = start if start is not None else rpc("getSlot", FINAL)
     while True:
         tip = rpc("getSlot", FINAL)
@@ -90,8 +94,10 @@ def watch(start):
                 sig = entry["signature"]
                 item = rpc("getTransaction",sig,dict(FINAL,encoding="json",maxSupportedTransactionVersion=0))
                 for event in proposals(item["meta"]["logMessages"] or []):
-                    print(json.dumps(dict(event, slot=entry["slot"], signature=sig)), flush=True)
+                    on_event(dict(event, slot=entry["slot"], signature=sig))
             cursor = tip + 1
+            if checkpoint is not None:
+                checkpoint(cursor)
         else:
             time.sleep(1)
 

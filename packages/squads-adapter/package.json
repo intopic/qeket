@@ -1,0 +1,17 @@
+{
+  "name": "@canary-gate/squads-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": { "build": "tsc", "test": "npm run build && node test/instructions.cjs" },
+  "dependencies": {
+    "@solana/web3.js": "1.98.4",
+    "@sqds/multisig": "2.1.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.3",
+    "typescript": "5.8.3"
+  }
+}

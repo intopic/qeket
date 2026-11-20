@@ -73,8 +73,32 @@ Te **Settings → Secrets and variables → Actions** vendos:
 | `RPC_URL` | HTTPS URL e Helius për Devnet, përfshirë API key |
 | `DEVNET_PAYER` | Array JSON i 64 bajtëve për një portofol të dedikuar, të financuar me SOL testues për rent dhe tarifa |
 | `GATE_PROGRAM_KEYPAIR` (opsional) | Array JSON i keypair-it të programit. Pa të, workflow derivon një adresë të qëndrueshme Devnet nga payer-i dhe ndërton gate-in dhe runner-in për atë adresë. |
-| `FLY_API_TOKEN` (opsional) | Token për deploy të worker-it. Për një aplikacion ekzistues vendos edhe repository variable `FLY_APP`. Për krijim automatik token-i duhet të ketë leje në organizatën `personal`. |
+| `FLY_API_TOKEN` (opsional) | Token për deploy të worker-it. Ky hap kërkon edhe secret `CANARY_CUSTOMERS`. Për një aplikacion ekzistues vendos edhe repository variable `FLY_APP`. Për krijim automatik token-i duhet të ketë leje në organizatën `personal`. |
 
 Nis **Actions → Live Devnet counter → Run workflow** në `main`. Një push provon ndërtimin offline. Vetëm nisja manuale aktivizon deploy dhe transaksionet. Dy votuesit Devnet përdorin çelësa të ndryshëm të derivuar në të njëjtin runner. Çdo nisje e re krijon target të ri dhe konsumon rent Devnet. Nëse një nisje dështon pasi ka inicializuar gate-in, artifact-i përmban hapat e finalizuar deri aty. Ruaj payer-in dhe run ID për rikuperimin e autoriteteve.
 
-Artifact-i `devnet-live-<run_id>` përmban `transactions.md` dhe arkivin e replay-it. Snapshot-i i shembullit merret nga RPC para propozimit për counter-in dhe fee payer-in e izoluar. Workflow kërkon pikërisht transaksionin e pritur në dritaren e finalizuar dhe rikonfirmon bytecode-in e instaluar. Counter-i nuk lexon sysvar Clock. Për programe arbitrare, komanda `python scripts/live_capture.py capture SNAPSHOT.json ARCHIVE.json --max-replay-txs 500` kërkon gjendjen historike të fillimit të dritares, përfshirë ALT, ProgramData dhe sysvars përkatëse. `minContextSlot` nuk rikthen gjendjen historike. CLI ekzistuese `canary-gate verify` riekzekuton arkivin. Worker-i Fly ndjek eventet e finalizuara dhe i shkruan në log. Votimi dhe ndërtimi i kandidatit për provën Devnet kryhen në Actions.
+Artifact-i `devnet-live-<run_id>` përmban `transactions.md` dhe arkivin e replay-it. Provën mund ta nisësh me 50–100 transaksione të counter-it, secila me ComputeBudget. Snapshot-i i shembullit merret nga RPC para propozimit për counter-in dhe fee payer-in e izoluar. Workflow kërkon pikërisht transaksionet e pritura në dritaren e finalizuar dhe rikonfirmon bytecode-in e instaluar. Counter-i nuk lexon sysvar Clock. Për programe arbitrare, komanda `python scripts/live_capture.py capture SNAPSHOT.json ARCHIVE.json --max-replay-txs 500` kërkon gjendjen historike të fillimit të dritares, përfshirë ALT, ProgramData dhe sysvars përkatëse. `minContextSlot` nuk rikthen gjendjen historike. CLI ekzistuese `canary-gate verify` riekzekuton arkivin. Worker-i Fly ndjek eventet e finalizuara dhe i shkruan në log. Votimi dhe ndërtimi i kandidatit për provën Devnet kryhen në Actions.
+
+
+### Whitelist dhe kuota për listener-in Fly.io
+
+Vendos `CANARY_CUSTOMERS` si repository secret para se të aktivizosh deploy-in në Fly. Formati është një objekt JSON me ID të qëndrueshme të klientëve.
+
+```json
+{
+  "protocol-a": {
+    "targets": ["<program-id>"],
+    "active_until": "2027-01-01T00:00:00Z",
+    "monthly_proposals": 25
+  }
+}
+```
+
+Zëvendëso `<program-id>` me adresën publike të programit të klientit. Afati është ekskluziv. Kuota mat propozimet unike të pranuara për klientin, brenda muajit kalendarik UTC, dhe ndahet ndërmjet programeve të tij. Një propozim i pranuar ruhet vetëm një herë. Listener-i ruan numërimin dhe pozicionin e leximit në SQLite në volumin e instancës Fly. Konfigurimi aktual presupozon një instancë të vetme për këtë ledger. Politikat e klientëve mirëmbahen në secret dhe hyjnë në fuqi kur publikohet konfigurimi i ri. Kjo fazë filtron eventet që publikohen në log.
+
+
+Planet `starter`, `pro` dhe `enterprise` caktojnë përkatësisht 5, 20 dhe pa kufi propozime në muaj, me tavane prej 500, 2,000 dhe 5,000 transaksionesh për replay. Mund të caktohen `active`, `cooldown_minutes`, `max_upgrades_per_month` dhe `max_replay_txs`. Përditëso `CANARY_CUSTOMERS` ose menaxho skedarin `/data/customers.json` me `python scripts/customer_admin.py --file customers.json set CLIENT --plan starter --target PROGRAM`. Për një klient ekzistues përdor `suspend CLIENT` ose `plan CLIENT --plan pro`. Skedari në volum ka përparësi ndaj secret-it. Një job i pranuar bllokon pranimin e job-eve të tjera të klientit deri në mbyllje. Në fazën aktuale operatori mund ta mbyllë me `python fly_listener.py --finish PROPOSAL`. Tavani i replay-it ruhet në payload-in e job-it. SQLite zbaton kuotën për një instancë. Për kuotë të përbashkët mes nyjeve, kërkohet ruajtje e përbashkët e vendimeve të pranimit.
+
+### Adapteri Squads v4
+
+`packages/squads-adapter` ndërton instruksionet e gate-it dhe i mbështjell me `vaultTransactionCreate` nga SDK Squads. Kalo adresën e gate-it të publikuar, adresën e multisig-ut, indeksin e Vault-it dhe të dhënat aktuale të propozimit. Vault-i duhet të jetë autoriteti për veprimet e qeverisjes dhe të ketë SOL për llogaritë e përdorura gjatë inicializimit ose propozimit. Ndiq rrjedhën e zakonshme Squads për krijimin e propozimit, miratimet dhe ekzekutimin. Për transferimin e autoritetit, rruga e qeverisjes kërkon `proposeProgramAuthorityTransfer` dhe timelock. Në ekzekutim duhet të sigurohet edhe nënshkrimi i marrësit të ri, sipas mënyrës si ai autoritet nënshkruan. Paketa krijon instruksionet dhe payload-in e Vault-it. Integrimi me një Vault të publikuar kërkon ende test on-chain.
