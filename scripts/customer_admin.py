@@ -15,6 +15,10 @@ def main():
     parser.add_argument("--target", action="append")
     parser.add_argument("--cooldown-minutes", type=int, default=0)
     parser.add_argument("--active-until")
+    parser.add_argument("--repo-url")
+    parser.add_argument("--library-name")
+    parser.add_argument("--build-subdir")
+    parser.add_argument("--webhook-url")
     args = parser.parse_args()
     customers = json.loads(args.file.read_text(encoding="utf-8")) if args.file.exists() else {}
     if args.action == "set":
@@ -23,6 +27,13 @@ def main():
         entry = dict(targets=args.target, plan=args.plan, active=True, cooldown_minutes=args.cooldown_minutes)
         if args.active_until:
             entry["active_until"] = args.active_until
+        previous = customers.get(args.customer, {})
+        for field in ("repo_url", "library_name", "build_subdir", "webhook_url"):
+            value = getattr(args, field)
+            if value is not None:
+                entry[field] = value
+            elif field in previous:
+                entry[field] = previous[field]
         customers[args.customer] = entry
     elif args.customer not in customers:
         parser.error("unknown customer")

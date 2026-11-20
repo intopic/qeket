@@ -36,7 +36,7 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo test --workspace --locked --offline
-          python3 -m unittest discover -s scripts -p test_fly_listener.py
+          python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Build and run the local upgrade
         run: python3 scripts/mvp.py --load-test
       - name: Preserve verified binaries and replay evidence

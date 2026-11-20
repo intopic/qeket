@@ -9,3 +9,5 @@
 !deploy/fly/start.sh
 !scripts/fly_listener.py
 !scripts/customer_admin.py
+!scripts/worker_http.py
+!scripts/worker_notify.py

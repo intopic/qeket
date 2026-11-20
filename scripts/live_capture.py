@@ -15,6 +15,8 @@ from devnet import GATE, GENESIS, from_base58, to_base58
 
 GATE = os.environ.get("GATE_PROGRAM_ID", GATE)
 EVENT = hashlib.sha256(b"event:ProposalCreated").digest()[:8]
+UPGRADE = hashlib.sha256(b"event:UpgradeExecuted").digest()[:8]
+EMERGENCY = hashlib.sha256(b"event:EmergencyOverrideTriggered").digest()[:8]
 FINAL = {"commitment": "finalized"}
 
 
@@ -46,10 +48,10 @@ def rpc(method, *params):
 
 def block(slot, encoding):
     return rpc("getBlock", slot, dict(FINAL, encoding=encoding,
-               transactionDetails="full", rewards=False, maxSupportedTransactionVersion=0))
+               transactionDetails="full", rewards=False, maxSupportedTransactionVersion=1))
 
 
-def proposals(logs):
+def gate_events(logs):
     stack = []
     for line in logs:
         invocation = re.fullmatch(r"Program (\w+) invoke \[(\d+)\]", line)
@@ -62,15 +64,27 @@ def proposals(logs):
             raw = base64.b64decode(line[14:], validate=True)
             if len(raw) == 96 and raw.startswith(EVENT):
                 nonce, anchor, span = struct.unpack_from("<QQQ", raw, 72)
-                yield dict(proposal=to_base58(raw[8:40]), target=to_base58(raw[40:72]),
-                           nonce=nonce, anchor_slot=anchor, replay_slots=span)
+                yield "ProposalCreated", dict(proposal=to_base58(raw[8:40]), target=to_base58(raw[40:72]),
+                                              nonce=nonce, anchor_slot=anchor, replay_slots=span)
+            elif len(raw) == 72 and raw.startswith(UPGRADE):
+                yield "UpgradeExecuted", dict(proposal=to_base58(raw[8:40]), target=to_base58(raw[40:72]))
+            elif len(raw) == 104 and raw.startswith(EMERGENCY):
+                yield "EmergencyOverrideTriggered", dict(
+                    target=to_base58(raw[8:40]), buffer=to_base58(raw[40:72]), authority=to_base58(raw[72:104]))
+
+
+
+def proposals(logs):
+    for name, payload in gate_events(logs):
+        if name == "ProposalCreated":
+            yield payload
 
 
 def print_event(event):
     print(json.dumps(event), flush=True)
 
 
-def watch(start, on_event=print_event, checkpoint=None):
+def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_lifecycle=None):
     cursor = start if start is not None else rpc("getSlot", FINAL)
     while True:
         tip = rpc("getSlot", FINAL)
@@ -92,14 +106,20 @@ def watch(start, on_event=print_event, checkpoint=None):
                 before = page[-1]["signature"]
             for entry in reversed(events):
                 sig = entry["signature"]
-                item = rpc("getTransaction",sig,dict(FINAL,encoding="json",maxSupportedTransactionVersion=0))
-                for event in proposals(item["meta"]["logMessages"] or []):
-                    on_event(dict(event, slot=entry["slot"], signature=sig))
+                item = rpc("getTransaction",sig,dict(FINAL,encoding="json",maxSupportedTransactionVersion=1))
+                if not item or not item.get("meta"):
+                    raise RuntimeError("finalized gate transaction unavailable")
+                for name, event in gate_events(item["meta"]["logMessages"] or []):
+                    event = dict(event, slot=entry["slot"], signature=sig)
+                    if name == "ProposalCreated":
+                        on_event(event)
+                    elif on_lifecycle is not None:
+                        on_lifecycle(name, event)
             cursor = tip + 1
             if checkpoint is not None:
                 checkpoint(cursor)
         else:
-            time.sleep(1)
+            wait(1)
 
 
 def invoked(item, target):
@@ -115,6 +135,10 @@ def invoked(item, target):
     for group in meta.get("innerInstructions") or []:
         instructions.extend(group["instructions"])
     return any(keys[ix["programIdIndex"]] == target for ix in instructions)
+
+
+class UnsupportedReplayVersion(ValueError):
+    pass
 
 
 def capture(snapshot, limit):
@@ -140,11 +164,17 @@ def capture(snapshot, limit):
                 raise ValueError("address history scan limit exceeded")
             if start <= entry["slot"] <= start + span and entry["err"] is None:
                 sig = entry["signature"]
-                options_tx = dict(FINAL, maxSupportedTransactionVersion=0)
+                options_tx = dict(FINAL, maxSupportedTransactionVersion=1)
                 item = rpc("getTransaction", sig, dict(options_tx, encoding="json"))
+                if not item or not item.get("meta"):
+                    raise RuntimeError("finalized transaction metadata unavailable")
                 if item["slot"] != entry["slot"]:
                     raise ValueError("transaction slot mismatch")
                 if invoked(item, target):
+                    if item.get("version", "legacy") not in ("legacy", 0):
+                        raise UnsupportedReplayVersion(
+                            f"target transaction at slot {item['slot']} has unsupported version {item['version']}: {sig}"
+                        )
                     matches.append((item["slot"], sig))
                     if len(matches) > limit:
                         raise ValueError("max_replay_txs exceeded")
@@ -152,10 +182,10 @@ def capture(snapshot, limit):
             break
         before = page[-1]["signature"]
     for slot in sorted({slot for slot, _ in matches}):
-        signatures = rpc("getBlock", slot, dict(FINAL, transactionDetails="signatures", rewards=False, maxSupportedTransactionVersion=0))["signatures"]
+        signatures = rpc("getBlock", slot, dict(FINAL, transactionDetails="signatures", rewards=False, maxSupportedTransactionVersion=1))["signatures"]
         positions = {sig: i for i, sig in enumerate(signatures)}
         for index, sig in sorted((positions[s], s) for n,s in matches if n == slot):
-            tx = rpc("getTransaction", sig, dict(FINAL, encoding="base64", maxSupportedTransactionVersion=0))
+            tx = rpc("getTransaction", sig, dict(FINAL, encoding="base64", maxSupportedTransactionVersion=1))
             raw = base64.b64decode(tx["transaction"][0], validate=True)
             signature = from_base58(sig)
             if tx["slot"] != slot or len(raw) > 1232 or raw[1:65] != signature:
