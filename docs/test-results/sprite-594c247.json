@@ -1,0 +1,36 @@
+{
+  "environment": "synthetic local LiteSVM",
+  "transactions_per_replay": 1000,
+  "v0_alt_cpi_transactions": 100,
+  "candidate_build_ms": 2204.706318999797,
+  "candidate_rebuild_ms": 3563.9569949998986,
+  "archive_bytes": 622611,
+  "standalone_replay_wall_ms": [
+    3387.440550000065,
+    3376.3208160000886,
+    3376.7785640000056,
+    3402.9992480000146,
+    3375.903684999912
+  ],
+  "late_regression": {
+    "expected_transaction_ordinal": 901,
+    "index": 233,
+    "reason": "post-state differs for 5w5aSyzkAmgYBcG3qop5EuLgpbMhAe7rnneuFkGjYKYc at slot 102, index 233",
+    "rejection_ms": 1555.20397,
+    "slot": 102
+  },
+  "upgrade_cu": 16531,
+  "vote_bytes_and_cu": [
+    [
+      610,
+      7970
+    ],
+    [
+      610,
+      7998
+    ]
+  ],
+  "standalone_replay_cpu_seconds": 3.379035,
+  "standalone_replay_peak_rss_kib": 30468,
+  "resource_sample_wall_ms": 3386.8450899999516
+}
