@@ -133,6 +133,8 @@ Vendos `CANARY_FUZZ_SCENARIO=reclaim_buffer` per fushaten e rikuperimit te buffe
 
 Vendos `CANARY_FUZZ_SCENARIO=transfer_program_authority_guards` për kontrollet e refuzimit para CPI-së së transferimit. Prova LiteSVM ushtron rrugët e autorizuara të transferimit. [Rezultatet e fushatës në Sprite](docs/test-results/trident-transfer-guards-1m.json).
 
+Pasi të ndërtosh edhe counter-in me `scripts/mvp.py`, vendos `CANARY_FUZZ_SCENARIO=execute_gated_upgrade_guards` për kontrollet e gjeneratës së politikës, statusit, skadimit, timelock-ut dhe ndryshimit të baseline-it. [Rezultatet e fushatës në Sprite](docs/test-results/trident-execute-guards-1m.json).
+
 ### Ingress dhe statusi i worker-it
 
 Konfigurimi i klientit pranon `repo_url` (HTTPS), `library_name`, `build_subdir` dhe `webhook_url`. Per t'i ruajtur me CLI perdor `--repo-url`, `--library-name`, `--build-subdir` dhe `--webhook-url`. URL-ja e repos nuk duhet te permbaje kredenciale. Konfigurimi ruan burimin per integrimin e builder-it.

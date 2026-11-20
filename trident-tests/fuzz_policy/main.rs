@@ -88,6 +88,7 @@ impl FuzzTest {
             Scenario::Policy => self.validate_policy_updates(),
             Scenario::Reclaim => self.validate_buffer_reclaim(),
             Scenario::Transfer => self.validate_authority_transfer(),
+            Scenario::Execute => self.validate_upgrade_execution_guards(),
         }
     }
 
@@ -314,12 +315,154 @@ impl FuzzTest {
         let state = GatekeeperConfig::try_deserialize(&mut config.data().as_ref()).unwrap();
         assert_eq!(state.proposal_nonce, 0);
     }
+
+    fn validate_upgrade_execution_guards(&mut self) {
+        let addresses = &self.fuzz_accounts;
+        let buffer = Pubkey::new_from_array([63; 32]);
+        let spill = Pubkey::new_from_array([64; 32]);
+        let program_data = loader::get_program_data_address(&addresses.target);
+        let guard = self.trident.random_from_range(0..5);
+        let baseline = 0u64;
+        let nonce = if guard == 0 { 1u64 << 32 } else { 0 };
+        let (proposal, bump) = Pubkey::find_program_address(
+            &[b"proposal", addresses.target.as_ref(), &nonce.to_le_bytes()],
+            &ID,
+        );
+        let now = self.trident.get_current_timestamp();
+        let jitter = self.trident.random_from_range(1..=20);
+        let state = UpgradeProposal {
+            bump,
+            nonce,
+            target_program: addresses.target,
+            baseline_deploy_slot: if guard == 4 {
+                self.trident.random_from_range(1..64u64)
+            } else {
+                baseline
+            },
+            buffer_account: buffer,
+            spill_account: spill,
+            expected_elf_sha256: [0; 32],
+            git_commit_sha: [0; 20],
+            anchor_slot: 70,
+            replay_slots: 2,
+            diff_root: [1; 32],
+            attestation_bitmap: 0b11,
+            attestation_count: 2,
+            created_at: now - 100,
+            expires_at: if guard == 2 {
+                now - jitter
+            } else {
+                now + jitter
+            },
+            ready_at: if guard == 3 {
+                now - 30 + jitter
+            } else {
+                now - 30 - jitter
+            },
+            status: if guard == 1 {
+                ProposalStatus::Cancelled
+            } else {
+                ProposalStatus::Ready
+            },
+        };
+        let mut proposal_bytes = Vec::new();
+        state.try_serialize(&mut proposal_bytes).unwrap();
+        let mut proposal_account =
+            AccountSharedData::new(LAMPORTS_PER_SOL, proposal_bytes.len(), &ID);
+        proposal_account.set_data_from_slice(&proposal_bytes);
+        self.trident
+            .set_account_custom(&proposal, &proposal_account);
+        let loader_accounts = [
+            (
+                addresses.target,
+                loader::UpgradeableLoaderState::Program {
+                    programdata_address: program_data,
+                },
+                true,
+            ),
+            (
+                program_data,
+                loader::UpgradeableLoaderState::ProgramData {
+                    slot: baseline,
+                    upgrade_authority_address: Some(addresses.config),
+                },
+                false,
+            ),
+            (
+                buffer,
+                loader::UpgradeableLoaderState::Buffer {
+                    authority_address: Some(addresses.config),
+                },
+                false,
+            ),
+        ];
+        for (key, state, executable) in loader_accounts {
+            let mut data = bincode::serialize(&state).unwrap();
+            if key == program_data {
+                static BASELINE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+                let baseline_elf = BASELINE.get_or_init(|| {
+                    std::fs::read(
+                        "../target/mvp/baseline/sbpf-solana-solana/release/canary_counter.so",
+                    )
+                    .expect("build the baseline counter with scripts/mvp.py")
+                });
+                data.extend_from_slice(baseline_elf);
+            }
+            let mut account = AccountSharedData::new(LAMPORTS_PER_SOL, data.len(), &loader::ID);
+            account.set_data_from_slice(&data);
+            account.set_executable(executable);
+            self.trident.set_account_custom(&key, &account);
+        }
+        self.trident.airdrop(&spill, LAMPORTS_PER_SOL);
+        let execute = Instruction {
+            program_id: ID,
+            accounts: accounts::ExecuteGatedUpgrade {
+                config: addresses.config,
+                proposal,
+                target_program: addresses.target,
+                program_data,
+                buffer,
+                spill,
+                rent: anchor_lang::solana_program::sysvar::rent::ID,
+                clock: anchor_lang::solana_program::sysvar::clock::ID,
+                loader_program: loader::ID,
+            }
+            .to_account_metas(None),
+            data: instruction::ExecuteGatedUpgrade {}.data(),
+        };
+        let result = self
+            .trident
+            .process_transaction(&[execute], Some("execute_gated_upgrade"));
+        let expected = [
+            "PolicyChanged",
+            "WrongStatus",
+            "Expired",
+            "Timelocked",
+            "BaselineChanged",
+        ][guard];
+        assert!(
+            result.is_error() && result.logs().contains(expected),
+            "{expected}: {:?} {}",
+            result.get_result(),
+            result.logs()
+        );
+        assert_eq!(self.trident.get_account(&proposal).data(), proposal_bytes);
+        assert_eq!(
+            self.trident.get_account(&buffer).lamports(),
+            LAMPORTS_PER_SOL
+        );
+        assert_eq!(
+            self.trident.get_account(&spill).lamports(),
+            LAMPORTS_PER_SOL
+        );
+    }
 }
 
 enum Scenario {
     Policy,
     Reclaim,
     Transfer,
+    Execute,
 }
 
 fn scenario() -> &'static Scenario {
@@ -328,6 +471,7 @@ fn scenario() -> &'static Scenario {
         Err(_) | Ok("propose_config_update") => Scenario::Policy,
         Ok("reclaim_buffer") => Scenario::Reclaim,
         Ok("transfer_program_authority_guards") => Scenario::Transfer,
+        Ok("execute_gated_upgrade_guards") => Scenario::Execute,
         Ok(other) => panic!("unknown fuzz scenario: {other}"),
     })
 }

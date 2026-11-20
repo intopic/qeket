@@ -1,0 +1,19 @@
+{
+  "environment": "Fly.io Sprite qeket-test",
+  "engine": "Trident 0.12.0",
+  "instruction": "execute_gated_upgrade",
+  "scenario": "execute_gated_upgrade_guards",
+  "scope": "Pre-CPI rejection and unchanged proposal, buffer rent, and spill. Successful upgrade is covered by LiteSVM and Devnet separately.",
+  "guards": ["PolicyChanged", "WrongStatus", "Expired", "Timelocked", "BaselineChanged"],
+  "gate_elf_sha256": "0c0d7252e45fdbde344aeb55db4640991b39b8ef8656687e8ad40a4be9b80176",
+  "baseline_elf_sha256": "2f02ac2544afe1cccd1df5dd1f6fb339e9771bfbf34da2333dfad6479c4ccd5b",
+  "harness_sha256": "ac3dcb75dcf01b58626b3906213ff5c565bc40aee43c9406b01ac3c45c9143bd",
+  "cargo_lock_sha256": "766ab59f03d33d6a04fe0be72672180bf8866a6ef8024c76fd8c025493de73d8",
+  "master_seed": "12146bc1c546c4f420fdde9600ea6b003fc885ee6e5af80ce8d0e2b590aa19f8",
+  "iterations": 1000000,
+  "rejected_invalid": 1000000,
+  "instruction_panics": 0,
+  "wall_seconds": 21.798,
+  "user_cpu_seconds": 166.422,
+  "system_cpu_seconds": 0.262
+}
