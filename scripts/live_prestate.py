@@ -4,7 +4,7 @@ from hashlib import sha256
 import struct
 
 from devnet import LOADER, from_base58, to_base58
-from live_capture import FINAL, GATE, block, capture, rpc
+from live_capture import FINAL, GATE, block, capture, invoked, rpc
 
 MAX_PRESTATE_BYTES = 8 * 1024 * 1024
 MAX_ANCHOR_DRIFT = 32
@@ -46,16 +46,21 @@ def program_data_address(account):
         raise PrestateRefused("expected a loader-v3 executable program")
     return to_base58(data[4:])
 
-def check_transaction_prestate(item, accounts):
+
+def resolved_addresses(item):
     message = item["transaction"]["message"]
     loaded = item["meta"].get("loadedAddresses") or {}
-    keys = set(message["accountKeys"])
-    keys.update(loaded.get("writable", []))
-    keys.update(loaded.get("readonly", []))
     lookups = message.get("addressTableLookups") or []
     if (sum(len(lookup["writableIndexes"]) for lookup in lookups) != len(loaded.get("writable", []))
             or sum(len(lookup["readonlyIndexes"]) for lookup in lookups) != len(loaded.get("readonly", []))):
         raise PrestateRefused("finalized transaction is missing resolved ALT addresses")
+    return loaded.get("writable", []), loaded.get("readonly", []), lookups
+
+
+def check_transaction_prestate(item, accounts):
+    message = item["transaction"]["message"]
+    writable, readonly, lookups = resolved_addresses(item)
+    keys = {*message["accountKeys"], *writable, *readonly}
     keys.update(lookup["accountKey"] for lookup in lookups)
     # These runtime programs are supplied by LiteSVM. Other executable accounts
     # must be present in the captured state, just like transaction data accounts.
@@ -66,20 +71,59 @@ def check_transaction_prestate(item, accounts):
     missing = sorted(keys - accounts.keys())
     if missing:
         raise PrestateRefused(f"initial state was not captured for {len(missing)} transaction account(s); first: {missing[0]}")
+    for key in sorted(keys):
+        account = accounts[key]
+        if account is not None and account["executable"] and account["owner"] == LOADER:
+            program_data = program_data_address(account)
+            account_bytes(accounts.get(program_data), LOADER)
+            keys.add(program_data)
+    return keys
 
 
 def preflight_traffic(event, bundle, limit):
+    anchor = event["anchor_slot"]
+    span = event["replay_slots"]
+    check_window_epoch(anchor, anchor + span)
     snapshot = dict(target=list(from_base58(event["target"])), anchor_slot=event["anchor_slot"],
                     replay_slots=event["replay_slots"])
-    traffic = capture(snapshot, limit, validate_transaction=lambda item: check_transaction_prestate(
-        item, bundle["accounts"]
-    ))
-    return len(traffic["records"])
+    tracked = set()
 
-def check_captured_accounts_unchanged(anchor, capture_slot, tracked):
-    """Disprove possible writes between the inclusive window start and the capture bank."""
-    slots = rpc("getBlocks", anchor, capture_slot, FINAL)
-    if not slots or slots != sorted(set(slots)) or slots[-1] != capture_slot or slots[0] < anchor:
+    def track_dependencies(item):
+        tracked.update(check_transaction_prestate(item, bundle["accounts"]))
+
+    records = capture(snapshot, limit, validate_transaction=track_dependencies)["records"]
+    if records:
+        check_window_isolation(event, records, tracked, bundle["accounts"])
+    return len(records)
+
+
+def check_window_epoch(anchor, end):
+    schedule = rpc("getEpochSchedule")
+    first = schedule["firstNormalSlot"]
+    size = schedule["slotsPerEpoch"]
+    if size <= 0 or anchor < first or (anchor - first) // size != (end - first) // size:
+        raise PrestateRefused("replay window crosses an epoch boundary or is in epoch warmup")
+
+
+def possible_writes(tx):
+    meta = tx.get("meta")
+    if meta is None:
+        raise PrestateRefused("missing transaction metadata during live state compatibility check")
+    message = tx["transaction"]["message"]
+    keys = message["accountKeys"]
+    header = message["header"]
+    signers = header["numRequiredSignatures"]
+    signed_writable = signers - header["numReadonlySignedAccounts"]
+    unsigned_end = len(keys) - header["numReadonlyUnsignedAccounts"]
+    if not 1 <= signers <= len(keys) or not 0 <= signed_writable <= signers <= unsigned_end <= len(keys):
+        raise PrestateRefused("invalid RPC transaction header")
+    loaded_writable, _, _ = resolved_addresses(tx)
+    # Failed transactions may still debit the payer or change a durable nonce.
+    return {keys[0], *keys[:signed_writable], *keys[signers:unsigned_end], *loaded_writable}
+
+
+def finalized_blocks(anchor, slots):
+    if not slots or slots != sorted(set(slots)) or slots[0] < anchor:
         raise PrestateRefused("finalized block coverage is incomplete")
     previous = None
     for slot in slots:
@@ -88,27 +132,67 @@ def check_captured_accounts_unchanged(anchor, capture_slot, tracked):
             previous is not None and confirmed["parentSlot"] != previous
         ):
             raise PrestateRefused("finalized block parent chain is incomplete")
-        for tx in confirmed["transactions"]:
-            meta = tx.get("meta")
-            if meta is None:
-                raise PrestateRefused("missing transaction metadata during live state compatibility check")
-            message = tx["transaction"]["message"]
-            keys = message["accountKeys"]
-            header = message["header"]
-            signers = header["numRequiredSignatures"]
-            signed_writable = signers - header["numReadonlySignedAccounts"]
-            unsigned_end = len(keys) - header["numReadonlyUnsignedAccounts"]
-            if not 1 <= signers <= len(keys) or not 0 <= signed_writable <= signers <= unsigned_end:
-                raise PrestateRefused("invalid RPC transaction header")
-            if message.get("addressTableLookups") and "loadedAddresses" not in meta:
-                raise PrestateRefused("missing resolved ALT addresses during live state compatibility check")
-            loaded = meta.get("loadedAddresses") or {}
-            # Failed transactions may still debit fees or change durable nonces.
-            possible_writes = set(keys[:signed_writable] + keys[signers:unsigned_end] + loaded.get("writable", []))
-            possible_writes.add(keys[0])
-            if possible_writes.intersection(tracked):
-                raise PrestateRefused(f"captured account could have changed before the snapshot at slot {slot}")
+        yield slot, confirmed
         previous = slot
+
+
+def check_initial_balances(tx, accounts, observed):
+    meta = tx["meta"]
+    message = tx["transaction"]["message"]
+    writable, readonly, _ = resolved_addresses(tx)
+    keys = message["accountKeys"] + writable + readonly
+    balances = meta["preBalances"]
+    if len(keys) != len(balances):
+        raise PrestateRefused("finalized balance metadata does not match transaction account keys")
+    for key, balance in zip(keys, balances):
+        if key in accounts and key not in observed:
+            account = accounts[key]
+            expected = 0 if account is None else account["lamports"]
+            if balance != expected:
+                raise PrestateRefused(f"first observed balance differs from captured account {key}")
+            observed.add(key)
+
+
+def check_window_isolation(event, records, tracked, accounts):
+    anchor = event["anchor_slot"]
+    end = anchor + event["replay_slots"]
+    slots = rpc("getBlocks", anchor, end, FINAL)
+    next_slots = rpc("getBlocksWithLimit", end + 1, 1, FINAL)
+    if not next_slots:
+        raise RuntimeError("waiting for a finalized block after the replay window")
+    if len(next_slots) != 1 or next_slots[0] <= end or any(slot > end for slot in slots):
+        raise PrestateRefused("invalid finalized window boundaries")
+    expected = {(record["slot"], record["index"]): to_base58(bytes.fromhex(record["transaction"])[1:65])
+                for record in records}
+    if len(expected) != len(records):
+        raise PrestateRefused("duplicate replay transaction positions")
+    observed = set()
+    for slot, confirmed in finalized_blocks(anchor, slots + next_slots):
+        if slot > end:
+            break
+        for index, tx in enumerate(confirmed["transactions"]):
+            position = (slot, index)
+            signature = expected.pop(position, None)
+            if invoked(tx, event["target"]):
+                if signature is None or tx["transaction"]["signatures"][0] != signature:
+                    raise PrestateRefused("target transaction list differs from the finalized block")
+                check_initial_balances(tx, accounts, observed)
+            elif signature is not None:
+                raise PrestateRefused("target transaction list differs from the finalized block")
+            elif possible_writes(tx).intersection(tracked):
+                raise PrestateRefused("captured account modified by non-target transaction during replay window")
+    if expected:
+        raise PrestateRefused("target replay transaction was absent from the finalized window")
+
+def check_captured_accounts_unchanged(anchor, capture_slot, tracked):
+    """Disprove possible writes between the inclusive window start and the capture bank."""
+    slots = rpc("getBlocks", anchor, capture_slot, FINAL)
+    if not slots or slots[-1] != capture_slot:
+        raise PrestateRefused("finalized block coverage is incomplete")
+    for slot, confirmed in finalized_blocks(anchor, slots):
+        for tx in confirmed["transactions"]:
+            if possible_writes(tx).intersection(tracked):
+                raise PrestateRefused(f"captured account could have changed before the snapshot at slot {slot}")
 
 
 def capture_prestate(event, seed_accounts, gate=GATE):

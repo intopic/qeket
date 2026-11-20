@@ -213,7 +213,7 @@ class Admissions:
     def record_traffic_preflight(self, proposal, count):
         with self.database as db:
             self._record_outcome(db, proposal, "traffic_preflight_passed",
-                                 f"{count} finalized target transactions checked for initial account coverage")
+                                 f"{count} finalized target transactions checked for account coverage and unrelated writes")
 
     def cursor(self):
         row = self.database.execute("SELECT next_slot FROM cursors WHERE gate = ?", (GATE,)).fetchone()

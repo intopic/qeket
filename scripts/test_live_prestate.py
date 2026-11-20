@@ -6,7 +6,7 @@ from unittest.mock import patch
 from devnet import LOADER, to_base58
 from live_prestate import (
     PROPOSAL_TAG, PrestateRefused, capture_prestate, check_captured_accounts_unchanged,
-    check_transaction_prestate,
+    check_transaction_prestate, check_window_epoch, check_window_isolation,
 )
 
 
@@ -80,6 +80,7 @@ class LivePrestateTest(unittest.TestCase):
             "meta": {"err": None, "loadedAddresses": {"writable": [watched]}},
             "transaction": {"message": {
                 "accountKeys": [address(2), address(3)],
+                "addressTableLookups": [{"accountKey": address(4), "writableIndexes": [0], "readonlyIndexes": []}],
                 "header": {"numRequiredSignatures": 1, "numReadonlySignedAccounts": 0,
                            "numReadonlyUnsignedAccounts": 1},
             }},
@@ -96,3 +97,54 @@ class LivePrestateTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(PrestateRefused, "parent chain"):
                 check_captured_accounts_unchanged(100, 102, {watched})
+
+    def test_window_checks_failed_fees_and_closing_parent(self):
+        payer, target, outsider = map(address, range(1, 4))
+        signature = bytes([9]) * 64
+        record = dict(slot=100, index=0, transaction=(b"\x01" + signature).hex())
+
+        def transaction(sender, program, error=None):
+            return {
+                "meta": {"err": error, "innerInstructions": [], "preBalances": [10, 20]},
+                "transaction": {"signatures": [to_base58(signature)], "message": {
+                    "accountKeys": [sender, program],
+                    "instructions": [{"programIdIndex": 1}],
+                    "header": {"numRequiredSignatures": 1, "numReadonlySignedAccounts": 0,
+                               "numReadonlyUnsignedAccounts": 1},
+                }},
+            }
+
+        event = dict(anchor_slot=100, replay_slots=2, target=target)
+        first = dict(parentSlot=99, transactions=[transaction(payer, target), transaction(outsider, target, "failed")])
+        tip = dict(parentSlot=100, transactions=[])
+        for invalid in (None, "fee", "boundary", "selection", "prebalance"):
+            with self.subTest(invalid=invalid):
+                produced = dict(first)
+                closing = dict(tip)
+                if invalid == "fee":
+                    produced["transactions"] = [transaction(payer, target), transaction(payer, outsider, "failed")]
+                if invalid == "boundary":
+                    closing["parentSlot"] = 102
+                if invalid == "selection":
+                    produced["transactions"] = [transaction(outsider, target), transaction(payer, target)]
+                captures = {payer: {"lamports": 11 if invalid == "prebalance" else 10}, target: {"lamports": 20}}
+                with patch("live_prestate.rpc", side_effect=[[100], [103]]), patch(
+                    "live_prestate.block", side_effect=[produced, closing]
+                ):
+                    if invalid is None:
+                        check_window_isolation(event, [record], {payer, target}, captures)
+                    else:
+                        with self.assertRaisesRegex(PrestateRefused, {
+                            "fee": "modified by non-target",
+                            "boundary": "parent chain",
+                            "selection": "transaction list",
+                            "prebalance": "first observed balance",
+                        }[invalid]):
+                            check_window_isolation(event, [record], {payer, target}, captures)
+
+    def test_window_cannot_cross_epoch(self):
+        with patch("live_prestate.rpc", return_value=dict(firstNormalSlot=100, slotsPerEpoch=50)):
+            check_window_epoch(100, 149)
+            for first, last in ((99, 100), (149, 150)):
+                with self.assertRaisesRegex(PrestateRefused, "epoch"):
+                    check_window_epoch(first, last)
