@@ -3,13 +3,14 @@ import argparse
 import json
 import os
 import sqlite3
+import time
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from devnet import GENESIS, from_base58
-from live_capture import GATE, rpc, watch
+from devnet import GENESIS, from_base58, to_base58
+from live_capture import GATE, capture, rpc, watch
 
 
 PLANS = {"starter": (5, 500), "pro": (20, 2000), "enterprise": (None, 5000)}
@@ -115,6 +116,13 @@ class Admissions:
                        (GATE, event["proposal"], customer, month))
         return customer
 
+    def active_jobs(self):
+        rows = self.database.execute("""
+            SELECT payload FROM customer_jobs WHERE gate = ? AND finished_at IS NULL
+            ORDER BY started_at
+        """, (GATE,)).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def finish(self, proposal, now):
         with self.database as db:
             updated = db.execute("""
@@ -135,10 +143,51 @@ class Admissions:
             """, (GATE, slot))
 
 
+def capture_ready(admissions, snapshots, next_slot, now):
+    """Collect finalized traffic once a trusted pre-state is available."""
+    for event in admissions.active_jobs():
+        if event["anchor_slot"] + event["replay_slots"] >= next_slot:
+            continue
+        policy = admissions.policies.get(event["target"])
+        if policy is None or not policy.active or now >= policy.expires:
+            admissions.finish(event["proposal"], now)
+            continue
+        if len(from_base58(event["proposal"])) != 32:
+            raise ValueError("invalid proposal address")
+        directory = snapshots / event["proposal"]
+        snapshot_path = directory / "snapshot.json"
+        archive_path = directory / "archive.json"
+        if not snapshot_path.is_file() or archive_path.exists():
+            continue
+        try:
+            with snapshot_path.open("rb") as snapshot_file:
+                data = snapshot_file.read(8 * 1024 * 1024 + 1)
+            if len(data) > 8 * 1024 * 1024:
+                raise ValueError("snapshot exceeds 8 MiB")
+            snapshot = json.loads(data)
+            if (to_base58(bytes(snapshot["target"])) != event["target"]
+                    or any(snapshot.get(field) != event[field] for field in ("anchor_slot", "replay_slots", "nonce"))):
+                raise ValueError("snapshot does not match proposal event")
+            limit = min(policy.max_replay_txs, event["max_replay_txs"])
+            archive = capture(snapshot, limit)
+            staged = directory / ".archive.json.tmp"
+            staged.write_text(json.dumps(archive, separators=(",", ":")), encoding="utf-8")
+            staged.replace(archive_path)
+            print(json.dumps({"event": "archive_captured", "proposal": event["proposal"],
+                              "transactions": len(archive["records"])}), flush=True)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            # Keep the job and allow the operator to repair its trusted inputs.
+            print(json.dumps({"event": "capture_failed", "proposal": event["proposal"],
+                              "error": type(exc).__name__}), flush=True)
+        # Leave time for event ingestion even when many snapshots are ready.
+        break
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", default="/data/admissions.sqlite3")
     parser.add_argument("--customers", type=Path, default=Path("/data/customers.json"))
+    parser.add_argument("--snapshots", type=Path, default=Path("/data/snapshots"))
     parser.add_argument("--finish", metavar="PROPOSAL")
     args = parser.parse_args()
     if args.finish:
@@ -153,14 +202,27 @@ def main():
     with closing(sqlite3.connect(args.database)) as database:
         admissions = Admissions(database, policies)
 
+        def refresh_policies():
+            raw = args.customers.read_text(encoding="utf-8") if args.customers.exists() else os.environ["CANARY_CUSTOMERS"]
+            admissions.policies = customer_policies(raw)
+
         def on_event(event):
-            if args.customers.exists():
-                admissions.policies = customer_policies(args.customers.read_text(encoding="utf-8"))
+            refresh_policies()
             customer = admissions.consume(event, datetime.now(timezone.utc), enqueue=True)
             if customer is not None:
                 print(json.dumps(dict(event, customer=customer)), flush=True)
 
-        watch(admissions.cursor(), on_event=on_event, checkpoint=admissions.checkpoint)
+        next_capture = 0
+
+        def checkpoint(slot):
+            nonlocal next_capture
+            admissions.checkpoint(slot)
+            if time.monotonic() >= next_capture:
+                refresh_policies()
+                capture_ready(admissions, args.snapshots, slot, datetime.now(timezone.utc))
+                next_capture = time.monotonic() + 30
+
+        watch(admissions.cursor(), on_event=on_event, checkpoint=checkpoint)
 
 
 if __name__ == "__main__":
