@@ -1,0 +1,82 @@
+{
+  "fixture": "counter",
+  "source_commit": "7d572104c27d7377f7d981f17d643726218818af",
+  "clients": [
+    {
+      "client": 1,
+      "build_interval_seconds": [
+        0.004684351999912906,
+        8.910365467999782
+      ],
+      "replay_interval_seconds": [
+        8.95212798800003,
+        18.745136834999812
+      ],
+      "replay_per_verifier_ms": [
+        1695.722928,
+        1768.606801
+      ],
+      "transactions_per_verifier": 1000,
+      "v0_alt_cpi_transactions": 100,
+      "local_fault_checks": {
+        "conflicting_vote_rejected": true,
+        "modified_buffer_rejections": 3,
+        "quorum_with_middle_verifier_absent": true
+      },
+      "late_regression_ordinal": 901,
+      "archive_sha256": "48a6a33f937bb90de99d38cec7f506eae726827fc36260cbcefc459a7939945c"
+    },
+    {
+      "client": 2,
+      "build_interval_seconds": [
+        0.004540242000075523,
+        8.951658247000069
+      ],
+      "replay_interval_seconds": [
+        8.951953307999702,
+        18.699147283000002
+      ],
+      "replay_per_verifier_ms": [
+        1699.800389,
+        1806.35247
+      ],
+      "transactions_per_verifier": 1000,
+      "v0_alt_cpi_transactions": 100,
+      "local_fault_checks": {
+        "conflicting_vote_rejected": true,
+        "modified_buffer_rejections": 3,
+        "quorum_with_middle_verifier_absent": true
+      },
+      "late_regression_ordinal": 901,
+      "archive_sha256": "9b8d4db3fd64fbc17c534206fde2f64bd4260ddef3ed29eecc46dee8842862df"
+    },
+    {
+      "client": 3,
+      "build_interval_seconds": [
+        0.0043766419998974015,
+        8.863562524999907
+      ],
+      "replay_interval_seconds": [
+        8.952015628000026,
+        18.795243748999837
+      ],
+      "replay_per_verifier_ms": [
+        1749.504692,
+        1802.155857
+      ],
+      "transactions_per_verifier": 1000,
+      "v0_alt_cpi_transactions": 100,
+      "local_fault_checks": {
+        "conflicting_vote_rejected": true,
+        "modified_buffer_rejections": 3,
+        "quorum_with_middle_verifier_absent": true
+      },
+      "late_regression_ordinal": 901,
+      "archive_sha256": "0c3db54763c87edf31a132cddbde5de4c66a66ae8e98a2a53056c7a0b272547a"
+    }
+  ],
+  "total_child_cpu_seconds": 67.74000000000001,
+  "largest_child_peak_rss_kib": 210292,
+  "build_overlap_seconds": 8.858878172999994,
+  "replay_overlap_seconds": 9.747019294999973
+}

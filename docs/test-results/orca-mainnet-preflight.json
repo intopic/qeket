@@ -1,0 +1,16 @@
+{
+  "scope": "read-only preflight; public Solana RPC; no replay",
+  "program": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+  "successful_finalized_signatures": 500,
+  "scanned_signatures": 1000,
+  "oldest_slot": 471871909,
+  "newest_slot": 471871925,
+  "signature_pages": 1,
+  "response_bytes": 241513,
+  "signature_fetch_wall_seconds": 0.6472622000001138,
+  "sample_signature": "3wjNHySknwKbkZjjHvVEjyWnRgfvX93J24xAqPgAUDFgUcrCrbvDVAfGbhssWkLuMJ62Rcx1FsNTNbR95yzxyRX9",
+  "sample_version": 1,
+  "version_zero_client_rpc_error": -32015,
+  "sample_cpi_groups": 1,
+  "sample_alt_loaded_addresses": 0
+}
