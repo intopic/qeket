@@ -97,11 +97,13 @@ Vendos `CANARY_CUSTOMERS` si repository secret para se të aktivizosh deploy-in 
 Zëvendëso `<program-id>` me adresën publike të programit të klientit. Afati është ekskluziv. Kuota mat propozimet unike të pranuara për klientin, brenda muajit kalendarik UTC, dhe ndahet ndërmjet programeve të tij. Një propozim i pranuar ruhet vetëm një herë. Listener-i ruan numërimin dhe pozicionin e leximit në SQLite në volumin e instancës Fly. Konfigurimi aktual presupozon një instancë të vetme për këtë ledger. Politikat e klientëve mirëmbahen në secret dhe hyjnë në fuqi kur publikohet konfigurimi i ri. Worker-i ruan propozimet e pranuara në radhë. Kur dritarja finalizohet dhe operatori vendos gjendjen historike të besuar në `/data/snapshots/<proposal>/snapshot.json`, worker-i mbledh transaksionet me kufirin e klientit dhe shkruan `archive.json` në të njëjtën dosje. Kompilimi dhe dërgimi automatik i votës nga Fly mbeten hapa të veçantë.
 
 
-| Plani | Abonimi mujor (USD) | Propozime për upgrade në muaj | Transaksione replay për propozim |
-| --- | ---: | ---: | ---: |
-| Starter | $490 | 5 | 500 |
-| Pro | $1,900 | 20 | 2,000 |
-| Enterprise | $4,500 | Pa kufi | 5,000 |
+| Plani | Abonimi mujor (USD) | Kontrata | Propozime për upgrade në muaj | Transaksione replay për propozim | Për kë është |
+| --- | ---: | --- | ---: | ---: | --- |
+| **Starter** | **$490** | 1 smart kontratë + Devnet falas | Deri në 5 | Deri në 500 | Startup-e dhe projekte me një program kryesor, p.sh. staking, token ose vault. |
+| **Pro** *(Plani i rekomanduar)* | **$1,900** | Deri në 3 smart kontrata + $450/muaj për çdo kontratë shtesë | Deri në 20 | Deri në 2,000 | Protokolle aktive DeFi/DePIN me $5M–$50M TVL dhe zakonisht 2–3 programe (`core`, `router`, `rewards`). Oferta parashikon Squads v4 dhe alerte. |
+| **Enterprise** | **Nga $4,500** | Deri në 10 smart kontrata | Pa limit, me cooldown 15–30 min | Deri në 5,000 | Protokolle me $50M+ TVL, ura cross-chain dhe RWA. Oferta parashikon nyje të dedikuar, kuorum 3/5 dhe SLA. |
+
+Tabela përshkruan ofertën komerciale. Devnet falas, kufijtë e kontratave sipas planit, faturimi i kontratave shtesë dhe cooldown-i i paracaktuar i Enterprise mbeten për t'u lidhur me faturimin dhe konfigurimin e klientëve. Integrimi live me Squads v4, alertet, nyjet e dedikuara, kuorumi 3/5 dhe SLA mbeten për t'u verifikuar operacionalisht.
 
 Abonimet B2B faturohen jashtë zinxhirit.
 
