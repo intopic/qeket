@@ -126,7 +126,7 @@ Mund të caktohen `active`, `cooldown_minutes`, `max_upgrades_per_month` dhe `ma
 Për ta përsëritur fushatën në Linux, ndërto më parë gate-in me komandën e MVP-së. Nga `trident-tests` ekzekuto:
 
 ```sh
-CANARY_FUZZ_ITERATIONS=1000000 FUZZING_METRICS=1 cargo run --locked --release --bin fuzz_policy
+CANARY_FUZZ_ITERATIONS=1000000 FUZZING_METRICS=1 TRIDENT_WITH_EXIT_CODE=1 cargo run --locked --release --bin fuzz_policy
 ```
 
 Vendos `CANARY_FUZZ_SCENARIO=reclaim_buffer` per fushaten e rikuperimit te buffer-it. [Rezultatet e fushates](docs/test-results/trident-reclaim-1m.json).
@@ -134,6 +134,8 @@ Vendos `CANARY_FUZZ_SCENARIO=reclaim_buffer` per fushaten e rikuperimit te buffe
 Vendos `CANARY_FUZZ_SCENARIO=transfer_program_authority_guards` për kontrollet e refuzimit para CPI-së së transferimit. Prova LiteSVM ushtron rrugët e autorizuara të transferimit. [Rezultatet e fushatës në Sprite](docs/test-results/trident-transfer-guards-1m.json).
 
 Pasi të ndërtosh edhe counter-in me `scripts/mvp.py`, vendos `CANARY_FUZZ_SCENARIO=execute_gated_upgrade_guards` për kontrollet e gjeneratës së politikës, statusit, skadimit, timelock-ut dhe ndryshimit të baseline-it. [Rezultatet e fushatës në Sprite](docs/test-results/trident-execute-guards-1m.json).
+
+Fushata e votave Ed25519 ngeci në një degë të paimplementuar të Trident 0.12. LiteSVM dhe validatori i përkohshëm e ushtrojnë udhëzimin me vota të nënshkruara. [Diagnostika e Trident](docs/test-results/trident-attestation-compatibility.json).
 
 ### Ingress dhe statusi i worker-it
 

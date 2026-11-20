@@ -1,0 +1,11 @@
+{
+  "environment": "Fly.io Sprite qeket-test",
+  "engine": "Trident 0.12.0 / Trident SVM 0.2.0",
+  "instruction": "submit_verified_attestation",
+  "status": "blocked_in_test_engine",
+  "gate_elf_sha256": "0c0d7252e45fdbde344aeb55db4640991b39b8ef8656687e8ad40a4be9b80176",
+  "diagnostic_seed": "5176ebe3d14aa3166572e466aa233daadf0572be8a7494c6b2b0fa927b250bb1",
+  "diagnostic": "Trident client panics in the unimplemented FeesOnly branch of handle_tx_result while processing the Ed25519 precompile and submit_verified_attestation transaction.",
+  "verified_trident_iterations": 0,
+  "separate_coverage": "LiteSVM and the disposable-validator workflow submit signed votes and execute the complete counter upgrade."
+}

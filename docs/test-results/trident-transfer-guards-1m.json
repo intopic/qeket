@@ -14,5 +14,14 @@
   "program_authority_and_policy_generation_unchanged": true,
   "wall_seconds": 16.029,
   "user_cpu_seconds": 125.189,
-  "system_cpu_seconds": 0.136
+  "system_cpu_seconds": 0.136,
+  "strict_rerun": {
+    "harness_sha256": "ac3dcb75dcf01b58626b3906213ff5c565bc40aee43c9406b01ac3c45c9143bd",
+    "master_seed": "de8816192816076dd2803a4d6c4a571b38bec4032e4a7bf94bb3e85765725120",
+    "iterations": 1000000,
+    "rejected_invalid": 1000000,
+    "instruction_panics": 0,
+    "exit_code": 0,
+    "wall_seconds": 16.079
+  }
 }

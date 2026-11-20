@@ -15,5 +15,13 @@
   "instruction_panics": 0,
   "wall_seconds": 21.798,
   "user_cpu_seconds": 166.422,
-  "system_cpu_seconds": 0.262
+  "system_cpu_seconds": 0.262,
+  "strict_rerun": {
+    "master_seed": "078d44f3b42e352c83986d63a48fb13663c8323a87b17552b1a436550a2443c8",
+    "iterations": 1000000,
+    "rejected_invalid": 1000000,
+    "instruction_panics": 0,
+    "exit_code": 0,
+    "wall_seconds": 20.065
+  }
 }
