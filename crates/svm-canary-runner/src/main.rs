@@ -7,7 +7,10 @@ use std::{env, fs, path::Path};
 fn main() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
     match args.as_slice() {
-        [command, gate, base, candidate, rebuilt, commit, out] if command == "demo" => {
+        [command, gate, base, candidate, rebuilt, commit, out, regression @ ..]
+            if command == "demo" && regression.len() <= 1 =>
+        {
+            let regression = regression.first().map(fs::read).transpose()?;
             demo::run(
                 &fs::read(gate)?,
                 &fs::read(base)?,
@@ -15,6 +18,7 @@ fn main() -> Result<()> {
                 &fs::read(rebuilt)?,
                 commit,
                 Path::new(out),
+                regression.as_deref(),
             )
         }
         [command, archive, base, rebuilt] if command == "verify" => {
@@ -23,6 +27,6 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&evidence)?);
             Ok(())
         }
-        _ => bail!("Usage: canary-gate demo GATE.so OLD.so NEW.so REBUILT.so GIT_SHA OUTPUT_DIR\n       canary-gate verify ARCHIVE.json OLD.so REBUILT.so"),
+        _ => bail!("Usage: canary-gate demo GATE.so OLD.so NEW.so REBUILT.so GIT_SHA OUTPUT_DIR [REGRESSION.so]\n       canary-gate verify ARCHIVE.json OLD.so REBUILT.so"),
     }
 }

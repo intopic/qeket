@@ -31,6 +31,9 @@ fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramRe
     } else {
         increment
     };
+    // A synthetic regression that leaves early transactions unchanged.
+    #[cfg(feature = "regression-fixture")]
+    let increment = if increment == 901 { increment + 1 } else { increment };
     let mut state = counter.try_borrow_mut_data()?;
     let value = u64::from_le_bytes(
         state

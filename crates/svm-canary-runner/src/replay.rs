@@ -365,8 +365,9 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
             let after = new.get_account(&key);
             ensure!(
                 !strict || before == after,
-                "post-state differs for {key} at slot {}",
-                record.slot
+                "post-state differs for {key} at slot {}, index {}",
+                record.slot,
+                record.index
             );
             let mut leaf = Sha256::new();
             leaf.update(b"CANARY_STATE_V1");

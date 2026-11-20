@@ -6,6 +6,8 @@ MVP lokal për përditësime të kontrolluara të programeve Solana. Një komand
 
 Në GitHub hap **Actions → Canary MVP**. Çdo push ose pull request nis testet në Ubuntu. Mund t'i nisësh edhe nga **Run workflow**. Job-i `verify` ndërton me platform-tools v1.58 të kontrolluar me SHA-256, ekzekuton testet Rust dhe provën në LiteSVM, pastaj ruan binarët dhe arkivin si artifact të commit-it.
 
+Te **Actions → Canary MVP → Summary**, seksioni **Canary load test** jep rezultatin e replay-it me 1,000 transaksione sintetike, përfshirë 100 raste v0 me ALT dhe CPI, si edhe refuzimin e kandidatit me gabim në transaksionin 901. Artefakti `canary-mvp-<commit>` përmban `target/mvp/evidence/load-test.json`, `report.json` dhe `archive.json`. Matjet përfshijnë kohën e ndërtimit, pesë ekzekutime të replay-it, CPU, RAM dhe madhësinë e arkivit. Prova e pranimit simulon 24 kërkesa në të njëjtën kohë nga tre klientë mbi një bazë SQLite. Ajo shfaqet te logu **Check Rust workspace**. Lokalisht, `python scripts/mvp.py --load-test` ekzekuton të njëjtën provë të replay-it.
+
 Job-i `Devnet RPC compatibility` shkarkon po atë artifact, kontrollon identitetin e Devnet-it dhe loader-in v3, dhe kërkon tarifën për mesazhin e votës së testuar me një blockhash të finalizuar. Nëse programi ekziston në adresën e konfiguruar, krahason edhe bajtët e tij me binarin e CI-së. `devnet-report.json` tregon slotin, tarifën dhe nëse kontrata është publikuar. Ky hap është vetëm për lexim dhe funksionon pa kredenciale.
 
 Nga rrënja e projektit, në këtë kompjuter:

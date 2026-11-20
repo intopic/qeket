@@ -2,9 +2,11 @@ import json
 import sqlite3
 from uuid import uuid4
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 from devnet import to_base58
@@ -96,3 +98,37 @@ class AdmissionsTest(unittest.TestCase):
             snapshot.unlink(missing_ok=True)
             directory.rmdir()
             root.rmdir()
+
+
+    def test_concurrent_admission_isolated_per_customer(self):
+        targets = [to_base58(bytes([n]) * 32) for n in (1, 2, 3)]
+        controls = customer_policies(json.dumps({
+            f"client-{i}": {"targets": [target], "plan": plan}
+            for i, (target, plan) in enumerate(zip(targets, ("starter", "pro", "enterprise")))
+        }))
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        attempts = [(target, f"proposal-{i}-{n}") for i, target in enumerate(targets) for n in range(8)]
+        barrier = Barrier(len(attempts))
+        db = Path.cwd() / f"concurrent-admissions-test-{uuid4().hex}.sqlite3"
+        try:
+            with closing(sqlite3.connect(db)) as connection:
+                Admissions(connection, controls)
+
+            def submit(attempt):
+                target, proposal = attempt
+                with closing(sqlite3.connect(db, timeout=20)) as connection:
+                    ledger = Admissions(connection, controls)
+                    barrier.wait(timeout=20)
+                    return ledger.consume({"target": target, "proposal": proposal}, now, enqueue=True)
+
+            with ThreadPoolExecutor(max_workers=len(attempts)) as pool:
+                admitted = [client for client in pool.map(submit, attempts) if client is not None]
+            self.assertCountEqual(admitted, ["client-0", "client-1", "client-2"])
+            with closing(sqlite3.connect(db)) as connection:
+                ledger = Admissions(connection, controls)
+                jobs = {job["target"]: job["max_replay_txs"] for job in ledger.active_jobs()}
+                self.assertEqual(jobs, dict(zip(targets, (500, 2000, 5000))))
+                total, = connection.execute("SELECT count(*) FROM admissions").fetchone()
+                self.assertEqual(total, 3)
+        finally:
+            db.unlink(missing_ok=True)

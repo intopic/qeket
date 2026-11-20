@@ -20,7 +20,7 @@ use solana_account::Account;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Instant};
 
 fn ix(accounts: impl ToAccountMetas, data: impl InstructionData) -> Instruction {
     Instruction {
@@ -85,7 +85,7 @@ fn clock(vm: &mut LiteSVM, slot: u64, time: i64) {
     vm.set_sysvar(&c);
 }
 
-fn traffic(target: Pubkey, baseline: &[u8], archive: &mut Archive) -> Result<()> {
+fn traffic(target: Pubkey, baseline: &[u8], archive: &mut Archive, count: u32) -> Result<()> {
     // This public seed identifies a synthetic fee payer in the replay fixture only.
     let payer = Keypair::new_from_array([72; 32]);
     let counter = Pubkey::new_from_array([73; 32]);
@@ -144,14 +144,27 @@ fn traffic(target: Pubkey, baseline: &[u8], archive: &mut Archive) -> Result<()>
         key: table_key,
         addresses,
     };
-    for i in 0..=archive.replay_slots {
-        clock(&mut source, archive.anchor_slot + i, 1000 + i as i64);
+    let slots = u32::try_from(archive.replay_slots + 1)?;
+    let mut ordinal = 0u64;
+    for i in 0..slots {
+        clock(
+            &mut source,
+            archive.anchor_slot + u64::from(i),
+            1000 + i64::from(i),
+        );
         archive.clocks.push(source.get_sysvar());
-        for index in 0..=83u32 {
-            let value = (i * 84 + u64::from(index) + 1).to_le_bytes();
+        let per_slot = count / slots + u32::from(i < count % slots);
+        for index in 0..per_slot {
+            ordinal += 1;
+            let value = ordinal.to_le_bytes();
             let instruction =
                 Instruction::new_with_bytes(target, &value, vec![AccountMeta::new(counter, false)]);
-            let tx = if index == 0 {
+            let use_router = if count == 1000 {
+                ordinal % 10 == 1
+            } else {
+                index == 0
+            };
+            let tx = if use_router {
                 let router_ix = Instruction::new_with_bytes(
                     router,
                     &value,
@@ -184,7 +197,7 @@ fn traffic(target: Pubkey, baseline: &[u8], archive: &mut Archive) -> Result<()>
                 .send_transaction(tx.clone())
                 .map_err(|e| anyhow!("capturing baseline: {e:?}"))?;
             archive.records.push(Record {
-                slot: archive.anchor_slot + i,
+                slot: archive.anchor_slot + u64::from(i),
                 index,
                 transaction: tx,
             });
@@ -201,6 +214,7 @@ pub fn run(
     rebuilt: &[u8],
     commit: &str,
     out: &Path,
+    regression: Option<&[u8]>,
 ) -> Result<()> {
     let commit_bytes: [u8; 20] = hex::decode(commit)?
         .try_into()
@@ -343,7 +357,17 @@ pub fn run(
         clocks: vec![],
         records: vec![],
     };
-    traffic(target, baseline, &mut archive)?;
+    let capture_started = Instant::now();
+    traffic(
+        target,
+        baseline,
+        &mut archive,
+        if regression.is_some() { 1000 } else { 252 },
+    )?;
+    let capture_ms = capture_started.elapsed().as_secs_f64() * 1_000.0;
+    let regression_result = regression
+        .map(|binary| check_late_regression(&archive, baseline, binary))
+        .transpose()?;
     check_replay_modes(&archive, baseline, candidate)?;
     clock(&mut vm, 103, 1010);
     let execute = ix(
@@ -371,8 +395,11 @@ pub fn run(
     let mut measured = Vec::new();
     let mut consensus = None;
     let mut vote_message = None;
+    let mut verifier_ms = Vec::new();
     for (node, local_build) in nodes[..2].iter().zip([candidate, rebuilt]) {
+        let started = Instant::now();
         let evidence = verify(&archive, baseline, local_build)?;
+        verifier_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
         if let Some(previous) = &consensus {
             ensure!(previous == &evidence, "verifiers disagree");
         }
@@ -509,7 +536,8 @@ pub fn run(
         "attestations_bytes_and_cu":measured,"execution_bytes":execution_bytes,"execution_cu":meta.compute_units_consumed,
         "reclaim_cancelled_and_expired_checked":true, "authority_rotation_and_exit_checked":true,
         "v0_alt_cpi_transactions":archive.records.iter().filter(|record| matches!(record.transaction.message, solana_message::VersionedMessage::V0(_))).count(),
-        "relaxed_mode_checked":true, "quorum":"2/3","deployed_program_data_verified":true,"candidate_invoked":true,"proposal_closed":true,"policy_rotation_checked":true,"emergency_checked":true});
+        "synthetic_capture_ms":capture_ms, "replay_per_verifier_ms":verifier_ms,
+        "late_regression":regression_result, "relaxed_mode_checked":true, "quorum":"2/3","deployed_program_data_verified":true,"candidate_invoked":true,"proposal_closed":true,"policy_rotation_checked":true,"emergency_checked":true});
     fs::create_dir_all(out)?;
     fs::write(
         out.join("vote-message.bin"),
@@ -867,4 +895,38 @@ fn check_replay_modes(captured: &Archive, baseline: &[u8], candidate: &[u8]) -> 
         .accounts
         .retain(|(_, a)| a.owner != solana_sdk_ids::address_lookup_table::ID);
     check_error(&archive, "missing lookup table")
+}
+
+fn check_late_regression(
+    archive: &Archive,
+    baseline: &[u8],
+    binary: &[u8],
+) -> Result<serde_json::Value> {
+    // Commit to the faulty ELF so rejection tests behavior, after binary integrity checks pass.
+    let mut proposed = archive.clone();
+    proposed.expected_elf = hash(binary);
+    proposed.cu_limit_bps = u16::MAX;
+    proposed
+        .buffer
+        .data
+        .truncate(loader::UpgradeableLoaderState::size_of_buffer_metadata());
+    proposed.buffer.data.extend_from_slice(binary);
+    let record = &proposed.records[900];
+    let started = Instant::now();
+    let err = verify(&proposed, baseline, binary)
+        .err()
+        .context("state regression unexpectedly passed")?;
+    let expected = format!("at slot {}, index {}", record.slot, record.index);
+    let reason = err.to_string();
+    ensure!(
+        reason.contains("post-state differs") && reason.ends_with(&expected),
+        "expected the late state regression, got {reason}"
+    );
+    Ok(serde_json::json!({
+        "expected_transaction_ordinal": 901,
+        "slot": record.slot,
+        "index": record.index,
+        "reason": reason,
+        "rejection_ms": started.elapsed().as_secs_f64() * 1000.0,
+    }))
 }

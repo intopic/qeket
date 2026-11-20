@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [features]
 candidate = []
+regression-fixture = []
 
 [dependencies]
 solana-program-entrypoint = "=2.3.0"

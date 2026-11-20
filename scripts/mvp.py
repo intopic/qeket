@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from time import perf_counter
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "target" / "mvp"
@@ -46,20 +47,20 @@ def snapshot():
     return commit
 
 
-def build(manifest, crate, directory, toolchain, candidate=False):
+def build(manifest, crate, directory, toolchain, features=None):
     env = dict(os.environ)
     env["CARGO_NET_OFFLINE"] = "true"
     if toolchain:
         args = ["cargo", "+" + toolchain, "build", "--manifest-path", str(manifest), "--target",
                 "sbpf-solana-solana", "--target-dir", str(directory), "--release", "--locked"]
         env["CARGO_TARGET_SBPF_SOLANA_SOLANA_RUSTFLAGS"] = f"--remap-path-prefix={manifest.parent}=fixture"
-        if candidate:
-            args += ["--features", "candidate"]
+        if features:
+            args += ["--features", features]
         run(args, env=env)
         return directory / "sbpf-solana-solana/release" / (crate + ".so")
     args = ["cargo", "build-sbf", "--tools-version", "v1.58", "--manifest-path", str(manifest), "--sbf-out-dir", str(directory / "deploy")]
-    if candidate:
-        args += ["--features", "candidate"]
+    if features:
+        args += ["--features", features]
     args += ["--", "--locked"]
     run(args, env=dict(env, CARGO_TARGET_DIR=str(directory)))
     return directory / "deploy" / (crate + ".so")
@@ -67,7 +68,9 @@ def build(manifest, crate, directory, toolchain, candidate=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--build-only", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--build-only", action="store_true")
+    modes.add_argument("--load-test", action="store_true")
     parser.add_argument("--sbf-toolchain", default=os.environ.get("CANARY_SBF_TOOLCHAIN"))
     args = parser.parse_args()
     toolchain = args.sbf_toolchain
@@ -79,8 +82,12 @@ def main():
     commit = snapshot()
     gate = build(ROOT / "programs/canary_upgrade_gate/Cargo.toml", "canary_upgrade_gate", ROOT / "target", toolchain)
     v1 = build(OUT / "builder/Cargo.toml", "canary_counter", OUT / "baseline", toolchain)
-    v2 = build(OUT / "builder/Cargo.toml", "canary_counter", OUT / "candidate", toolchain, True)
-    rebuilt = build(OUT / "verifier/Cargo.toml", "canary_counter", OUT / "rebuild", toolchain, True)
+    started = perf_counter()
+    v2 = build(OUT / "builder/Cargo.toml", "canary_counter", OUT / "candidate", toolchain, "candidate")
+    candidate_ms = (perf_counter() - started) * 1000
+    started = perf_counter()
+    rebuilt = build(OUT / "verifier/Cargo.toml", "canary_counter", OUT / "rebuild", toolchain, "candidate")
+    rebuild_ms = (perf_counter() - started) * 1000
     if v1.read_bytes() == v2.read_bytes() or v2.read_bytes() != rebuilt.read_bytes():
         raise RuntimeError("Expected distinct versions and byte-identical candidate builds")
     print("Source commit", commit, "candidate SHA-256", hashlib.sha256(rebuilt.read_bytes()).hexdigest(), flush=True)
@@ -95,10 +102,15 @@ def main():
             native["PATH"] = str(Path(native["OPENSSL_DIR"]) / "bin") + os.pathsep + native["PATH"]
         runner = ["cargo", "run", "--offline", "--locked", "-p", "svm-canary-runner", "--"]
         output = OUT / "evidence"
-        run([*runner, "demo", str(gate), str(v1), str(v2), str(rebuilt), commit, str(output)], env=native)
-        # Exercise the standalone reader against the evidence actually persisted to disk.
-        saved = run([*runner, "verify", str(output / "archive.json"), str(v1), str(rebuilt)],
-                    env=native, stdout=subprocess.PIPE, text=True)
+        demo = [*runner, "demo", str(gate), str(v1), str(v2), str(rebuilt), commit, str(output)]
+        if args.load_test:
+            regression = build(OUT / "builder/Cargo.toml", "canary_counter", OUT / "regression",
+                               toolchain, "candidate,regression-fixture")
+            demo.append(str(regression))
+        run(demo, env=native)
+        # Reproduce the saved evidence through the standalone entry point.
+        verification = [*runner, "verify", str(output / "archive.json"), str(v1), str(rebuilt)]
+        saved = run(verification, env=native, stdout=subprocess.PIPE, text=True)
         check = json.loads(saved.stdout)
         report = json.loads((output / "report.json").read_bytes())
         if (bytes(check["diff_root"]).hex() != report["diff_root"]
@@ -106,6 +118,45 @@ def main():
                 or check["replayed_tx_count"] != report["replayed_transactions_per_verifier"]
                 or hashlib.sha256((output / "archive.json").read_bytes()).hexdigest() != report["archive_sha256"]):
             raise RuntimeError("Saved evidence failed independent replay")
+        if args.load_test:
+            if check["replayed_tx_count"] != 1000 or report["v0_alt_cpi_transactions"] != 100:
+                raise RuntimeError("Unexpected benchmark coverage")
+            binary = ROOT / "target/debug" / ("canary-gate.exe" if os.name == "nt" else "canary-gate")
+            command = [str(binary), *verification[-4:]]
+            samples = []
+            for _ in range(5):
+                started = perf_counter()
+                measured = run(command, env=native, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if json.loads(measured.stdout) != check:
+                    raise RuntimeError("Benchmark replay produced different evidence")
+                samples.append((perf_counter() - started) * 1000)
+            metrics = {
+                "environment": "synthetic local LiteSVM",
+                "transactions_per_replay": check["replayed_tx_count"],
+                "v0_alt_cpi_transactions": report["v0_alt_cpi_transactions"],
+                "candidate_build_ms": candidate_ms,
+                "candidate_rebuild_ms": rebuild_ms,
+                "archive_bytes": (output / "archive.json").stat().st_size,
+                "standalone_replay_wall_ms": samples,
+                "late_regression": report["late_regression"],
+                "upgrade_cu": report["execution_cu"],
+                "vote_bytes_and_cu": report["attestations_bytes_and_cu"],
+            }
+            if Path("/usr/bin/time").is_file():
+                usage = run(["/usr/bin/time", "-f", "%U %S %M", *command], env=native,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                user_s, system_s, rss_kib = usage.stderr.strip().split()
+                metrics["standalone_replay_cpu_seconds"] = float(user_s) + float(system_s)
+                metrics["standalone_replay_peak_rss_kib"] = int(rss_kib)
+            (output / "load-test.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+            if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
+                with open(summary, "a", encoding="utf-8") as file:
+                    print("## Canary load test - LiteSVM\n", file=file)
+                    print(f"- **{metrics['transactions_per_replay']}** transactions per replay, including **{metrics['v0_alt_cpi_transactions']}** with v0, ALT and CPI.", file=file)
+                    print(f"- Five replay samples: {', '.join(f'{ms:.1f} ms' for ms in samples)}.", file=file)
+                    print(f"- Faulty candidate rejected at transaction #901 in {report['late_regression']['rejection_ms']:.1f} ms.", file=file)
+                    print(f"- Peak replay memory: {metrics.get('standalone_replay_peak_rss_kib', 'unavailable')} KiB.", file=file)
+                    print("- Full metrics and signed archive are in the canary-mvp artifact.", file=file)
         print("Saved archive verified:", output / "report.json")
 
 
