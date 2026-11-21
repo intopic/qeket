@@ -14,6 +14,23 @@ use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction::Transaction;
 use std::collections::BTreeSet;
 
+/// A check the candidate itself failed. Every other error means the archive or
+/// the replay could not supply the evidence, which says nothing about the candidate.
+#[derive(Debug)]
+pub struct CandidateFault(pub String);
+
+impl std::fmt::Display for CandidateFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CandidateFault {}
+
+pub fn is_candidate_fault(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<CandidateFault>())
+}
+
 pub fn hash(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
@@ -209,6 +226,10 @@ pub struct Archive {
     pub cu_limit_bps: u16,
     pub accounts: Vec<(Pubkey, Account)>,
     pub clocks: Vec<Clock>,
+    /// Finalized state after the window of accounts the archive reconstructed.
+    /// The baseline replay must end in exactly this state.
+    #[serde(default)]
+    pub final_accounts: Vec<(Pubkey, Option<Account>)>,
     pub records: Vec<Record>,
 }
 
@@ -291,11 +312,15 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
     // Padding follows the known rebuilt file length. Preserve meaningful trailing zero bytes.
     ensure!(
         body.starts_with(rebuilt) && body[rebuilt.len()..].iter().all(|b| *b == 0),
-        "rebuilt ELF differs from locked buffer"
+        CandidateFault("rebuilt ELF differs from locked buffer".into())
     );
     ensure!(
-        hash(rebuilt) == archive.expected_elf && hash(baseline) == archive.baseline_elf,
-        "ELF digest mismatch"
+        hash(rebuilt) == archive.expected_elf,
+        CandidateFault("rebuilt ELF differs from the proposed digest".into())
+    );
+    ensure!(
+        hash(baseline) == archive.baseline_elf,
+        "baseline ELF digest mismatch"
     );
     let count = u32::try_from(archive.records.len())?;
     ensure!(
@@ -477,21 +502,26 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
             );
         }
         let b = new.send_transaction(tx.clone()).map_err(|e| {
-            anyhow!(
+            CandidateFault(format!(
                 "candidate failed at {}:{}: {:?}",
-                record.slot,
-                record.index,
-                e
-            )
+                record.slot, record.index, e
+            ))
         })?;
         ensure!(
-            invoked(tx, &keys, archive.target, &a) && invoked(tx, &keys, archive.target, &b),
+            invoked(tx, &keys, archive.target, &a),
             "target was not invoked"
+        );
+        ensure!(
+            invoked(tx, &keys, archive.target, &b),
+            CandidateFault(format!(
+                "candidate did not invoke the target at {}:{}",
+                record.slot, record.index
+            ))
         );
         let strict = archive.replay_mode == ReplayMode::StrictEquality;
         ensure!(
             !strict || a.return_data == b.return_data,
-            "return data changed"
+            CandidateFault("return data changed".into())
         );
         ensure!(a.compute_units_consumed > 0, "missing compute measurement");
         let growth = u128::from(
@@ -501,7 +531,7 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
         let bp = growth.div_ceil(u128::from(a.compute_units_consumed));
         ensure!(
             bp <= u128::from(archive.cu_limit_bps),
-            "compute policy exceeded"
+            CandidateFault("compute policy exceeded".into())
         );
         peak = peak.max(bp as u16);
         let writable: BTreeSet<_> = keys
@@ -516,9 +546,10 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
             let after = new.get_account(&key);
             ensure!(
                 !strict || before == after,
-                "post-state differs for {key} at slot {}, index {}",
-                record.slot,
-                record.index
+                CandidateFault(format!(
+                    "post-state differs for {key} at slot {}, index {}",
+                    record.slot, record.index
+                ))
             );
             let mut leaf = Sha256::new();
             leaf.update(b"CANARY_STATE_V1");
@@ -529,6 +560,22 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
             leaf.update(hash(&bincode::serialize(&after)?));
             leaves.push(leaf.finalize().into());
         }
+    }
+    for (key, expected) in &archive.final_accounts {
+        // A reconstructed starting state is only an assumption until the
+        // baseline replay arrives at the state the chain finalized.
+        let actual = old.get_account(key).filter(|a| a.lamports > 0);
+        let same = match (&actual, expected) {
+            (None, None) => true,
+            (Some(a), Some(e)) => {
+                a.lamports == e.lamports
+                    && a.owner == e.owner
+                    && a.data == e.data
+                    && a.executable == e.executable
+            }
+            _ => false,
+        };
+        ensure!(same, "final state differs for reconstructed account {key}");
     }
     Ok(Evidence {
         replay_mode: archive.replay_mode,
@@ -655,6 +702,16 @@ mod tests {
         assert!(observation
             .check_balances(&vm, &observation.keys, &observation.post_balances, &payer)
             .is_ok());
+    }
+
+    #[test]
+    fn candidate_faults_survive_context_and_others_do_not_match() {
+        let fault: anyhow::Error = CandidateFault("post-state differs".into()).into();
+        assert!(is_candidate_fault(&fault.context("verifying archive")));
+        assert!(!is_candidate_fault(&anyhow!("baseline failed at 1:0")));
+        assert!(!is_candidate_fault(
+            &anyhow!("observed fee differs").context("CandidateFault in a message only")
+        ));
     }
 
     #[test]
