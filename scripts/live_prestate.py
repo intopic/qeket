@@ -1,5 +1,5 @@
 """Capture a bounded live state bundle and turn a finalized window into a replay archive."""
-from base64 import b64decode
+from base64 import b64decode, b64encode
 from hashlib import sha256
 import struct
 
@@ -22,6 +22,15 @@ REPLAY_MODES = ("StrictEquality", "NoRevertAndCuBound")
 FEATURE_OWNER = "Feature111111111111111111111111111111111111"
 ALPENGLOW_FEATURE = "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS"
 RENT_EXEMPT_EPOCH = 2 ** 64 - 1
+NATIVE_LOADER = "NativeLoader1111111111111111111111111111111"
+# The loaders whose programs the runner installs from captured accounts.
+PROGRAM_LOADERS = {LOADER, "BPFLoader2111111111111111111111111111111111", "BPFLoader1111111111111111111111111111111111"}
+TOKEN_PROGRAMS = {"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"}
+# Transfer, MintTo, Burn, TransferChecked, MintToChecked and BurnChecked change
+# only a token account's amount, and its lamports for native SOL. Any other
+# instruction can change fields that no transaction metadata records.
+AMOUNT_ONLY = {3, 7, 8, 12, 14, 15}
+MAX_LATE_BYTES = 16 * 1024 * 1024
 
 
 class PrestateRefused(ValueError):
@@ -101,7 +110,18 @@ def resolved_addresses(item):
     return loaded.get("writable", []), loaded.get("readonly", []), lookups
 
 
-def check_transaction_prestate(item, accounts, fee_payers=()):
+def ordered_keys(item):
+    """Account keys in the index space of compiled instructions: static, then loaded."""
+    writable, readonly, _ = resolved_addresses(item)
+    return item["transaction"]["message"]["accountKeys"] + writable + readonly
+
+
+def referenced_accounts(item):
+    _, _, lookups = resolved_addresses(item)
+    return {*ordered_keys(item), *(lookup["accountKey"] for lookup in lookups)}
+
+
+def check_transaction_prestate(item, accounts, fee_payers=(), runtime=RUNTIME_ACCOUNTS):
     """Return the accounts a transaction needs. Unknown fee payers are reconstructed later."""
     message = item["transaction"]["message"]
     writable, readonly, lookups = resolved_addresses(item)
@@ -122,7 +142,7 @@ def check_transaction_prestate(item, accounts, fee_payers=()):
     keys.update(lookup["accountKey"] for lookup in lookups)
     # These runtime programs are supplied by LiteSVM. Other executable accounts
     # must be present in the captured state, just like transaction data accounts.
-    keys.difference_update(RUNTIME_ACCOUNTS)
+    keys.difference_update(runtime)
     missing = sorted(keys - accounts.keys() - set(fee_payers))
     if missing:
         raise PrestateRefused(f"initial state was not captured for {len(missing)} transaction account(s); first: {missing[0]}")
@@ -198,7 +218,7 @@ def finalized_blocks(anchor, slots):
         previous = slot
 
 
-def check_initial_balances(tx, accounts, observed, synthesized=None):
+def check_initial_balances(tx, accounts, observed, synthesized=None, runtime=RUNTIME_ACCOUNTS):
     """Compare first-use balances. Unknown fee payers take their first observed balance."""
     meta = tx["meta"]
     message = tx["transaction"]["message"]
@@ -216,14 +236,14 @@ def check_initial_balances(tx, accounts, observed, synthesized=None):
             if balance != expected:
                 raise PrestateRefused(f"first observed balance differs from captured account {key}")
             observed.add(key)
-        elif synthesized is not None and key not in RUNTIME_ACCOUNTS:
+        elif synthesized is not None and key not in runtime:
             if type(balance) is not int or balance <= 0:
                 raise PrestateRefused(f"fee payer {key} has no observable starting balance")
             synthesized[key] = balance
             observed.add(key)
 
 
-def check_window_isolation(event, records, tracked, accounts, synthesized=None):
+def check_window_isolation(event, records, tracked, accounts, synthesized=None, runtime=RUNTIME_ACCOUNTS):
     """Scan every finalized block of the window. Return production times by slot."""
     anchor = event["anchor_slot"]
     end = anchor + event["replay_slots"]
@@ -253,7 +273,7 @@ def check_window_isolation(event, records, tracked, accounts, synthesized=None):
             if invoked(tx, event["target"]):
                 if signature is None or tx["transaction"]["signatures"][0] != signature:
                     raise PrestateRefused("target transaction list differs from the finalized block")
-                check_initial_balances(tx, accounts, observed, synthesized)
+                check_initial_balances(tx, accounts, observed, synthesized, runtime)
             elif signature is not None:
                 raise PrestateRefused("target transaction list differs from the finalized block")
             elif possible_writes(tx).intersection(tracked):
@@ -308,36 +328,176 @@ def archive_account(account):
                 rentEpoch=account["rentEpoch"])
 
 
-def final_states(keys, end):
-    """Read reconstructed accounts after the window and disprove writes since it ended.
-
-    The runner checks that the baseline replay ends in this state, which turns the
-    assumed starting state of each fee payer into a checked one.
-    """
+def read_after_window(keys, end):
+    """Finalized states read after the window, with the bank slot of each read."""
     keys = sorted(keys)
-    if not keys:
-        return []
-    read_slots = {}
-    states = []
+    states, read_slots = {}, {}
     for start in range(0, len(keys), 100):
         batch = keys[start:start + 100]
         result = rpc("getMultipleAccounts", batch, dict(FINAL, encoding="base64", minContextSlot=end + 1))
         slot = result["context"]["slot"]
         if slot <= end or len(result["value"]) != len(batch):
-            raise PrestateRefused("incomplete finalized fee payer state")
+            raise PrestateRefused("incomplete finalized account state after the window")
         for key, value in zip(batch, result["value"]):
-            if value is None or account_bytes(value, SYSTEM) or value["executable"]:
-                raise PrestateRefused("fee payer requires captured initial state")
-            states.append([list(from_base58(key)), archive_account(value)])
+            states[key] = value
             read_slots[key] = slot
+    return states, read_slots
+
+
+def check_untouched_after(read_slots, end):
+    """Disprove writes to each account between the window end and its read."""
+    if not read_slots:
+        return
     slots = rpc("getBlocks", end + 1, max(read_slots.values()), FINAL)
     if not set(read_slots.values()).issubset(slots):
         raise PrestateRefused("finalized block coverage is incomplete")
     for slot, confirmed in finalized_blocks(end + 1, slots):
         for tx in confirmed["transactions"]:
             if any(read_slots.get(key, -1) >= slot for key in possible_writes(tx)):
-                raise PrestateRefused("reconstructed fee payer was used again before its final state was read")
-    return states
+                raise PrestateRefused("an account read after the window was used again before the read")
+
+
+def payer_final_state(key, value):
+    if value is None or account_bytes(value, SYSTEM) or value["executable"]:
+        raise PrestateRefused(f"fee payer {key} requires captured initial state")
+    return [list(from_base58(key)), archive_account(value)]
+
+
+def final_states(keys, end):
+    """Read reconstructed fee payers after the window and disprove writes since it ended.
+
+    The runner checks that the baseline replay ends in this state, which turns the
+    assumed starting state of each fee payer into a checked one.
+    """
+    states, read_slots = read_after_window(keys, end)
+    finals = [payer_final_state(key, states[key]) for key in sorted(states)]
+    check_untouched_after(read_slots, end)
+    return finals
+
+
+def instructions_of(item):
+    """Top-level and inner instructions, all in the transaction's account index space."""
+    inner = item["meta"].get("innerInstructions")
+    if inner is None:
+        raise PrestateRefused("finalized transaction metadata lacks inner instructions")
+    yield from item["transaction"]["message"]["instructions"]
+    for group in inner:
+        yield from group["instructions"]
+
+
+def check_amount_only(items, key, program):
+    """Refuse a token account that any window instruction can change beyond its amount."""
+    for item in items:
+        keys = ordered_keys(item)
+        if key not in keys:
+            continue
+        index = keys.index(key)
+        for ix in instructions_of(item):
+            if index not in ix["accounts"] or keys[ix["programIdIndex"]] not in TOKEN_PROGRAMS:
+                # Other programs can only read the account or credit its lamports.
+                continue
+            data = from_base58(ix["data"])
+            if keys[ix["programIdIndex"]] != program or not data or data[0] not in AMOUNT_ONLY:
+                raise PrestateRefused(f"token account {key} is used by an instruction other than transfer, "
+                                      f"mint or burn")
+
+
+def rebuild_token_account(items, key, final):
+    """The state of a token account at its first use in the window.
+
+    The amount and lamports come from the first transaction's finalized metadata.
+    Every other field comes from the state read after the window, which
+    `check_amount_only` shows no window instruction changed. The runner then
+    requires the baseline replay to end in that final state.
+    """
+    if final is None or final["owner"] not in TOKEN_PROGRAMS or final["executable"]:
+        raise PrestateRefused(f"account {key} is written by the window but was not captured at the anchor")
+    data = bytearray(b64decode(final["data"][0], validate=True))
+    # Base layout: mint, owner, amount, delegate, state at byte 108. Token-2022
+    # extensions follow an account type byte, 2 for a token account.
+    if len(data) < 165 or (len(data) > 165 and data[165] != 2) or data[108] != 1:
+        raise PrestateRefused(f"account {key} is not an initialized, unfrozen token account")
+    check_amount_only(items, key, final["owner"])
+    first = next(item for item in items if key in ordered_keys(item))
+    index = ordered_keys(first).index(key)
+    balances = [entry for entry in first["meta"].get("preTokenBalances") or [] if entry["accountIndex"] == index]
+    if len(balances) != 1 or "owner" not in balances[0]:
+        raise PrestateRefused(f"token account {key} has no observed starting balance")
+    balance, = balances
+    if (to_base58(data[:32]) != balance["mint"] or to_base58(data[32:64]) != balance["owner"]
+            or balance.get("programId", final["owner"]) != final["owner"]):
+        raise PrestateRefused(f"token account {key} changed mint, owner or program during the window")
+    data[64:72] = int(balance["uiTokenAmount"]["amount"]).to_bytes(8, "little")
+    # Same shape as an RPC account, like every other entry of the capture.
+    return dict(lamports=first["meta"]["preBalances"][index], data=[b64encode(bytes(data)).decode(), "base64"],
+                owner=final["owner"], executable=False, rentEpoch=final["rentEpoch"])
+
+
+def late_accounts(items, accounts, payers, end):
+    """Read, after the window, every account the window uses that the anchor capture lacks.
+
+    - Fee payers start as System accounts with their first observed balance.
+    - An account no target transaction writes, and that nothing else wrote from the
+      anchor to its read, had the read state when the window used it. Programs and
+      their ProgramData come in this way, with the bytes the cluster executes.
+    - A token account that the target transactions only move tokens in is rebuilt
+      at its first use.
+    The runner checks fee payers and rebuilt token accounts against their final state.
+    Writes inside the window by other transactions are refused by the window scan,
+    which receives these accounts as tracked.
+    """
+    referenced, written = set(), set()
+    for item in items:
+        referenced |= referenced_accounts(item)
+        written |= possible_writes(item)
+    missing = referenced - RUNTIME_ACCOUNTS - accounts.keys() - payers
+    states, read_slots = read_after_window(missing | payers, end)
+    initial, finals, builtins = {}, [], set()
+    for key in sorted(payers):
+        finals.append(payer_final_state(key, states[key]))
+    for key in sorted(missing - written):
+        value = states[key]
+        if value is not None and value["owner"] == NATIVE_LOADER:
+            builtins.add(key)  # LiteSVM supplies builtin programs and precompiles.
+        elif value is not None and value["owner"] == SYSVAR_OWNER:
+            raise PrestateRefused(f"the replay does not supply sysvar {key}")
+        elif value is not None and value["executable"] and value["owner"] not in PROGRAM_LOADERS:
+            raise PrestateRefused(f"program {key} uses a loader the replay does not support")
+        else:
+            initial[key] = value
+    for key in sorted(missing & written):
+        initial[key] = rebuild_token_account(items, key, states[key])
+        finals.append([list(from_base58(key)), archive_account(states[key])])
+    program_data = {program_data_address(value) for value in initial.values()
+                    if value is not None and value["executable"] and value["owner"] == LOADER}
+    extra, extra_slots = read_after_window(program_data - accounts.keys() - initial.keys(), end)
+    initial.update(extra)
+    read_slots.update(extra_slots)
+    size = sum(len(value["data"][0]) * 3 // 4 for value in initial.values() if value is not None)
+    if size > MAX_LATE_BYTES:
+        raise PrestateRefused("accounts read after the window exceed the archive budget")
+    check_untouched_after(read_slots, end)
+    return dict(initial=initial, finals=finals, builtins=builtins)
+
+
+def active_features(anchor):
+    """Features the cluster had activated at the anchor, with their activation slots.
+
+    Features take effect at epoch boundaries and the window stays inside one epoch.
+    """
+    entries = rpc("getProgramAccounts", FEATURE_OWNER, dict(FINAL, encoding="base64", minContextSlot=anchor))
+    features = []
+    for entry in entries:
+        data = account_bytes(entry["account"], FEATURE_OWNER)
+        if len(data) >= 9 and data[0] == 1:
+            slot, = struct.unpack_from("<Q", data, 1)
+            if slot <= anchor:
+                features.append([list(from_base58(entry["pubkey"])), slot])
+        elif not data or data[0] != 0:
+            raise PrestateRefused(f"invalid feature account {entry['pubkey']}")
+    if not features:
+        raise PrestateRefused("the cluster reported no active features")
+    return sorted(features)
 
 
 def system_account(lamports):
@@ -358,20 +518,24 @@ def replay_archive(event, bundle, limit):
     records = captured["records"]
     if not records:
         raise PrestateRefused("replay window contains no successful target transactions")
-    accounts = bundle["accounts"]
-    payers = {item["transaction"]["message"]["accountKeys"][0] for item in items} - accounts.keys()
+    # Block order. The first use of an account decides its rebuilt starting state.
+    order = {to_base58(bytes.fromhex(record["transaction"])[1:65]): (record["slot"], record["index"])
+             for record in records}
+    items.sort(key=lambda item: order[item["transaction"]["signatures"][0]])
+    payers = {item["transaction"]["message"]["accountKeys"][0] for item in items} - bundle["accounts"].keys()
+    late = late_accounts(items, bundle["accounts"], payers, anchor + span)
+    accounts = {**bundle["accounts"], **late["initial"]}
+    runtime = RUNTIME_ACCOUNTS | late["builtins"]
     tracked, direct = set(), set()
     for item in items:
-        tracked.update(check_transaction_prestate(item, accounts, payers))
-        message = item["transaction"]["message"]
-        writable, readonly, lookups = resolved_addresses(item)
-        direct.update(message["accountKeys"], writable, readonly, (lookup["accountKey"] for lookup in lookups))
+        tracked.update(check_transaction_prestate(item, accounts, payers, runtime))
+        direct.update(referenced_accounts(item))
     synthesized = {}
-    scan = check_window_isolation(event, records, tracked, accounts, synthesized)
+    scan = check_window_isolation(event, records, tracked, accounts, synthesized, runtime)
     if synthesized.keys() != payers:
         raise PrestateRefused("fee payer starting balance was not observed")
     # The runner installs the baseline ELF at the target address itself.
-    needed = tracked - RUNTIME_ACCOUNTS - {event["target"]}
+    needed = tracked - runtime - {event["target"]}
     if bundle["program_data"] not in direct:
         needed.discard(bundle["program_data"])
     present, absent = [], []
@@ -392,7 +556,7 @@ def replay_archive(event, bundle, limit):
         buffer=archive_account(accounts[bundle["buffer"]]), anchor_slot=anchor, replay_slots=span,
         min_txs=policy["min_replay_txs"], cu_limit_bps=policy["max_cu_delta_bps"],
         accounts=present, clocks=window_clocks(event, bundle, epoch, scan, from_parent), records=records,
-        final_accounts=final_states(synthesized.keys(), anchor + span),
+        final_accounts=late["finals"], features=active_features(anchor),
     )
 
 

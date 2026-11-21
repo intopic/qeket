@@ -13,6 +13,8 @@ anchor-lang.workspace = true
 canary-types.workspace = true
 canary-upgrade-gate = { path = "../../programs/canary_upgrade_gate", features = ["no-entrypoint"] }
 litesvm = "=0.7.1"
+# The feature set type LiteSVM 0.7.1 is built with.
+agave-feature-set = "=2.3.13"
 solana-sdk-ids = "=2.2.1"
 solana-compute-budget-interface = "=2.2.2"
 solana-message = "=2.4.0"
