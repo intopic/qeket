@@ -173,7 +173,7 @@ def remote_build(host, policy, commit, work):
     output = work / "candidate.so"
     ssh = ["ssh", "-F", "/dev/null", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
            "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=/run/canary/known_hosts",
-           "-o", "ConnectTimeout=15", "-i", "/run/canary/build_key", "-p", "2222", "root@" + host]
+           "-o", "ConnectTimeout=15", "-i", "/run/canary/build_key", "-p", "2222", "builder@" + host]
     try:
         with output.open("wb") as elf:
             command = ["sh", "-c", 'ulimit -f 20480 && exec "$@"', "sh", *ssh]

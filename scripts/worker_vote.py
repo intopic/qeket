@@ -8,7 +8,7 @@ import subprocess
 import time
 
 from live_capture import FINAL, rpc
-from devnet import from_base58
+from devnet import from_base58, to_base58
 from live_prestate import PROPOSAL_TAG, account_bytes, baseline_elf
 from solana_tx import (INSTRUCTIONS_SYSVAR, Keypair, anchor_discriminator, attestation_payload,
                        ed25519_instruction, transaction)
@@ -85,7 +85,7 @@ def wait_finalized(signature, timeout=150):
     raise RuntimeError("vote was not finalized in time")
 
 
-def finalized_vote(event, bundle, evidence, keypair, gate):
+def finalized_vote(event, bundle, evidence, verifier, gate):
     account = rpc("getAccountInfo", event["proposal"], dict(FINAL, encoding="base64"))["value"]
     if not account:
         return False
@@ -95,7 +95,7 @@ def finalized_vote(event, bundle, evidence, keypair, gate):
             or data[17:49] != from_base58(event["target"]) or data[57:89] != from_base58(bundle["buffer"])
             or data[121:153] != bytes(evidence["elf_sha256"])):
         raise VoteRefused("finalized proposal differs from vote")
-    index = bundle["config"]["verifiers"].index(keypair.address)
+    index = bundle["config"]["verifiers"].index(verifier)
     if not data[221] & (1 << index):
         return False
     if data[189:221] != bytes(evidence["diff_root"]):
@@ -103,27 +103,32 @@ def finalized_vote(event, bundle, evidence, keypair, gate):
     return True
 
 
-def submit_vote(event, bundle, evidence, keypair, gate, authorize=None):
-    if finalized_vote(event, bundle, evidence, keypair, gate):
+def submit_vote(event, bundle, evidence, keypair, gate, authorize=None, directory=None):
+    if finalized_vote(event, bundle, evidence, keypair.address, gate):
         return bundle.get("confirmed_signature")
     slot = rpc("getSlot", FINAL)
     payload = attestation_payload(
         evidence["replay_mode"], event["target"], event["nonce"], bundle["buffer"], event["anchor_slot"],
         event["replay_slots"], evidence["elf_sha256"], evidence["diff_root"], evidence["replayed_tx_count"],
         evidence["max_cu_delta_bps"], slot + VOTE_VALIDITY_SLOTS)
-    blockhash = rpc("getLatestBlockhash", FINAL)["value"]["blockhash"]
+    latest = rpc("getLatestBlockhash", FINAL)["value"]
+    blockhash = latest["blockhash"]
     if authorize is not None:
         authorize()
     verify = ed25519_instruction(keypair.public, keypair.sign(payload), payload)
     submit = (gate, [(bundle["config_address"], False, False), (event["proposal"], False, True),
                      (INSTRUCTIONS_SYSVAR, False, False)], anchor_discriminator("submit_verified_attestation"))
     raw = transaction(keypair.address, [verify, submit], blockhash, [keypair])
+    if directory is not None:
+        receipt = dict(signature=to_base58(raw[1:65]), last_height=latest["lastValidBlockHeight"],
+                       verifier=keypair.address, buffer=bundle["buffer"], config=bundle["config"], evidence=evidence)
+        write_atomic(directory / "vote-intent.json", json.dumps(receipt).encode())
     try:
         signature = rpc("sendTransaction", base64.b64encode(raw).decode(),
                         {"encoding": "base64", "preflightCommitment": "finalized"})
     except RuntimeError as exc:
         message = str(exc)
-        if finalized_vote(event, bundle, evidence, keypair, gate):
+        if finalized_vote(event, bundle, evidence, keypair.address, gate):
             return None
         if "AlreadyVoted" not in message and "Error Code:" in message and message.startswith("sendTransaction: -32002 "):
             raise VoteRefused(message[:400]) from None
@@ -153,5 +158,5 @@ def attest(event, bundle, policy, directory, runner, build, keypair, gate, autho
                    max_cu_delta_bps=evidence["max_cu_delta_bps"])
     if keypair is None or keypair.address not in bundle["config"]["verifiers"]:
         return dict(outcome, status="verified")
-    signature = submit_vote(event, bundle, evidence, keypair, gate, authorize)
+    signature = submit_vote(event, bundle, evidence, keypair, gate, authorize, directory)
     return dict(outcome, status="voted", verifier=keypair.address, signature=signature)

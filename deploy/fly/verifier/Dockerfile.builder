@@ -5,4 +5,5 @@ COPY scripts/worker_build.py .
 COPY deploy/fly/verifier/build-one /usr/local/bin/build-one
 COPY deploy/fly/verifier/start-builder.sh .
 RUN chmod 755 /usr/local/bin/build-one
+RUN useradd --create-home --groups docker --shell /bin/sh builder && usermod --password '*' builder
 ENTRYPOINT ["sh", "/worker/start-builder.sh"]

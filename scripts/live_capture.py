@@ -88,6 +88,10 @@ class NodeBehind(RuntimeError):
     """The RPC node that answered has not reached the slot the request needs."""
 
 
+class HistoryLimit(ValueError):
+    pass
+
+
 def behind(error):
     return isinstance(error, NodeBehind) or "-32016" in str(error)
 
@@ -107,7 +111,7 @@ def gate_history(cursor, tip):
             if cursor <= entry["slot"] <= tip and entry["err"] is None:
                 events.append(entry)
                 if len(events) > 1000:
-                    raise ValueError("proposal history limit exceeded")
+                    raise HistoryLimit("proposal history limit exceeded")
         if len(page) < 100 or page[-1]["slot"] < cursor:
             break
         before = page[-1]["signature"]
@@ -123,13 +127,25 @@ def gate_history(cursor, tip):
 
 def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_lifecycle=None):
     cursor = start if start is not None else rpc("getSlot", FINAL)
+    span = 64
     while True:
-        tip = min(rpc("getSlot", FINAL), cursor + 63)
+        tip = min(rpc("getSlot", FINAL), cursor + span - 1)
         if cursor > tip:
             wait(1)
             continue
         try:
             items = gate_history(cursor, tip)
+        except HistoryLimit:
+            if cursor == tip:
+                # One busy slot cannot be split. Use the block's own order.
+                confirmed = block(cursor, "json")
+                if not confirmed:
+                    raise NodeBehind("finalized gate block unavailable")
+                items = [(dict(slot=cursor, signature=item["transaction"]["signatures"][0]), item)
+                         for item in confirmed["transactions"] if item.get("meta") and item["meta"]["err"] is None]
+            else:
+                span = max(1, (tip - cursor + 1) // 2)
+                continue
         except RuntimeError as exc:
             if not behind(exc):
                 raise
@@ -144,6 +160,7 @@ def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_life
                 elif on_lifecycle is not None:
                     on_lifecycle(name, event)
         cursor = tip + 1
+        span = min(span * 2, 64)
         if checkpoint is not None:
             checkpoint(cursor)
 

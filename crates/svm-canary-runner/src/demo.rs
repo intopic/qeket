@@ -1156,11 +1156,23 @@ fn check_late_regression(
         reason.contains("post-state differs") && reason.ends_with(&expected),
         "expected the late state regression, got {reason}"
     );
+    let rejection_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // A bad final observation invalidates the replay even when the candidate
+    // has already diverged several transactions earlier.
+    proposed.final_accounts.push((proposed.target, None));
+    let incomplete = verify(&proposed, baseline, binary)
+        .err()
+        .context("invalid baseline observation unexpectedly passed")?;
+    ensure!(
+        !crate::replay::is_candidate_fault(&incomplete)
+            && incomplete.to_string().contains("final state differs"),
+        "invalid baseline was classified as a candidate regression"
+    );
     Ok(serde_json::json!({
         "expected_transaction_ordinal": 901,
         "slot": record.slot,
         "index": record.index,
         "reason": reason,
-        "rejection_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "rejection_ms": rejection_ms,
     }))
 }

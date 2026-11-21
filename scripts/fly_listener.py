@@ -19,7 +19,7 @@ from live_prestate import PrestateRefused, capture_prestate, replay_archive
 from worker_build import FEATURE, BuildFailed, build_candidate, remote_build
 from worker_http import start_http
 from worker_notify import notify
-from worker_vote import (CandidateRejected, ReplayIncomplete, VoteRefused, attest, discard_job_files,
+from worker_vote import (CandidateRejected, ReplayIncomplete, VoteRefused, attest, discard_job_files, finalized_vote,
                          load_keypair)
 
 MAX_BUILD_ATTEMPTS = 3
@@ -534,8 +534,13 @@ def main():
     with closing(sqlite3.connect(args.database)) as database:
         admissions = Admissions(database, policies, notify)
         live_jobs = {}
+        interrupted_votes = {}
         # Time-sensitive live snapshots cannot be recovered from the disk after a restart.
         for job in admissions.active_jobs():
+            intent = args.jobs / job["proposal"] / "vote-intent.json"
+            if attestor and intent.is_file():
+                interrupted_votes[job["proposal"]] = (job, json.loads(intent.read_bytes()))
+                continue
             if job.get("live_prestate") or (policies.get(job["target"]) and policies[job["target"]].seed_accounts is not None):
                 admissions.finish(job["proposal"], datetime.now(timezone.utc),
                                   "refused", "live pre-state was lost on restart")
@@ -586,8 +591,11 @@ def main():
                     capture_task = captures.pop(event["proposal"], None)
                     if capture_task is not None:
                         capture_task.cancel()
-                    observe_upgrade(admissions, live_jobs, running, attestor, event["proposal"],
-                                    datetime.now(timezone.utc))
+                    if event["proposal"] in interrupted_votes:
+                        interrupted_votes[event["proposal"]][1]["executed"] = True
+                    else:
+                        observe_upgrade(admissions, live_jobs, running, attestor, event["proposal"],
+                                        datetime.now(timezone.utc))
                 notify(name, event)
 
         next_capture = 0
@@ -607,6 +615,27 @@ def main():
                     for proposal in list(attestor.pending_cleanup):
                         attestor.discard(proposal)
                 now = datetime.now(timezone.utc)
+                for proposal, (job, receipt) in list(interrupted_votes.items()):
+                    try:
+                        evidence = receipt["evidence"]
+                        if finalized_vote(job, receipt, evidence, receipt["verifier"], GATE):
+                            root = bytes(evidence["diff_root"]).hex()
+                            admissions.finish(proposal, now, "voted", f"vote confirmed on chain; diff_root {root}")
+                            notify("VoteSubmitted", dict(proposal=proposal, verifier=receipt["verifier"], diff_root=root))
+                        elif rpc("getBlockHeight", {"commitment": "finalized"}) > receipt["last_height"]:
+                            # Re-read after the finalized expiry height in case the vote landed between reads.
+                            if finalized_vote(job, receipt, evidence, receipt["verifier"], GATE):
+                                continue
+                            admissions.finish(proposal, now, "refused", "interrupted vote expired without confirmation")
+                        else:
+                            continue
+                    except (RuntimeError, OSError):
+                        continue
+                    except (KeyError, ValueError, TypeError) as exc:
+                        admissions.finish(proposal, now, "refused", f"vote reconciliation failed: {exc}")
+                    if receipt.get("executed"):
+                        admissions.record_executed(proposal)
+                    del interrupted_votes[proposal]
                 check_live_traffic(admissions, live_jobs, slot, now, notify, attestor, executor, running)
                 capture_ready(admissions, args.snapshots, slot, now, notify, live_jobs)
                 next_capture = time.monotonic() + 30

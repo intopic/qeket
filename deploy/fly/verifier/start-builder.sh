@@ -27,10 +27,12 @@ for _ in $(seq 1 60); do
 done
 docker info >/dev/null 2>&1 || { tail -20 /data/dockerd.log >&2; exit 1; }
 install -d -m 0755 /run/sshd
-install -d -m 0700 /root/.ssh
+install -d -m 0700 -o builder -g builder /home/builder/.ssh
+chown builder:builder /data/tmp
 umask 077
 printf '%s\n' "$BUILDER_HOST_KEY" > /run/sshd/host_key
-printf 'restrict,command="/usr/local/bin/build-one" %s\n' "$BUILDER_CLIENT_PUBKEY" > /root/.ssh/authorized_keys
+printf 'restrict,command="/usr/local/bin/build-one" %s\n' "$BUILDER_CLIENT_PUBKEY" > /home/builder/.ssh/authorized_keys
+chown builder:builder /home/builder/.ssh/authorized_keys
 unset BUILDER_HOST_KEY BUILDER_CLIENT_PUBKEY
 exec /usr/sbin/sshd -D -e -h /run/sshd/host_key -p 2222 -o ListenAddress=fly-local-6pn \
-  -o PermitRootLogin=forced-commands-only -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
+  -o AllowUsers=builder -o PermitRootLogin=no -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
