@@ -1,0 +1,29 @@
+{
+  "environment": "Solana Devnet with Alpenglow active, GitHub Actions run 44924610867, three separate runners",
+  "run": "https://github.com/intopic/qeket/actions/runs/44924610867",
+  "source_commit": "5b2f5c8",
+  "purpose": "Recheck the cycle after the five review findings and two Devnet faults were fixed",
+  "quorum_diff_root": "03f1f9fc30898081aab96ec72eaf092b283b0d54ae1da88f6e3ad0ca4d5e21d6",
+  "quorum_root_matches_controlled_snapshot_replay": true,
+  "execute_gated_upgrade": "https://explorer.solana.com/tx/3D5pczrzsGifCyhe2p1Ku8XwES89AYe25vq1bA9G7VXJbMvEjux5iaXbAG2mCCqR55EGxqUrb8LHRJyjwQy9AEaD?cluster=devnet",
+  "verifiers": [
+    {"job": "verifier-a", "sqlite_outcome": "executed", "reason_keeps_vote": "vote 64edBsxhcpWgHw7SDxjwqcRwbNw2P92pfL9cdr9q5kRxk7mEtXMrvHpS5yZ6XgbDoT7zJvLBWp4cmLLCG2m6Kovj"},
+    {"job": "verifier-b", "sqlite_outcome": "executed", "reason_keeps_vote": "vote 3KLBVRqfJkUp3L49v1yp3FMpBta78Gq3a4jRys2pKnojHyE1Mmm5mw5ygWApqmy1seo5cjqMP72BeHF9om5e5ySB"}
+  ],
+  "archive": {
+    "records": 50,
+    "final_accounts": "the reconstructed fee payer ended at 1,750,000 lamports with no data, and the baseline replay reached that state",
+    "execution_clock_example": {
+      "slot": 524774571,
+      "archive_unix_timestamp": 1795279094,
+      "blockTime_of_slot": 1795279095,
+      "blockTime_of_parent": 1795279094,
+      "note": "Under Alpenglow transactions read the parent time. The previous rule would have been one second ahead here."
+    }
+  },
+  "faults_found_on_devnet": {
+    "44916754489": "verifier-a moved its cursor past execute_gated_upgrade without the event: a lagging RPC node answered getSignaturesForAddress. Fixed with minContextSlot=tip and retry. verifier-b closed as executed without its vote reason. Fixed by keeping the job open while the vote finalizes.",
+    "44924062388": "Both workers refused: the first counter transaction landed 5 slots after the anchor, before their snapshot, because Alpenglow finality is nearly immediate. Fixed in the cycle harness by sending traffic after anchor + 32."
+  },
+  "devnet_sol_after_run_lamports": "checked before dispatch: 4.319 SOL"
+}
