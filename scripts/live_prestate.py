@@ -325,19 +325,30 @@ def baseline_elf(bundle):
     return account_bytes(bundle["accounts"][bundle["program_data"]], LOADER)[45:]
 
 
+def read_slot(result, floor, anchor):
+    slot = result["context"]["slot"]
+    if slot < floor:
+        raise PrestateRefused("RPC returned an older bank than a previous capture read")
+    if slot > anchor + MAX_ANCHOR_DRIFT:
+        raise PrestateRefused("live state was captured too far from the replay anchor")
+    return slot
+
+
 def capture_prestate(event, seed_accounts, gate=GATE):
     anchor = event["anchor_slot"]
     options = dict(FINAL, encoding="base64", minContextSlot=anchor)
     target, proposal = event["target"], event["proposal"]
+    # A public RPC finalizes a new bank every few hundred milliseconds, so the
+    # three reads may land in successive banks. Scanning every block from the
+    # anchor through the latest read proves each read equals the state at the
+    # start of the anchor slot.
     owned = rpc("getProgramAccounts", target, dict(options, withContext=True))
-    slot = owned["context"]["slot"]
-    if not anchor <= slot <= anchor + MAX_ANCHOR_DRIFT:
-        raise PrestateRefused("live state was captured too far from the replay anchor")
+    slot = read_slot(owned, anchor, anchor)
     options["minContextSlot"] = slot
 
     pointers = rpc("getMultipleAccounts", [target, proposal], options)
-    if pointers["context"]["slot"] != slot:
-        raise PrestateRefused("RPC advanced between owned-account and pointer reads")
+    slot = read_slot(pointers, slot, anchor)
+    options["minContextSlot"] = slot
     program, proposed = pointers["value"]
     parsed = proposal_details(proposed, event, gate)
     program_data = program_data_address(program)
@@ -345,12 +356,13 @@ def capture_prestate(event, seed_accounts, gate=GATE):
     core = [target, proposal, parsed["buffer"], program_data]
     addresses = list(dict.fromkeys([*core, *seed_accounts]))
     fetched = rpc("getMultipleAccounts", [*addresses, config_address, CLOCK], options)
-    if fetched["context"]["slot"] != slot or len(fetched["value"]) != len(addresses) + 2:
-        raise PrestateRefused("RPC advanced or did not return all requested accounts")
+    slot = read_slot(fetched, slot, anchor)
+    if len(fetched["value"]) != len(addresses) + 2:
+        raise PrestateRefused("RPC did not return all requested accounts")
     *values, config_account, clock_account = fetched["value"]
     accounts = dict(zip(addresses, values))
     if accounts[target] != program or accounts[proposal] != proposed:
-        raise PrestateRefused("program or proposal differed within the capture bank")
+        raise PrestateRefused("program or proposal changed during the capture")
     policy = config_details(config_account, target, gate)
     clock = clock_details(clock_account, slot)
 

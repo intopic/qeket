@@ -75,12 +75,12 @@ class LivePrestateTest(unittest.TestCase):
         voters = [address(20), address(21), address(22)]
         clock = account(SYSVAR_OWNER, struct.pack("<QqQQq", 101, 900, 4, 5, 1234))
 
-        def responses(slot=101, clock_record=clock, authority_record=new):
+        def responses(slot=101, clock_record=clock, authority_record=new, last=101):
             return [
                 dict(context=dict(slot=101), value=[dict(pubkey=address(7), account=owned)]),
                 dict(context=dict(slot=slot), value=[executable, proposal_record]),
-                dict(context=dict(slot=101), value=[executable, proposal_record, authority_record, old, seed_record,
-                                                    config_record(target, gate, voters, mode=1), clock_record]),
+                dict(context=dict(slot=last), value=[executable, proposal_record, authority_record, old, seed_record,
+                                                     config_record(target, gate, voters, mode=1), clock_record]),
             ]
 
         with patch("live_prestate.rpc", side_effect=responses()), patch(
@@ -98,10 +98,22 @@ class LivePrestateTest(unittest.TestCase):
             self.assertNotIn(proposal, writes.call_args.args[2])
             self.assertNotIn(config, writes.call_args.args[2])
 
+        # Successive finalized banks are accepted. The unchanged-state scan then
+        # runs through the latest read.
+        later_clock = account(SYSVAR_OWNER, struct.pack("<QqQQq", 104, 900, 4, 5, 1234))
+        with patch("live_prestate.rpc", side_effect=responses(slot=102, last=104, clock_record=later_clock)), patch(
+            "live_prestate.check_captured_accounts_unchanged"
+        ) as writes:
+            bundle = capture_prestate(event, [seed], gate=gate)
+            self.assertEqual(bundle["capture_slot"], 104)
+            self.assertEqual(writes.call_args.args[:2], (100, 104))
+
         stale_clock = account(SYSVAR_OWNER, struct.pack("<QqQQq", 100, 900, 4, 5, 1234))
+        late_clock = account(SYSVAR_OWNER, struct.pack("<QqQQq", 133, 900, 4, 5, 1234))
         foreign = account(LOADER, struct.pack("<IB", 1, 1) + bytes([8]) * 32 + b"new ELF")
         old_foreign = account(LOADER, struct.pack("<IQB", 3, 90, 1) + bytes([8]) * 32 + b"old ELF")
-        for kwargs, reason in ((dict(slot=102), "RPC advanced"), (dict(clock_record=stale_clock), "Clock"),
+        for kwargs, reason in ((dict(slot=102), "older bank"), (dict(last=133, clock_record=late_clock), "too far"),
+                               (dict(clock_record=stale_clock), "Clock"),
                                (dict(authority_record=foreign), "authority differ")):
             with self.subTest(reason=reason), patch("live_prestate.rpc", side_effect=responses(**kwargs)), \
                     patch("live_prestate.check_captured_accounts_unchanged"):
