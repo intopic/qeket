@@ -5,10 +5,21 @@ from unittest.mock import patch
 
 from devnet import LOADER, from_base58, to_base58
 from live_prestate import (
-    CLOCK, CONFIG_TAG, SYSTEM, PROPOSAL_TAG, SYSVAR_OWNER, PrestateRefused, capture_prestate,
-    check_captured_accounts_unchanged, check_transaction_prestate, check_window_epoch,
+    CLOCK, CONFIG_TAG, FEATURE_OWNER, NATIVE_LOADER, SYSTEM, PROPOSAL_TAG, SYSVAR_OWNER, PrestateRefused,
+    capture_prestate, check_captured_accounts_unchanged, check_transaction_prestate, check_window_epoch,
     check_window_isolation, final_states, replay_archive, window_clocks,
 )
+
+TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+BPF_LOADER_2 = "BPFLoader2111111111111111111111111111111111"
+
+
+def token_account(mint, owner, amount, state=1):
+    data = bytearray(165)
+    data[:32], data[32:64] = from_base58(mint), from_base58(owner)
+    data[64:72] = amount.to_bytes(8, "little")
+    data[108] = state
+    return account(TOKEN, bytes(data), lamports=2_039_280)
 from solana_tx import find_program_address
 
 
@@ -236,22 +247,30 @@ class ReplayArchiveTest(unittest.TestCase):
             }},
         }
 
-    def run_archive(self, later=(), after=(), alpenglow=None, final=None, epoch_slots=1000):
-        target_tx = self.transaction([self.payer, self.counter, self.target], 2, self.signature)
+    def run_archive(self, later=(), after=(), alpenglow=None, final=None, epoch_slots=1000, target_tx=None,
+                    chain=(), features=None):
+        """`chain` holds account states read after the window, besides the fee payer's."""
+        target_tx = target_tx or self.transaction([self.payer, self.counter, self.target], 2, self.signature)
         record = dict(slot=101, index=0, transaction=(b"\x01" + self.signature).hex(), baseline={"fee": 5000})
         blocks = {101: dict(parentSlot=99, blockTime=1010, transactions=[target_tx]),
                   103: dict(parentSlot=101, blockTime=1030, transactions=list(later)),
                   105: dict(parentSlot=103, blockTime=1050, transactions=list(after))}
-        feature = None if alpenglow is None else account(
-            "Feature111111111111111111111111111111111111", b"\x01" + struct.pack("<Q", alpenglow))
+        feature = None if alpenglow is None else account(FEATURE_OWNER, b"\x01" + struct.pack("<Q", alpenglow))
         payer_end = final if final is not None else dict(account(SYSTEM, b"", lamports=4_995_000))
+        states = {self.payer: payer_end, **dict(chain)}
+        if features is None:
+            features = [dict(pubkey=address(40), account=account(FEATURE_OWNER, b"\x01" + struct.pack("<Q", 0)))]
 
         def fake_rpc(method, *params):
             if method == "getBlocks":
                 return [101, 103] if params[0] == 100 else [105]
+            if method == "getMultipleAccounts":
+                return {"context": {"slot": 105}, "value": [states.get(key) for key in params[0]]}
+            if method == "getProgramAccounts":
+                self.assertEqual(params[0], FEATURE_OWNER)
+                return features
             return {"getEpochSchedule": dict(firstNormalSlot=0, slotsPerEpoch=epoch_slots, firstNormalEpoch=0),
-                    "getBlocksWithLimit": [105], "getBlockTime": 990, "getAccountInfo": {"value": feature},
-                    "getMultipleAccounts": {"context": {"slot": 105}, "value": [payer_end]}}[method]
+                    "getBlocksWithLimit": [105], "getBlockTime": 990, "getAccountInfo": {"value": feature}}[method]
 
         def fake_capture(snapshot, limit, validate_transaction=None, include_baseline=False):
             self.assertTrue(include_baseline)
@@ -328,6 +347,105 @@ class ReplayArchiveTest(unittest.TestCase):
         with patch("live_prestate.rpc", side_effect=rpc), patch("live_prestate.block", side_effect=blocks):
             self.assertEqual(len(final_states(keys, 103)), 102)
         self.assertEqual(calls, [keys[:100], keys[100:]])
+
+    def test_archive_carries_the_cluster_features_active_at_the_anchor(self):
+        def feature(n, data):
+            return dict(pubkey=address(n), account=account(FEATURE_OWNER, data))
+        archive = self.run_archive(features=[
+            feature(41, b"\x01" + struct.pack("<Q", 100)), feature(42, b"\x01" + struct.pack("<Q", 101)),
+            feature(43, b"\x00" + bytes(8)), feature(40, b"\x01" + struct.pack("<Q", 7)),
+        ])
+        # Activated after the anchor (101) or still pending (43): not active in the window.
+        self.assertEqual(archive["features"], [[list(from_base58(address(40))), 7],
+                                               [list(from_base58(address(41))), 100]])
+        with self.assertRaisesRegex(PrestateRefused, "invalid feature account"):
+            self.run_archive(features=[feature(40, b"\x05")])
+
+    def test_read_only_accounts_and_programs_are_read_after_the_window(self):
+        """A mint, an external program and its ProgramData, all untouched from anchor to read."""
+        mint, program, program_data, vote = address(50), address(51), address(52), address(53)
+        keys = [self.payer, self.counter, mint, program, vote, self.target]
+        tx = self.transaction(keys, 5, self.signature, balances=[5_000_000, 100, 1, 1, 1, 1], readonly=4)
+        chain = {mint: account(TOKEN, bytes(82)), vote: account(NATIVE_LOADER, b"", True),
+                 program: account(LOADER, struct.pack("<I", 2) + from_base58(program_data), True),
+                 program_data: account(LOADER, struct.pack("<IQB", 3, 10, 0) + b"\x7fELF other")}
+        archive = self.run_archive(target_tx=tx, chain=chain)
+        accounts = {to_base58(bytes(key)): value for key, value in archive["accounts"]}
+        self.assertEqual(sorted(accounts), sorted([self.counter, self.payer, mint, program, program_data]))
+        self.assertEqual(bytes(accounts[program_data]["data"][13:]), b"\x7fELF other")
+        self.assertTrue(accounts[program]["executable"])
+        # Read-only accounts need no end-state check. The builtin is left to LiteSVM.
+        self.assertEqual([to_base58(bytes(key)) for key, _ in archive["final_accounts"]], [self.payer])
+        # Another transaction writing the mint inside the window, or before its read, is refused.
+        writer = self.transaction([self.outsider, mint], 1, balances=[1, 1], readonly=0)
+        with self.assertRaisesRegex(PrestateRefused, "modified by non-target"):
+            self.run_archive(target_tx=tx, chain=chain, later=[writer])
+        with self.assertRaisesRegex(PrestateRefused, "used again"):
+            self.run_archive(target_tx=tx, chain=chain, after=[writer])
+        # So is an upgrade of the external program after the window.
+        upgrade = self.transaction([self.outsider, program_data], 1, balances=[1, 1], readonly=0)
+        with self.assertRaisesRegex(PrestateRefused, "used again"):
+            self.run_archive(target_tx=tx, chain=chain, after=[upgrade])
+
+    def test_sysvars_and_unsupported_loaders_are_refused(self):
+        rent, program = "SysvarRent111111111111111111111111111111111", address(54)
+        for key, state, reason in ((rent, account(SYSVAR_OWNER, bytes(17)), "sysvar"),
+                                   (program, account("LoaderV411111111111111111111111111111111111", b"", True),
+                                    "loader")):
+            tx = self.transaction([self.payer, self.counter, key, self.target], 3, self.signature,
+                                  balances=[5_000_000, 100, 1, 1], readonly=2)
+            with self.subTest(reason), self.assertRaisesRegex(PrestateRefused, reason):
+                self.run_archive(target_tx=tx, chain={key: state})
+
+    def token_window(self, data, amount=500, final_amount=400, owner=None, pre=True, inner=True):
+        """The target moves tokens out of an account the anchor capture did not include."""
+        holder, mint, wallet = address(60), address(61), address(62)
+        keys = [self.payer, self.counter, holder, self.target, TOKEN]
+        tx = self.transaction(keys, 3, self.signature, balances=[5_000_000, 100, 2_039_280, 1, 1], readonly=2)
+        tx["transaction"]["message"]["instructions"][0]["accounts"] = [1, 2, 4]
+        tx["meta"]["innerInstructions"] = [dict(index=0, instructions=[
+            dict(programIdIndex=4, accounts=[2, 1, 0], data=to_base58(data))])] if inner else None
+        if pre:
+            tx["meta"]["preTokenBalances"] = [dict(accountIndex=2, mint=mint, owner=owner or wallet, programId=TOKEN,
+                                                   uiTokenAmount=dict(amount=str(amount), decimals=6))]
+        chain = {holder: token_account(mint, wallet, final_amount),
+                 TOKEN: account(BPF_LOADER_2, b"\x7fELF token", True)}
+        return holder, dict(target_tx=tx, chain=chain)
+
+    def test_token_account_is_rebuilt_from_its_first_use(self):
+        transfer = bytes([3]) + (100).to_bytes(8, "little")
+        holder, window = self.token_window(transfer)
+        archive = self.run_archive(**window)
+        accounts = {to_base58(bytes(key)): value for key, value in archive["accounts"]}
+        # The amount and lamports at first use, every other field from the state after the window.
+        start = accounts[holder]
+        self.assertEqual(int.from_bytes(bytes(start["data"][64:72]), "little"), 500)
+        self.assertEqual(start["data"][:64], list(base64.b64decode(window["chain"][holder]["data"][0]))[:64])
+        self.assertEqual((start["lamports"], bytes(start["owner"])), (2_039_280, from_base58(TOKEN)))
+        # The token program comes from the cluster, not from LiteSVM's bundled copy.
+        self.assertEqual(bytes(accounts[TOKEN]["data"]), b"\x7fELF token")
+        # The runner must arrive at the token account the chain finalized.
+        finals = {to_base58(bytes(key)): value for key, value in archive["final_accounts"]}
+        self.assertEqual(int.from_bytes(bytes(finals[holder]["data"][64:72]), "little"), 400)
+
+    def test_token_account_changed_beyond_its_amount_is_refused(self):
+        transfer = bytes([3]) + (100).to_bytes(8, "little")
+        cases = [
+            ("approve", dict(data=bytes([4]) + (5).to_bytes(8, "little")), "other than transfer"),
+            ("no starting balance", dict(data=transfer, pre=False), "no observed starting balance"),
+            ("owner changed", dict(data=transfer, owner=address(63)), "changed mint, owner"),
+            ("no inner instructions", dict(data=transfer, inner=False), "inner instructions"),
+        ]
+        for name, options, reason in cases:
+            _, window = self.token_window(**options)
+            with self.subTest(name), self.assertRaisesRegex(PrestateRefused, reason):
+                self.run_archive(**window)
+        # A written account that is not a token account cannot be rebuilt.
+        _, window = self.token_window(transfer)
+        holder = window["target_tx"]["transaction"]["message"]["accountKeys"][2]
+        window["chain"][holder] = account(address(64), bytes(165), lamports=2_039_280)
+        with self.assertRaisesRegex(PrestateRefused, "written by the window but was not captured"):
+            self.run_archive(**window)
 
     def test_reconstructed_fee_payer_is_isolated(self):
         # A later failed transaction from the same payer could have charged its fee.
