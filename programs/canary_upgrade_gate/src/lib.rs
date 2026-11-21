@@ -107,15 +107,8 @@ pub mod canary_upgrade_gate {
         Ok(())
     }
 
-    pub fn submit_canary_attestation(
-        ctx: Context<SubmitCanaryAttestation>,
-        payload: CanaryAttestationPayload,
-    ) -> Result<()> {
-        let ix = ed25519_check::previous_verification(&ctx.accounts.instruction_sysvar)?;
-        let verifier = ed25519_check::signer_from_instruction(&ix, &payload.try_to_vec()?)?;
-        accept_vote(ctx, verifier, payload)
-    }
-
+    /// The vote payload is read from the preceding Ed25519 instruction, so it
+    /// is signed and parsed exactly once.
     pub fn submit_verified_attestation(ctx: Context<SubmitCanaryAttestation>) -> Result<()> {
         let ix = ed25519_check::previous_verification(&ctx.accounts.instruction_sysvar)?;
         let (verifier, payload) = ed25519_check::signed_payload(&ix)?;

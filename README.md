@@ -77,16 +77,15 @@ Te **Settings → Secrets and variables → Actions** vendos:
 | `RPC_URL` | HTTPS URL e Helius për Devnet, përfshirë API key |
 | `DEVNET_PAYER` | Array JSON i 64 bajtëve për një portofol të dedikuar, të financuar me SOL testues për rent dhe tarifa |
 | `GATE_PROGRAM_KEYPAIR` (opsional) | Array JSON i keypair-it të programit. Pa të, workflow derivon një adresë të qëndrueshme Devnet nga payer-i dhe ndërton gate-in dhe runner-in për atë adresë. |
-| `FLY_API_TOKEN` (opsional) | Token për deploy të worker-it. Ky hap kërkon edhe secret `CANARY_CUSTOMERS`. Për një aplikacion ekzistues vendos edhe repository variable `FLY_APP`. Për krijim automatik token-i duhet të ketë leje në organizatën `personal`. |
 
-Nis **Actions → Live Devnet counter → Run workflow** në `main`. Një push provon ndërtimin offline dhe gjithë ciklin në një validator të përkohshëm, me dy worker-a të pavarur në të njëjtin runner. Vetëm nisja manuale aktivizon deploy dhe transaksionet në Devnet. Aty votat i japin job-et `verifier-a` dhe `verifier-b`, secili në runner-in e vet. Secili mban vetëm çelësin e vet të votës, kap gjendjen live në pranim, ndërton kandidatin nga commit-i i propozimit, riekzekuton dritaren dhe voton. Job-i `cycle` nuk voton. Ai pret që të dy worker-at të raportojnë `Verifier ready`, pastaj propozon, dërgon trafikun, pret kuorumin dhe kontrollon që `diff_root` i votuar të jetë i njëjtë me replay-in e snapshot-it të kontrolluar. Pas ekzekutimit, secili worker regjistron `executed`. Çdo nisje e re krijon target të ri dhe konsumon rent Devnet. Nëse një nisje dështon pasi ka inicializuar gate-in, artifact-i përmban hapat e finalizuar deri aty. Ruaj payer-in dhe run ID për rikuperimin e autoriteteve.
+Nis **Actions → Live Devnet counter → Run workflow** në `main`. Një push provon ndërtimin offline dhe gjithë ciklin në një validator të përkohshëm, me dy worker-a të pavarur në të njëjtin runner. Vetëm nisja manuale dërgon transaksione në Devnet. Aty votat i japin job-et `verifier-a` dhe `verifier-b`, secili në runner-in e vet. Secili mban vetëm çelësin e vet të votës, kap gjendjen live në pranim, ndërton kandidatin nga commit-i i propozimit, riekzekuton dritaren dhe voton. Job-i `cycle` nuk voton. Ai pret që të dy worker-at të raportojnë `Verifier ready`, pastaj propozon, dërgon trafikun, pret kuorumin dhe kontrollon që `diff_root` i votuar të jetë i njëjtë me replay-in e snapshot-it të kontrolluar. Pas ekzekutimit, secili worker regjistron `executed`. Çdo nisje e re krijon target të ri dhe konsumon rent Devnet. Nëse një nisje dështon pasi ka inicializuar gate-in, artifact-i përmban hapat e finalizuar deri aty. Ruaj payer-in dhe run ID për rikuperimin e autoriteteve.
 
 Artifact-i `devnet-live-<run_id>` përmban `transactions.md` dhe arkivin e replay-it. Provën mund ta nisësh me 50–100 transaksione të counter-it, secila me ComputeBudget. Snapshot-i i shembullit merret nga RPC para propozimit për counter-in dhe fee payer-in e izoluar. Workflow kërkon pikërisht transaksionet e pritura në dritaren e finalizuar dhe rikonfirmon bytecode-in e instaluar. Counter-i nuk lexon sysvar Clock. Për programe arbitrare, komanda `python scripts/live_capture.py capture SNAPSHOT.json ARCHIVE.json --max-replay-txs 500` kërkon gjendjen historike të fillimit të dritares, përfshirë ALT, ProgramData dhe sysvars përkatëse. `minContextSlot` nuk rikthen gjendjen historike. CLI ekzistuese `canary-gate verify` riekzekuton arkivin. Në provën Devnet, ndërtimin e kandidatit dhe votimin i bëjnë worker-at e verifikuesve, jo skripti i ciklit. Artifact-et `devnet-verifier-a-<run_id>` dhe `devnet-verifier-b-<run_id>` përmbajnë logun, SQLite-in, arkivin dhe `evidence.json` të secilit.
 
 
-### Whitelist dhe kuota për listener-in Fly.io
+### Whitelist dhe kuota e klientëve
 
-Vendos `CANARY_CUSTOMERS` si repository secret para se të aktivizosh deploy-in në Fly. Formati është një objekt JSON me ID të qëndrueshme të klientëve.
+Vendos `CANARY_CUSTOMERS` si Fly secret në secilin verifikues. Formati është një objekt JSON me ID të qëndrueshme të klientëve.
 
 ```json
 {
@@ -98,7 +97,7 @@ Vendos `CANARY_CUSTOMERS` si repository secret para se të aktivizosh deploy-in 
 }
 ```
 
-Zëvendëso `<program-id>` me adresën publike të programit të klientit. Afati është ekskluziv. Kuota mat propozimet unike të pranuara për klientin, brenda muajit kalendarik UTC, dhe ndahet ndërmjet programeve të tij. Një propozim i pranuar ruhet vetëm një herë. Listener-i ruan numërimin dhe pozicionin e leximit në SQLite në volumin e instancës Fly. Konfigurimi aktual presupozon një instancë të vetme për këtë ledger. Politikat e klientëve mirëmbahen në secret dhe hyjnë në fuqi kur publikohet konfigurimi i ri. Worker-i ruan propozimet e pranuara në radhë. Kur dritarja finalizohet dhe operatori vendos gjendjen historike të besuar në `/data/snapshots/<proposal>/snapshot.json`, worker-i mbledh transaksionet me kufirin e klientit dhe shkruan `archive.json` në të njëjtën dosje. Kompilimi dhe dërgimi automatik i votës nga Fly mbeten hapa të veçantë.
+Zëvendëso `<program-id>` me adresën publike të programit të klientit. Afati është ekskluziv. Kuota mat propozimet unike të pranuara për klientin, brenda muajit kalendarik UTC, dhe ndahet ndërmjet programeve të tij. Një propozim i pranuar ruhet vetëm një herë. Çdo verifikues ruan numërimin dhe pozicionin e leximit në SQLite, në volumin e vet. Politikat e klientëve mirëmbahen në secret dhe hyjnë në fuqi kur publikohet konfigurimi i ri. Për çdo propozim të pranuar, worker-i kap gjendjen live, pret finalizimin e dritares, ndërton kandidatin dhe voton (shih [kapjen live](#kapja-live-e-gjendjes-fillestare)).
 
 
 | Plani | Abonimi mujor (USD) | Kontrata | Propozime për upgrade në muaj | Transaksione replay për propozim | Për kë është |
@@ -111,11 +110,13 @@ Tabela përshkruan ofertën komerciale. Devnet falas, kufijtë e kontratave sipa
 
 Abonimet B2B faturohen jashtë zinxhirit.
 
-Mund të caktohen `active`, `cooldown_minutes`, `max_upgrades_per_month` dhe `max_replay_txs`. Përditëso `CANARY_CUSTOMERS` ose menaxho skedarin `/data/customers.json` me `python scripts/customer_admin.py --file customers.json set CLIENT --plan starter --target PROGRAM`. Për një klient ekzistues përdor `suspend CLIENT` ose `plan CLIENT --plan pro`. Skedari në volum ka përparësi ndaj secret-it. Një job i pranuar bllokon pranimin e job-eve të tjera të klientit deri në mbyllje. Në fazën aktuale operatori mund ta mbyllë me `python fly_listener.py --finish PROPOSAL`. Tavani i replay-it ruhet në payload-in e job-it. SQLite zbaton kuotën për një instancë. Për kuotë të përbashkët mes nyjeve, kërkohet ruajtje e përbashkët e vendimeve të pranimit.
+Mund të caktohen `active`, `cooldown_minutes`, `max_upgrades_per_month` dhe `max_replay_txs`. Përditëso `CANARY_CUSTOMERS` ose menaxho skedarin `/data/customers.json` me `python scripts/customer_admin.py --file customers.json set CLIENT --plan starter --target PROGRAM`. Për një klient ekzistues përdor `suspend CLIENT` ose `plan CLIENT --plan pro`. Skedari në volum ka përparësi ndaj secret-it. Një job i pranuar bllokon pranimin e job-eve të tjera të klientit deri në mbyllje. Job-i mbyllet vetë me një rezultat, kur skadon propozimi ose pas një rinisjeje. Operatori mund ta mbyllë edhe me dorë, me `python fly_listener.py --finish PROPOSAL`. Tavani i replay-it ruhet në payload-in e job-it. SQLite zbaton kuotën për një instancë. Për kuotë të përbashkët mes nyjeve, kërkohet ruajtje e përbashkët e vendimeve të pranimit.
 
 ### Dy verifikues të pavarur në Fly.io
 
-Çdo verifikues në Fly.io përdor dy makina. Makina nënshkruese ekzekuton `canary-gate` dhe mban çelësin Solana. Makina e dedikuar e build-it shkarkon platform-tools v1.58, kontrollon SHA-256 dhe ndërton kandidatin në Docker offline. Dy çiftet vendosen në `fra` dhe `iad`. Emrat e aplikacioneve, çelësat SSH dhe lidhja private për secilin çift përshkruhen te [konfigurimi Fly](deploy/fly/verifier/README.md).
+`deploy/fly/verifier/` publikon dy aplikacione me nga një makinë: `canary-verifier-a` në `fra` dhe `canary-verifier-b` në `iad`. Secila ka `shared-cpu-2x`, 2 GB RAM, 2 GB swap dhe volum `/data` 10 GB. Imazhi përmban `canary-gate`, të ndërtuar me ID-në e gate-it, dhe Docker. Në nisjen e parë, worker-i shkarkon platform-tools v1.58 në volum dhe kontrollon SHA-256. Build-et e kandidatit përdorin të njëjtin kontejner offline si CI-ja: pa rrjet, pa capabilities dhe me burim read-only. Hapat e deploy-it janë te [konfigurimi Fly](deploy/fly/verifier/README.md).
+
+Build-i dhe çelësi i votës janë në të njëjtën makinë. Listener-i ka qasje në Docker që të nisë kontejnerin e build-it, dhe kjo në praktikë është qasje root. Një dalje nga kontejneri do ta zbulonte çelësin. Për këtë duhet një gabim në kernel ose në `runc`, dhe kodin e ndërton commit-i që zgjedh propozuesi. Të dy verifikuesit e ndërtojnë të njëjtin commit, dhe çelësat e tyre vlejnë për të gjithë klientët. Për Devnet ky rrezik pranohet. Para Mainnet rekomandohet që build-i të kalojë në një makinë pa çelës. `CANARY_BUILDER_HOST` e dërgon build-in me SSH te një host i tillë, ku `worker_build.py serve-build` është komanda e vetme e lejuar. Konfigurimi Fly për këtë host ndodhet në commit-in `9238584`.
 
 Gjenero çelësin e votës veçmas për secilin aplikacion, në kompjuterin tënd. Çelësi sekret shkon vetëm te `fly secrets`, ndërsa adresa publike shfaqet në ekran:
 
@@ -123,11 +124,24 @@ Gjenero çelësin e votës veçmas për secilin aplikacion, në kompjuterin tën
 fly secrets set -a canary-verifier-a CANARY_VERIFIER_KEYPAIR="$(python scripts/solana_tx.py keygen)"
 ```
 
-Workflow-i **Deploy Fly verifiers** përdor nga një token të kufizuar për secilin nga katër aplikacionet. Makina e build-it publikohet para verifikuesit të saj. Nëse verifikuesi nuk ka `RPC_URL`, workflow-i e merr nga secret-i `RPC_URL` i repos.
+Workflow-i **Deploy Fly verifiers** kërkon secret-et e repos `FLY_API_TOKEN_VERIFIER_A` dhe `FLY_API_TOKEN_VERIFIER_B`, nga një token deploy i kufizuar për secilin aplikacion. Nëse aplikacioni nuk ka `RPC_URL`, workflow-i e merr nga secret-i `RPC_URL` i repos. Deploy-i ndalet nëse mungon `CANARY_VERIFIER_KEYPAIR` ose `CANARY_CUSTOMERS`.
+
+`CANARY_CLUSTER` zgjedh rrjetin: `devnet`, që është vlera e paracaktuar, ose `mainnet-beta`. Worker-i nuk niset nëse `RPC_URL` i përgjigjet me genesis të një rrjeti tjetër.
 
 ### Adapteri Squads v4
 
-`packages/squads-adapter` ndërton instruksionet e gate-it dhe i mbështjell me `vaultTransactionCreate` nga SDK Squads. Kalo adresën e gate-it të publikuar, adresën e multisig-ut, indeksin e Vault-it dhe të dhënat aktuale të propozimit. Vault-i duhet të jetë autoriteti për veprimet e qeverisjes dhe të ketë SOL për llogaritë e përdorura gjatë inicializimit ose propozimit. Ndiq rrjedhën e zakonshme Squads për krijimin e propozimit, miratimet dhe ekzekutimin. Për transferimin e autoritetit, rruga e qeverisjes kërkon `proposeProgramAuthorityTransfer` dhe timelock. Në ekzekutim duhet të sigurohet edhe nënshkrimi i marrësit të ri, sipas mënyrës si ai autoritet nënshkruan. Paketa krijon instruksionet dhe payload-in e Vault-it. Integrimi me një Vault të publikuar kërkon ende test on-chain.
+`packages/squads-adapter` ndërton instruksionet e gate-it dhe i mbështjell me `vaultTransactionCreate` nga SDK Squads. Kalo adresën e gate-it të publikuar, adresën e multisig-ut, indeksin e Vault-it dhe të dhënat aktuale të propozimit. Vault-i duhet të jetë autoriteti për veprimet e qeverisjes dhe të ketë SOL për llogaritë e përdorura gjatë inicializimit ose propozimit. Ndiq rrjedhën e zakonshme Squads për krijimin e propozimit, miratimet dhe ekzekutimin. Paketa mbulon çdo instruksion të gate-it që nënshkruan qeverisja ose autoriteti emergjent:
+
+| Veprimi | Funksionet |
+| --- | --- |
+| Inicializimi dhe propozimi | `initializeGatekeeper`, `proposeBufferUpgrade`, `executeGatedUpgrade` |
+| Anulimi dhe mbyllja e propozimit | `cancelProposal`, `reclaimBuffer`, `closeProposal` |
+| Ndryshimi i politikës, p.sh. `StrictEquality` ↔ `NoRevertAndCuBound` | `proposeConfigUpdate`, `executeConfigUpdate`, `cancelConfigUpdate` |
+| Rotacioni i autoriteteve | `proposeAuthorityChange`, `executeAuthorityChange`, `cancelAuthorityChange` |
+| Autoriteti i programit | `proposeProgramAuthorityTransfer`, `transferProgramAuthority` |
+| Upgrade emergjent | `emergencyOverrideUpgrade` |
+
+Ndryshimet e politikës dhe të autoriteteve zbatohen pas timelock-ut. Zbatimi i politikës së re zhvlerëson propozimet e hapura. Te `executeAuthorityChange` dhe `transferProgramAuthority` nënshkruan edhe marrësi i ri, sipas mënyrës si ai autoritet nënshkruan. `emergencyOverrideUpgrade` e nënshkruan autoriteti emergjent. Kur ai është Vault Squads, mbështille me `createVaultTransaction` të multisig-ut të tij. Paketa krijon instruksionet dhe payload-in e Vault-it. Testi krahason çdo instruksion me rendin e llogarive te `contexts.rs`. Integrimi me një Vault të publikuar kërkon ende test on-chain.
 
 ## Provat paralele dhe Trident
 
@@ -168,11 +182,11 @@ Konfigurimi i klientit pranon `repo_url` (HTTPS), `library_name`, `build_subdir`
 - Njoftimet opsionale te operatorit perdorin `CANARY_SLACK_WEBHOOK` ose `CANARY_TELEGRAM_BOT_TOKEN` dhe `CANARY_TELEGRAM_CHAT_ID`. Cakto `CANARY_VERIFIER_PUBKEY` per njoftimin nen 0.05 SOL. Njoftimet jane best-effort dhe deshtimi i transportit nuk ndryshon vendimin e job-it.
 - RPC kerkon `maxSupportedTransactionVersion: 1` per lexim. Nje transaksion v1 i lidhur me target-in e ben dritaren te paperputhshme me runner-in aktual. Worker-i regjistron refuzimin dhe liron job-in. LiteSVM vazhdon me legacy dhe v0.
 
-Fly mban `auto_stop_machines = "off"` derisa job-et qe presin finalizimin te kene nje mekanizem zgjimi te pavarur nga webhook-u fillestar. Per klientet me `seed_accounts`, worker-i kap gjendjen live, ndertos kandidatin nga repoja dhe voton (shih me poshte). Per klientet pa kapje live, worker-i ende lexon snapshot-in e besuar nga volumi.
+Fly mban `auto_stop_machines = "off"` derisa job-et qe presin finalizimin te kene nje mekanizem zgjimi te pavarur nga webhook-u fillestar. Per cdo klient, worker-i kap gjendjen live, ndertos kandidatin nga repoja dhe voton (shih me poshte).
 
 ### Kapja live e gjendjes fillestare
 
-Per klientin qe perdor kapjen live, cakto `seed_accounts` ne konfigurim. Nje liste bosh aktivizon kapjen vetem me llogarite e programit dhe metadatat e upgrade-it. CLI pranon `--live-prestate` dhe `--seed-account PUBKEY` per varësitë e njohura.
+Kapja live vlen për çdo klient. `seed_accounts` liston deri në 96 llogari të tjera që përdorin transaksionet e target-it, si mint-e, oracle ose programe të tjera. Pa të, kapen vetëm llogaritë e programit dhe metadatat e upgrade-it. CLI pranon `--seed-account PUBKEY` dhe mund të përsëritet.
 
 Pasi pranohet eventi `ProposalCreated`, worker-i lexon llogarite e programit, varesite e listuara, propozimin, buffer-in dhe ProgramData nga banka te finalizuara brenda 32 sloteve nga anchor-i. RPC-ja publike mund te finalizoje nje banke te re ndermjet leximeve. Prandaj worker-i kontrollon zinxhirin e blloqeve nga anchor-i deri te leximi i fundit dhe refuzon shkrimet e mundshme ne llogarite e kapura. Kjo deshmon se cdo lexim jep gjendjen ne fillim te slotit anchor. Rezultati `prestate_captured` tregon kapjen fillestare, jo perfundimin e replay-it. Kapja rri ne memorie. Ne disk shkruhet vetem gjate verifikimit dhe fshihet sapo job-i merr rezultat, perfundon ose skadon. Rinisja regjistron se kapja u humb.
 
@@ -210,5 +224,16 @@ Gabimet e rrjetit dhe RPC-së provohen sërish në ciklin tjetër. Dështimi i b
 | `CANARY_SBF_TOOLCHAIN` | Toolchain-i rustup i lidhur me platform-tools v1.58. Pa këtë dhe `CANARY_GATE_BIN`, worker-i ndalet te `traffic_preflight_passed`. |
 | `CANARY_DOCKER_RESOURCE_LIMITS=0` | Heq `--cpus` dhe `--memory` në hostet me cgroup në modalitet threaded, si Sprites. Bajtët e binarit nuk ndryshojnë. |
 | `CANARY_DOCKER_ROOT=1` | Për hostet ku Docker nis vetëm uid 0. Kontejneri mbetet pa rrjet dhe pa capabilities dhe ua kthen skedarët e daljes të lexueshëm. |
+| `CANARY_CLUSTER` | `devnet` (vlera e paracaktuar) ose `mainnet-beta`. Genesis-i i `RPC_URL` duhet të përputhet. |
+| `CANARY_BUILDER_HOST` (opsional) | Host-i i veçantë i build-it, që arrihet me SSH. Pa të, worker-i ndërton vetë në Docker. |
 
-Për build-in duhen Docker dhe platform-tools. Imazhi `deploy/fly` është vetëm listener: makina `shared-cpu-1x` me 256 MB nuk ka `canary-gate`, toolchain ose Docker, dhe worker-i ndalet te `traffic_preflight_passed`. Për votim përdor imazhin `deploy/fly/verifier`, të përshkruar më poshtë.
+Për build-in duhen Docker dhe platform-tools. Pa `CANARY_GATE_BIN` dhe toolchain-in, worker-i punon vetëm si listener dhe ndalet te `traffic_preflight_passed`. Për votim përdor imazhin `deploy/fly/verifier`, të përshkruar më sipër.
+
+### Çfarë mungon për Mainnet
+
+`CANARY_CLUSTER=mainnet-beta` e lejon worker-in të lexojë Mainnet, por replay-i ende refuzon shumicën e programeve reale:
+
+- **Llogaritë e përdoruesve.** Çdo llogari që përdor një transaksion i dritares duhet të jetë kapur te anchor-i. Llogaritë Token të përdoruesve dhe portofolat e tyre nuk dihen në atë moment dhe nuk futen dot në 96 `seed_accounts`. Dritarja refuzohet me `initial state was not captured`. Rregullimi kërkon rindërtimin e gjendjes fillestare nga `preTokenBalances` dhe nga gjendja e finalizuar pas dritares, pastaj verifikimin me `final_accounts`, si për fee payer-in.
+- **Programet SPL.** LiteSVM 0.7.1 sjell kopjet e veta të SPL Token 3.5.0, Token-2022 8.0.0 dhe ATA 1.1.1. Runner-i kërkon që CU-të e baseline-it të përputhen saktë me zinxhirin, ndaj programet duhet të kapen nga rrjeti, me bajtët që ai ekzekuton. Kjo mund të bëhet me `seed_accounts`, por ende nuk është provuar.
+- **Feature-t.** Replay-i aktivizon të gjitha feature-t e LiteSVM (`FeatureSet::all_enabled()`). Mainnet ka më pak feature aktive se Devnet, ndaj arkivi duhet të mbajë feature-t aktive të rrjetit.
+- **Gate-i dhe build-i.** Gate-i duhet audituar dhe publikuar në Mainnet. Build-i rekomandohet të kalojë në një makinë pa çelës votimi.

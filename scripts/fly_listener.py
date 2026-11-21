@@ -1,4 +1,4 @@
-"""Admission policy and durable monthly usage for the Fly Devnet listener."""
+"""Admission policy, durable monthly usage and the build -> verify -> vote loop of a Fly verifier."""
 import argparse
 import json
 import os
@@ -13,8 +13,8 @@ from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import urlsplit
 
-from devnet import GENESIS, from_base58, to_base58
-from live_capture import GATE, UnsupportedReplayVersion, capture, rpc, watch
+from devnet import check_cluster, from_base58
+from live_capture import GATE, rpc, watch
 from live_prestate import PrestateRefused, capture_prestate, replay_archive
 from worker_build import FEATURE, BuildFailed, build_candidate, remote_build
 from worker_http import start_http
@@ -40,7 +40,7 @@ class Policy:
     library_name: str | None
     build_subdir: str | None
     webhook_url: str | None
-    seed_accounts: tuple[str, ...] | None
+    seed_accounts: tuple[str, ...]
     build_features: tuple[str, ...] = ()
 
 
@@ -71,8 +71,10 @@ def build_options(policy):
         or PurePosixPath(subdir).is_absolute() or ".." in PurePosixPath(subdir).parts
     ):
         raise ValueError("build_subdir must stay inside the repository")
-    seed_accounts = policy.get("seed_accounts")
-    if seed_accounts is not None and (
+    # Accounts the target's transactions use besides its own (mints, oracles,
+    # other programs). Every customer gets the live pre-state capture.
+    seed_accounts = policy.get("seed_accounts", [])
+    if (
         not isinstance(seed_accounts, list) or len(seed_accounts) > 96
         or any(not isinstance(key, str) or len(from_base58(key)) != 32 for key in seed_accounts)
         or len(set(seed_accounts)) != len(seed_accounts)
@@ -82,8 +84,7 @@ def build_options(policy):
     if (not isinstance(features, list) or len(features) > 16
             or any(not isinstance(f, str) or not FEATURE.fullmatch(f) for f in features)):
         raise ValueError("build_features must list at most 16 cargo feature names")
-    return (repo, library, subdir, webhook, None if seed_accounts is None else tuple(seed_accounts),
-            tuple(features))
+    return repo, library, subdir, webhook, tuple(seed_accounts), tuple(features)
 
 
 def customer_policies(raw):
@@ -186,7 +187,7 @@ class Admissions:
                     print(json.dumps({"event": "customer_busy_or_cooldown", "customer": customer,
                                       "proposal": event["proposal"]}), flush=True)
                     return None
-                payload = dict(event, max_replay_txs=policy.max_replay_txs, live_prestate=policy.seed_accounts is not None)
+                payload = dict(event, max_replay_txs=policy.max_replay_txs)
                 db.execute("INSERT INTO customer_jobs VALUES (?, ?, ?, ?, ?, NULL)",
                            (GATE, customer, event["proposal"], json.dumps(payload), int(now.timestamp())))
             db.execute("INSERT INTO admissions VALUES (?, ?, ?, ?)",
@@ -245,54 +246,6 @@ class Admissions:
                 INSERT INTO cursors VALUES (?, ?)
                 ON CONFLICT(gate) DO UPDATE SET next_slot = max(next_slot, excluded.next_slot)
             """, (GATE, slot))
-
-
-def capture_ready(admissions, snapshots, next_slot, now, on_notice=None, live_jobs=()):
-    """Collect finalized traffic once a trusted pre-state is available."""
-    for event in admissions.active_jobs():
-        if event["anchor_slot"] + event["replay_slots"] >= next_slot:
-            continue
-        if event["proposal"] in live_jobs:
-            continue
-        policy = admissions.policies.get(event["target"])
-        if policy is None or not policy.active or now >= policy.expires:
-            admissions.finish(event["proposal"], now, "refused", "customer inactive")
-            continue
-        if len(from_base58(event["proposal"])) != 32:
-            raise ValueError("invalid proposal address")
-        directory = snapshots / event["proposal"]
-        snapshot_path = directory / "snapshot.json"
-        archive_path = directory / "archive.json"
-        if not snapshot_path.is_file() or archive_path.exists():
-            continue
-        try:
-            with snapshot_path.open("rb") as snapshot_file:
-                data = snapshot_file.read(8 * 1024 * 1024 + 1)
-            if len(data) > 8 * 1024 * 1024:
-                raise ValueError("snapshot exceeds 8 MiB")
-            snapshot = json.loads(data)
-            if (to_base58(bytes(snapshot["target"])) != event["target"]
-                    or any(snapshot.get(field) != event[field] for field in ("anchor_slot", "replay_slots", "nonce"))):
-                raise ValueError("snapshot does not match proposal event")
-            limit = min(policy.max_replay_txs, event["max_replay_txs"])
-            archive = capture(snapshot, limit, include_baseline=True)
-            staged = directory / ".archive.json.tmp"
-            staged.write_text(json.dumps(archive, separators=(",", ":")), encoding="utf-8")
-            staged.replace(archive_path)
-            print(json.dumps({"event": "archive_captured", "proposal": event["proposal"],
-                              "transactions": len(archive["records"])}), flush=True)
-        except UnsupportedReplayVersion as exc:
-            admissions.finish(event["proposal"], now, "refused", str(exc))
-            if on_notice is not None:
-                on_notice("ReplayFailed", dict(proposal=event["proposal"], reason=str(exc)))
-            print(json.dumps({"event": "capture_refused", "proposal": event["proposal"],
-                              "reason": str(exc)}), flush=True)
-        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-            # Keep the job and allow the operator to repair its trusted inputs.
-            print(json.dumps({"event": "capture_failed", "proposal": event["proposal"],
-                              "error": type(exc).__name__}), flush=True)
-        # Leave time for event ingestion even when many snapshots are ready.
-        break
 
 
 @dataclass(frozen=True)
@@ -555,7 +508,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", default="/data/admissions.sqlite3")
     parser.add_argument("--customers", type=Path, default=Path("/data/customers.json"))
-    parser.add_argument("--snapshots", type=Path, default=Path("/data/snapshots"))
     parser.add_argument("--jobs", type=Path, default=Path("/data/jobs"))
     parser.add_argument("--finish", metavar="PROPOSAL")
     args = parser.parse_args()
@@ -572,8 +524,7 @@ def main():
     policies = load_policies()
     # A loopback endpoint is a disposable validator used for the rehearsal.
     local = urlsplit(os.environ["RPC_URL"]).hostname in ("127.0.0.1", "localhost")
-    if not local and rpc("getGenesisHash") != GENESIS:
-        raise ValueError("expected Solana Devnet")
+    cluster = "localnet" if local else check_cluster(rpc("getGenesisHash"))
     keypair = load_keypair()
     runner, toolchain = os.environ.get("CANARY_GATE_BIN"), os.environ.get("CANARY_SBF_TOOLCHAIN")
     tools = toolchain or os.environ.get("CANARY_PLATFORM_TOOLS") or os.environ.get("CANARY_BUILDER_HOST")
@@ -584,21 +535,21 @@ def main():
         attestor.discard_all()
     # One job at a time beside the event loop. Builds need the Machine's memory.
     executor, running = ThreadPoolExecutor(max_workers=1, thread_name_prefix="verify"), {}
-    print(json.dumps(dict(event="worker_started", gate=GATE, attestation=attestor is not None,
+    print(json.dumps(dict(event="worker_started", cluster=cluster, gate=GATE, attestation=attestor is not None,
                           verifier=keypair.address if keypair else None)), flush=True)
     with closing(sqlite3.connect(args.database)) as database:
         admissions = Admissions(database, policies, notify)
         live_jobs = {}
         interrupted_votes = {}
-        # Time-sensitive live snapshots cannot be recovered from the disk after a restart.
+        # Live pre-state is captured near the anchor and cannot be recovered after
+        # a restart. Only a vote that may already be on its way survives.
         for job in admissions.active_jobs():
             intent = args.jobs / job["proposal"] / "vote-intent.json"
             if attestor and intent.is_file():
                 interrupted_votes[job["proposal"]] = (job, json.loads(intent.read_bytes()))
                 continue
-            if job.get("live_prestate") or (policies.get(job["target"]) and policies[job["target"]].seed_accounts is not None):
-                admissions.finish(job["proposal"], datetime.now(timezone.utc),
-                                  "refused", "live pre-state was lost on restart")
+            admissions.finish(job["proposal"], datetime.now(timezone.utc),
+                              "refused", "live pre-state was lost on restart")
 
         captures = {}
         capture_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="prestate")
@@ -611,14 +562,13 @@ def main():
             customer = admissions.consume(event, datetime.now(timezone.utc), enqueue=True)
             if customer is not None:
                 policy = admissions.policies[event["target"]]
-                if policy.seed_accounts is not None:
-                    proposal = event["proposal"]
-                    if len(captures) >= 16:
-                        reason = "live capture queue is full"
-                        admissions.finish(proposal, datetime.now(timezone.utc), "refused", reason)
-                        notify("ReplayFailed", dict(proposal=proposal, reason=reason))
-                        return
-                    captures[proposal] = capture_pool.submit(capture_prestate, event, policy.seed_accounts)
+                proposal = event["proposal"]
+                if len(captures) >= 16:
+                    reason = "live capture queue is full"
+                    admissions.finish(proposal, datetime.now(timezone.utc), "refused", reason)
+                    notify("ReplayFailed", dict(proposal=proposal, reason=reason))
+                    return
+                captures[proposal] = capture_pool.submit(capture_prestate, event, policy.seed_accounts)
                 print(json.dumps(dict(event, customer=customer)), flush=True)
                 notify("ProposalCreated", dict(event, customer=customer))
 
@@ -655,7 +605,6 @@ def main():
                 now = datetime.now(timezone.utc)
                 reconcile_votes(admissions, interrupted_votes, now, notify)
                 check_live_traffic(admissions, live_jobs, slot, now, notify, attestor, executor, running)
-                capture_ready(admissions, args.snapshots, slot, now, notify, live_jobs)
                 next_capture = time.monotonic() + 30
             if verifier_address and time.monotonic() >= balance_check:
                 balance_check = time.monotonic() + 300

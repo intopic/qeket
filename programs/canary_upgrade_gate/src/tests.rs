@@ -285,7 +285,7 @@ fn payload_layout_and_precompile_envelope_are_stable() {
 }
 
 #[test]
-fn legacy_attestation_transaction_size() {
+fn attestation_transaction_size() {
     use anchor_lang::solana_program::{message::Message, sysvar::instructions};
     use anchor_lang::{InstructionData, ToAccountMetas};
     let (_, _, payload, _) = setup();
@@ -302,19 +302,14 @@ fn legacy_attestation_transaction_size() {
             instruction_sysvar: instructions::ID,
         }
         .to_account_metas(None),
-        data: crate::instruction::SubmitCanaryAttestation { payload }.data(),
-    };
-    let compact = Instruction {
         data: crate::instruction::SubmitVerifiedAttestation {}.data(),
-        ..submit.clone()
     };
-    let small = Message::new(&[verify.clone(), compact], Some(&key(7)));
-    assert!(1 + 64 + small.serialize().len() < 650);
     let message = Message::new(&[verify, submit], Some(&key(7)));
     assert_eq!(message.header.num_required_signatures, 1);
     let wire_bytes = 1 + 64 + message.serialize().len();
-    println!("Legacy attestation with one fee payer: {wire_bytes} bytes");
-    assert!(wire_bytes <= 1232);
+    println!("Attestation with one fee payer: {wire_bytes} bytes");
+    // The worker builds this transaction byte for byte (scripts/solana_tx.py).
+    assert!(wire_bytes < 650);
 }
 
 #[test]

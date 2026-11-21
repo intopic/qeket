@@ -12,17 +12,20 @@ kill_timeout = 30
   GATE_PROGRAM_ID = "GdmM9gBp8j8reyHyoLTPGfvYtMYpqd2yU1yeob5z1MJw"
   CANARY_GATE_BIN = "/usr/local/bin/canary-gate"
   CANARY_HTTP_PORT = "8080"
-  CANARY_BUILDER_HOST = "canary-builder-a.internal"
+  CANARY_CLUSTER = "devnet"
+  # The Machine itself bounds CPU and memory.
+  CANARY_DOCKER_RESOURCE_LIMITS = "0"
 
 [[vm]]
   size = "shared-cpu-2x"
   memory = "2gb"
 
-# SQLite and temporary verifier jobs.
+# Platform tools (1.7 GB), the builder image and Docker layers (about 3 GB),
+# temporary build trees, jobs and SQLite.
 [mounts]
   source = "canary_data"
   destination = "/data"
-  initial_size = "20gb"
+  initial_size = "10gb"
 
 [http_service]
   internal_port = 8080

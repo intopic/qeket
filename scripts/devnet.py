@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -10,9 +11,24 @@ import urllib.request
 
 ENDPOINT = "https://api.devnet.solana.com"
 GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
+# The clusters a worker may serve, selected with CANARY_CLUSTER.
+CLUSTER_GENESIS = {
+    "devnet": GENESIS,
+    "mainnet-beta": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+}
 LOADER = "BPFLoaderUpgradeab1e11111111111111111111111"
 GATE = "38SJ9rbJgLtibh4bL1VyoGb5uMaEQtSPBJZbTFahYtmz"
 ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def check_cluster(genesis_hash, environ=os.environ):
+    """Return the configured cluster if RPC_URL serves it. Devnet unless set otherwise."""
+    cluster = environ.get("CANARY_CLUSTER", "devnet")
+    if cluster not in CLUSTER_GENESIS:
+        raise ValueError(f"CANARY_CLUSTER must be one of: {', '.join(CLUSTER_GENESIS)}")
+    if genesis_hash != CLUSTER_GENESIS[cluster]:
+        raise ValueError(f"expected Solana {cluster}, but RPC_URL serves genesis {genesis_hash}")
+    return cluster
 
 
 def rpc(method, params):
