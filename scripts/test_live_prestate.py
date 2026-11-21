@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from devnet import LOADER, from_base58, to_base58
 from live_prestate import (
-    CLOCK, CONFIG_TAG, PROPOSAL_TAG, SYSVAR_OWNER, PrestateRefused, capture_prestate,
+    CLOCK, CONFIG_TAG, SYSTEM, PROPOSAL_TAG, SYSVAR_OWNER, PrestateRefused, capture_prestate,
     check_captured_accounts_unchanged, check_transaction_prestate, check_window_epoch,
     check_window_isolation, replay_archive, window_clocks,
 )
@@ -236,22 +236,30 @@ class ReplayArchiveTest(unittest.TestCase):
             }},
         }
 
-    def run_archive(self, later=()):
+    def run_archive(self, later=(), after=(), alpenglow=None, final=None, epoch_slots=1000):
         target_tx = self.transaction([self.payer, self.counter, self.target], 2, self.signature)
         record = dict(slot=101, index=0, transaction=(b"\x01" + self.signature).hex(), baseline={"fee": 5000})
         blocks = {101: dict(parentSlot=99, blockTime=1010, transactions=[target_tx]),
                   103: dict(parentSlot=101, blockTime=1030, transactions=list(later)),
-                  105: dict(parentSlot=103, blockTime=1050, transactions=[])}
-        replies = {"getEpochSchedule": dict(firstNormalSlot=0, slotsPerEpoch=1000, firstNormalEpoch=0),
-                   "getBlocks": [101, 103], "getBlocksWithLimit": [105], "getBlockTime": 990}
+                  105: dict(parentSlot=103, blockTime=1050, transactions=list(after))}
+        feature = None if alpenglow is None else account(
+            "Feature111111111111111111111111111111111111", b"\x01" + struct.pack("<Q", alpenglow))
+        payer_end = final if final is not None else dict(account(SYSTEM, b"", lamports=4_995_000))
+
+        def fake_rpc(method, *params):
+            if method == "getBlocks":
+                return [101, 103] if params[0] == 100 else [105]
+            return {"getEpochSchedule": dict(firstNormalSlot=0, slotsPerEpoch=epoch_slots, firstNormalEpoch=0),
+                    "getBlocksWithLimit": [105], "getBlockTime": 990, "getAccountInfo": {"value": feature},
+                    "getMultipleAccounts": {"context": {"slot": 105}, "value": [payer_end]}}[method]
 
         def fake_capture(snapshot, limit, validate_transaction=None, include_baseline=False):
             self.assertTrue(include_baseline)
             validate_transaction(target_tx)
             return dict(snapshot, format_version=2, records=[record], transaction_manifest=[1] * 32)
 
-        self.bundle["clock"]["epoch"] = 0
-        with patch("live_prestate.rpc", side_effect=lambda method, *_: replies[method]), patch(
+        self.bundle["clock"]["epoch"] = 100 // epoch_slots
+        with patch("live_prestate.rpc", side_effect=fake_rpc), patch(
                 "live_prestate.block", side_effect=lambda slot, _: blocks[slot]), patch(
                 "live_prestate.capture", side_effect=fake_capture):
             return replay_archive(self.event, self.bundle, 500)
@@ -274,6 +282,27 @@ class ReplayArchiveTest(unittest.TestCase):
         self.assertEqual((archive["replay_mode"], archive["min_txs"], archive["cu_limit_bps"]),
                          ("StrictEquality", 1, 1500))
         self.assertEqual(archive["buffer"]["data"][37:], list(b"\x7fELF new"))
+        # The runner must arrive at the payer state the chain finalized after the window.
+        (key, end_state), = archive["final_accounts"]
+        self.assertEqual((to_base58(bytes(key)), end_state["lamports"], end_state["data"]), (self.payer, 4_995_000, []))
+
+    def test_alpenglow_transactions_read_the_parent_block_time(self):
+        # Slot 101 executes with the time of its parent 99, slot 103 with that of 101.
+        archive = self.run_archive(alpenglow=0, epoch_slots=40)
+        self.assertEqual([c["unix_timestamp"] for c in archive["clocks"]], [990, 990, 990, 1010])
+        # Without the feature account the TowerBFT rule applies.
+        self.assertEqual([c["unix_timestamp"] for c in self.run_archive()["clocks"]], [990, 1010, 1010, 1030])
+
+    def test_window_near_the_alpenglow_switch_is_refused(self):
+        # Window epoch 2. Activation in epochs 1 or 2, or after the anchor, is too close.
+        for activated in (50, 99, 101):
+            with self.subTest(activated=activated), self.assertRaisesRegex(PrestateRefused, "Alpenglow"):
+                self.run_archive(alpenglow=activated, epoch_slots=40)
+
+    def test_fee_payer_must_be_quiet_until_its_final_state_is_read(self):
+        reuse = self.transaction([self.payer, self.outsider], 1, balances=[4_995_000, 0])
+        with self.assertRaisesRegex(PrestateRefused, "used again"):
+            self.run_archive(after=[reuse])
 
     def test_reconstructed_fee_payer_is_isolated(self):
         # A later failed transaction from the same payer could have charged its fee.
@@ -284,7 +313,7 @@ class ReplayArchiveTest(unittest.TestCase):
         self.run_archive([self.transaction([self.outsider, address(12)], 1, balances=[1, 1])])
 
     def test_clocks_need_capture_epoch_and_block_times(self):
-        scan = dict(parent_slot=99, block_times={100: 1000, 102: 1020})
+        scan = dict(parent_slot=99, block_times={100: 1000, 102: 1020}, parents={100: 99, 102: 100})
         self.assertEqual([c["unix_timestamp"] for c in window_clocks(self.event, self.bundle, 3, scan)],
                          [1000, 1000, 1020, 1020])
         with self.assertRaisesRegex(PrestateRefused, "different epoch"):
