@@ -73,6 +73,13 @@ function vault(input: Vault) {
   return getVaultPda({ multisigPda: input.multisigPda, index: input.vaultIndex, programId: input.squadsProgram ?? PROGRAM_ID })[0];
 }
 
+export * from "./gate.js";
+export { loader as LOADER };
+/** The gate config of a target. It must hold the program's and the buffer's upgrade authority. */
+export const configAddress = (input: Context) => config(input);
+export const proposalAddress = (input: Context & { nonce: bigint }) => proposal(input);
+export const vaultAddress = (input: Vault) => vault(input);
+
 export function initializeGatekeeper(input: Context & Vault & { emergency: PublicKey; policy: Policy }) {
   const { gate, target, emergency, policy } = input;
   const governance = vault(input);
