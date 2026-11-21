@@ -19,8 +19,8 @@ def main():
     parser.add_argument("--library-name")
     parser.add_argument("--build-subdir")
     parser.add_argument("--webhook-url")
-    parser.add_argument("--live-prestate", action="store_true")
-    parser.add_argument("--seed-account", action="append")
+    parser.add_argument("--seed-account", action="append",
+                        help="an account the target's transactions use besides its own; repeat for each")
     parser.add_argument("--build-feature", action="append")
     args = parser.parse_args()
     customers = json.loads(args.file.read_text(encoding="utf-8")) if args.file.exists() else {}
@@ -37,8 +37,8 @@ def main():
                 entry[field] = value
             elif field in previous:
                 entry[field] = previous[field]
-        if args.seed_account or args.live_prestate:
-            entry["seed_accounts"] = args.seed_account or []
+        if args.seed_account:
+            entry["seed_accounts"] = args.seed_account
         elif "seed_accounts" in previous:
             entry["seed_accounts"] = previous["seed_accounts"]
         if args.build_feature:

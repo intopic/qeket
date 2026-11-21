@@ -11,7 +11,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-from devnet import GATE, GENESIS, from_base58, to_base58
+# GENESIS is Devnet's. live_cycle, the Devnet rehearsal, imports it from here.
+from devnet import GATE, GENESIS, check_cluster, from_base58, to_base58
 
 GATE = os.environ.get("GATE_PROGRAM_ID", GATE)
 EVENT = hashlib.sha256(b"event:ProposalCreated").digest()[:8]
@@ -288,8 +289,7 @@ if __name__ == "__main__":
     reader.add_argument("archive", type=Path)
     reader.add_argument("--max-replay-txs", type=int, default=500)
     args = parser.parse_args()
-    if rpc("getGenesisHash") != GENESIS:
-        raise ValueError("expected Solana Devnet")
+    check_cluster(rpc("getGenesisHash"))
     if args.action == "watch":
         watch(args.start_slot)
     else:

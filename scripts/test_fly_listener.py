@@ -12,8 +12,8 @@ import time
 from unittest.mock import Mock, patch
 
 from devnet import to_base58
-from fly_listener import (GATE, LIVE_CACHE_BYTES, Admissions, capture_ready, check_live_traffic, collect_captures,
-                          customer_policies, reconcile_votes)
+from fly_listener import (GATE, LIVE_CACHE_BYTES, Admissions, check_live_traffic, collect_captures, customer_policies,
+                          reconcile_votes)
 from live_prestate import PrestateRefused
 from worker_build import BuildFailed
 from worker_vote import CandidateRejected, ReplayIncomplete, VoteRefused
@@ -480,38 +480,6 @@ class AdmissionsTest(unittest.TestCase):
             }}))
             self.assertIsNone(ledger.consume({"target": target, "proposal": "c"}, start, enqueue=True))
 
-    def test_collect_only_after_window_and_only_once(self):
-        target_bytes = bytes([7]) * 32
-        target = to_base58(target_bytes)
-        proposal = to_base58(bytes([8]) * 32)
-        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
-        event = dict(target=target, proposal=proposal, nonce=9, anchor_slot=100, replay_slots=10)
-        root = Path.cwd() / f"capture-test-{uuid4().hex}"
-        directory = root / proposal
-        directory.mkdir(parents=True)
-        snapshot = directory / "snapshot.json"
-        archive = directory / "archive.json"
-        try:
-            snapshot.write_text(json.dumps(dict(target=list(target_bytes), nonce=9, anchor_slot=100, replay_slots=10)))
-            with closing(sqlite3.connect(":memory:")) as connection:
-                ledger = Admissions(connection, customer_policies(json.dumps({
-                    "c": {"targets": [target], "plan": "starter"},
-                })))
-                ledger.consume(event, now, enqueue=True)
-                with patch("fly_listener.capture", return_value={"records": [1]}) as collect:
-                    capture_ready(ledger, root, 110, now)
-                    collect.assert_not_called()
-                    capture_ready(ledger, root, 111, now)
-                    capture_ready(ledger, root, 112, now)
-                    collect.assert_called_once_with(json.loads(snapshot.read_text()), 500, include_baseline=True)
-                self.assertEqual(json.loads(archive.read_text()), {"records": [1]})
-        finally:
-            archive.unlink(missing_ok=True)
-            snapshot.unlink(missing_ok=True)
-            directory.rmdir()
-            root.rmdir()
-
-
     def test_concurrent_admission_isolated_per_customer(self):
         targets = [to_base58(bytes([n]) * 32) for n in (1, 2, 3)]
         controls = customer_policies(json.dumps({
@@ -544,3 +512,35 @@ class AdmissionsTest(unittest.TestCase):
                 self.assertEqual(total, 3)
         finally:
             db.unlink(missing_ok=True)
+
+
+class ConfigurationTest(unittest.TestCase):
+    def test_every_customer_gets_the_live_capture(self):
+        target = to_base58(bytes([1]) * 32)
+        mint = to_base58(bytes([2]) * 32)
+        policies = customer_policies(json.dumps({
+            "plain": {"targets": [target]},
+            "with_mint": {"targets": [to_base58(bytes([3]) * 32)], "seed_accounts": [mint]},
+        }))
+        self.assertEqual(policies[target].seed_accounts, ())
+        self.assertEqual(policies[to_base58(bytes([3]) * 32)].seed_accounts, (mint,))
+        for seeds in (None, [mint, mint], [to_base58(bytes([n]) * 32) for n in range(97)], ["short"]):
+            with self.subTest(seeds=seeds), self.assertRaisesRegex(ValueError, "seed_accounts"):
+                customer_policies(json.dumps({"c": {"targets": [target], "seed_accounts": seeds}}))
+
+    def test_cluster_must_match_the_rpc_genesis(self):
+        from devnet import CLUSTER_GENESIS, check_cluster
+        devnet, mainnet = CLUSTER_GENESIS["devnet"], CLUSTER_GENESIS["mainnet-beta"]
+        self.assertEqual(check_cluster(devnet, {}), "devnet")
+        self.assertEqual(check_cluster(mainnet, {"CANARY_CLUSTER": "mainnet-beta"}), "mainnet-beta")
+        # Mainnet is never the default, and a Devnet worker refuses a Mainnet endpoint.
+        with self.assertRaisesRegex(ValueError, "expected Solana devnet"):
+            check_cluster(mainnet, {})
+        with self.assertRaisesRegex(ValueError, "expected Solana mainnet-beta"):
+            check_cluster(devnet, {"CANARY_CLUSTER": "mainnet-beta"})
+        with self.assertRaisesRegex(ValueError, "CANARY_CLUSTER must be one of"):
+            check_cluster(devnet, {"CANARY_CLUSTER": "testnet"})
+
+
+if __name__ == "__main__":
+    unittest.main()

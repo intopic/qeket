@@ -17,12 +17,11 @@ def start(args):
     from live_cycle import PRIVATE, key
     work = args.workdir.resolve()
     (work / "jobs").mkdir(parents=True, exist_ok=True)
-    (work / "snapshots").mkdir(exist_ok=True)
     # A remote verifier keeps only its own vote key and receives public addresses.
     target = os.environ.get("CANARY_E2E_TARGET") or str(key("target").pubkey())
     gate = os.environ.get("GATE_PROGRAM_ID") or str(key("gate").pubkey())
     customers = {"counter-e2e": {
-        "targets": [target], "plan": "starter", "seed_accounts": [],
+        "targets": [target], "plan": "starter",
         "repo_url": args.repo_url, "build_subdir": "examples/counter", "library_name": "canary_counter",
         "build_features": ["candidate"],
     }}
@@ -36,7 +35,7 @@ def start(args):
     log = (work / "worker.log").open("ab")
     process = subprocess.Popen(
         [sys.executable, "-u", str(ROOT / "scripts/fly_listener.py"), "--database", str(work / "admissions.sqlite3"),
-         "--customers", str(work / "customers.json"), "--snapshots", str(work / "snapshots"), "--jobs", str(work / "jobs")],
+         "--customers", str(work / "customers.json"), "--jobs", str(work / "jobs")],
         cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     (work / "worker.pid").write_text(str(process.pid))
     deadline = time.monotonic() + 120
