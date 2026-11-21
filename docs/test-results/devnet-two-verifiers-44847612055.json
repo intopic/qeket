@@ -1,0 +1,55 @@
+{
+  "environment": "Solana Devnet, GitHub Actions run 44847612055, three separate ubuntu-24.04 runners",
+  "run": "https://github.com/intopic/qeket/actions/runs/44847612055",
+  "source_commit": "branch claude/trident-fuzzing-auto-vote-14aeda",
+  "gate_program_id": "GdmM9gBp8j8reyHyoLTPGfvYtMYpqd2yU1yeob5z1MJw",
+  "proposal": "FVVnb9TXEbxd1kNzzJisPYVzFib1r2SN5NtUNDmXrkZV",
+  "anchor_slot": 524544040,
+  "replay_slots": 256,
+  "roles": {
+    "cycle": "Deploys the target, proposes, sends 50 counter transactions, waits for quorum and executes. It does not vote.",
+    "verifier-a": "Own runner and vote key. Captures live state at admission, rebuilds the candidate from the commit, replays and votes.",
+    "verifier-b": "Same, on a second runner with a second vote key."
+  },
+  "verifiers": [
+    {
+      "job": "verifier-a",
+      "verifier": "9e56urpxcxMKoQAW8mV79wY9BGWLYs1yKzQ4tvxFGwp4",
+      "vote": "https://explorer.solana.com/tx/3G8stuAv9YxuJwc8GpJpTY6HxDEW25ymXoRa85eDhDK76YB8X7GvnaaV87xQuJ1SjLCBbakHoZF4naxKbEXPghJJ?cluster=devnet",
+      "sqlite_outcome": "executed"
+    },
+    {
+      "job": "verifier-b",
+      "verifier": "3EovJaMVkSHPRfh3LJG44duYb69K6XcC8g763pkNgmfZ",
+      "vote": "https://explorer.solana.com/tx/38rKiZ4Bj42RHM9gEDn7eviisbr7EPfMtoYuowuvvCUV6XNo5s9oUaUxnzkNAQiBZNfdZDMxe2DNUb13SpprTTam?cluster=devnet",
+      "sqlite_outcome": "executed"
+    }
+  ],
+  "worker_archive": {
+    "records": 50,
+    "accounts": 2,
+    "clocks": 257,
+    "reconstructed_fee_payer_lamports": [2000000],
+    "observed_compute_units": [557],
+    "observed_fee_lamports": [5000],
+    "clock_unix_timestamp_range": [1795223676, 1795223738],
+    "identical_on_both_verifiers": true
+  },
+  "evidence": {
+    "replay_mode": "StrictEquality",
+    "rebuilt_sha256": "d080667b6d671bc6eecc987fbb4fb61c2d2dabb8a52ba5f7aa3d1c6cbf5910ae",
+    "diff_root": "a4949e1809d051685427d1b18e812fd5e4583ec03db2abb450fda39440090e3a",
+    "replayed_tx_count": 50,
+    "max_cu_delta_bps": 18
+  },
+  "quorum_root_matches_controlled_snapshot_replay": true,
+  "propose_buffer_upgrade": "https://explorer.solana.com/tx/4RhmxB9Sn5Y56Zn5StLemc1sfSLRjVEpiQd2m1z3qBjMMZ5aWfGe5WCNmjmTYhqk1kJWt6H9mUhs2zz6J5JYtMAe?cluster=devnet",
+  "execute_gated_upgrade": "https://explorer.solana.com/tx/45qdC7Dwbw9cxiNud9qVjUr9GNB9LkJ3wmedbjbBM4zgc6yWQ8Pe641qYB1wXCdmC4Dm2wHwMwdZKVPtbE7eTfdg?cluster=devnet",
+  "wall_time_minutes": 7,
+  "devnet_sol_spent": 0.545,
+  "earlier_attempts": {
+    "44845865185": "Devnet payer had 0.062 SOL. Cancelled after write-buffer failed.",
+    "44846896182": "verifier-a refused because the finalized bank advanced between capture reads. Fixed by accepting successive banks within 32 slots."
+  },
+  "limits": "The verifiers run in GitHub Actions instead of Fly Machines. The vote keys are derived from the same CI secret, so they are separate keys, not separate operators."
+}
