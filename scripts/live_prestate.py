@@ -105,6 +105,19 @@ def check_transaction_prestate(item, accounts, fee_payers=()):
     """Return the accounts a transaction needs. Unknown fee payers are reconstructed later."""
     message = item["transaction"]["message"]
     writable, readonly, lookups = resolved_addresses(item)
+    ordered = message["accountKeys"] + writable + readonly
+    # Only the fee debit can be reconstructed. A program receiving this
+    # account can observe or change fields that preBalances does not record.
+    unknown = set(fee_payers)
+    if unknown:
+        referenced = set(ordered[1:]) | {lookup["accountKey"] for lookup in lookups}
+        for ix in message["instructions"]:
+            for index in [ix["programIdIndex"], *ix["accounts"]]:
+                if type(index) is not int or not 0 <= index < len(ordered):
+                    raise PrestateRefused("invalid compiled instruction account index")
+                referenced.add(ordered[index])
+        if unknown.intersection(referenced):
+            raise PrestateRefused("mixed-role fee payer requires captured initial state")
     keys = {*message["accountKeys"], *writable, *readonly}
     keys.update(lookup["accountKey"] for lookup in lookups)
     # These runtime programs are supplied by LiteSVM. Other executable accounts
@@ -304,19 +317,27 @@ def final_states(keys, end):
     keys = sorted(keys)
     if not keys:
         return []
-    result = rpc("getMultipleAccounts", keys, dict(FINAL, encoding="base64", minContextSlot=end + 1))
-    slot = result["context"]["slot"]
-    if len(result["value"]) != len(keys):
-        raise PrestateRefused("RPC did not return all requested accounts")
-    slots = rpc("getBlocks", end + 1, slot, FINAL)
-    if not slots or slots[-1] != slot:
+    read_slots = {}
+    states = []
+    for start in range(0, len(keys), 100):
+        batch = keys[start:start + 100]
+        result = rpc("getMultipleAccounts", batch, dict(FINAL, encoding="base64", minContextSlot=end + 1))
+        slot = result["context"]["slot"]
+        if slot <= end or len(result["value"]) != len(batch):
+            raise PrestateRefused("incomplete finalized fee payer state")
+        for key, value in zip(batch, result["value"]):
+            if value is None or account_bytes(value, SYSTEM) or value["executable"]:
+                raise PrestateRefused("fee payer requires captured initial state")
+            states.append([list(from_base58(key)), archive_account(value)])
+            read_slots[key] = slot
+    slots = rpc("getBlocks", end + 1, max(read_slots.values()), FINAL)
+    if not set(read_slots.values()).issubset(slots):
         raise PrestateRefused("finalized block coverage is incomplete")
-    for _, confirmed in finalized_blocks(end + 1, slots):
+    for slot, confirmed in finalized_blocks(end + 1, slots):
         for tx in confirmed["transactions"]:
-            if possible_writes(tx).intersection(keys):
+            if any(read_slots.get(key, -1) >= slot for key in possible_writes(tx)):
                 raise PrestateRefused("reconstructed fee payer was used again before its final state was read")
-    return [[list(from_base58(key)), None if value is None else archive_account(value)]
-            for key, value in zip(keys, result["value"])]
+    return states
 
 
 def system_account(lamports):

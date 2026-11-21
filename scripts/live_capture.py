@@ -124,7 +124,7 @@ def gate_history(cursor, tip):
 def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_lifecycle=None):
     cursor = start if start is not None else rpc("getSlot", FINAL)
     while True:
-        tip = rpc("getSlot", FINAL)
+        tip = min(rpc("getSlot", FINAL), cursor + 63)
         if cursor > tip:
             wait(1)
             continue

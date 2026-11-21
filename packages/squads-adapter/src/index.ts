@@ -45,6 +45,9 @@ function vault(input: Vault) {
 export function initializeGatekeeper(input: Context & Vault & { emergency: PublicKey; policy: Policy }) {
   const { gate, target, emergency, policy } = input;
   const governance = vault(input);
+  if (policy.replayMode !== "StrictEquality" && policy.replayMode !== "NoRevertAndCuBound") {
+    throw new Error("invalid replay mode");
+  }
   if (policy.verifiers.length > 7 || policy.threshold < 2 ||
       policy.threshold > policy.verifiers.length || new Set(policy.verifiers.map(k => k.toBase58())).size !== policy.verifiers.length) {
     throw new Error("invalid verifier quorum");
