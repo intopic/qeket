@@ -27,6 +27,9 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&evidence)?);
             Ok(())
         }
-        _ => bail!("Usage: canary-gate demo GATE.so OLD.so NEW.so REBUILT.so GIT_SHA OUTPUT_DIR [REGRESSION.so]\n       canary-gate verify ARCHIVE.json OLD.so REBUILT.so"),
+        [command, gate, iterations, seed] if command == "fuzz-votes" => {
+            demo::fuzz_votes(&fs::read(gate)?, iterations.parse()?, seed.parse()?)
+        }
+        _ => bail!("Usage: canary-gate demo GATE.so OLD.so NEW.so REBUILT.so GIT_SHA OUTPUT_DIR [REGRESSION.so]\n       canary-gate verify ARCHIVE.json OLD.so REBUILT.so\n       canary-gate fuzz-votes GATE.so ITERATIONS SEED"),
     }
 }

@@ -39,6 +39,8 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Build and run the local upgrade
         run: python3 scripts/mvp.py --load-test
+      - name: Fuzz signed votes against the gate ELF
+        run: target/debug/canary-gate fuzz-votes target/sbpf-solana-solana/release/canary_upgrade_gate.so 20000 1795204278 | tee target/mvp/evidence/vote-fuzz.json
       - name: Preserve verified binaries and replay evidence
         uses: actions/upload-artifact@v4
         with:

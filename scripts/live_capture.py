@@ -141,7 +141,22 @@ class UnsupportedReplayVersion(ValueError):
     pass
 
 
-def capture(snapshot, limit, validate_transaction=None):
+def baseline_observation(item):
+    meta = item["meta"]
+    message = item["transaction"]["message"]
+    loaded = meta.get("loadedAddresses") or {}
+    keys = message["accountKeys"] + loaded.get("writable", []) + loaded.get("readonly", [])
+    before, after = meta["preBalances"], meta["postBalances"]
+    units = meta.get("computeUnitsConsumed")
+    fee = meta.get("fee")
+    if (len(before) != len(keys) or len(after) != len(keys) or type(units) is not int or units <= 0
+            or type(fee) is not int or fee < 0):
+        raise ValueError("incomplete finalized baseline observations")
+    return dict(keys=[list(from_base58(key)) for key in keys], pre_balances=before,
+                post_balances=after, compute_units=units, fee=fee)
+
+
+def capture(snapshot, limit, validate_transaction=None, include_baseline=False):
     start, span = snapshot["anchor_slot"], snapshot["replay_slots"]
     if not 0 < span <= 2048 or limit <= 0 or rpc("getSlot", FINAL) < start + span:
         raise ValueError("invalid or unfinalized replay window")
@@ -150,6 +165,7 @@ def capture(snapshot, limit, validate_transaction=None):
     digest = hashlib.sha256(b"CANARY_TX_LIST_V1")
     before = None
     matches = []
+    baseline = {}
     inspected = 0
     while True:
         options = dict(FINAL, limit=min(1000, limit + 1))
@@ -180,6 +196,8 @@ def capture(snapshot, limit, validate_transaction=None):
                         raise ValueError("max_replay_txs exceeded")
                     if validate_transaction is not None:
                         validate_transaction(item)
+                    if include_baseline:
+                        baseline[sig] = baseline_observation(item)
         if page[-1]["slot"] < start or len(page) < options["limit"]:
             break
         before = page[-1]["signature"]
@@ -192,7 +210,10 @@ def capture(snapshot, limit, validate_transaction=None):
             signature = from_base58(sig)
             if tx["slot"] != slot or len(raw) > 1232 or raw[1:65] != signature:
                 raise ValueError("transaction differs from finalized block")
-            records.append(dict(slot=slot, index=index, transaction=raw.hex()))
+            record = dict(slot=slot, index=index, transaction=raw.hex())
+            if include_baseline:
+                record["baseline"] = baseline[sig]
+            records.append(record)
             digest.update(struct.pack("<QI", slot, index) + signature)
     return dict(snapshot, format_version=2, records=records, transaction_manifest=list(digest.digest()))
 
