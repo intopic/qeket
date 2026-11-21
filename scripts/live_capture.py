@@ -84,42 +84,68 @@ def print_event(event):
     print(json.dumps(event), flush=True)
 
 
+class NodeBehind(RuntimeError):
+    """The RPC node that answered has not reached the slot the request needs."""
+
+
+def behind(error):
+    return isinstance(error, NodeBehind) or "-32016" in str(error)
+
+
+def gate_history(cursor, tip):
+    """Successful gate transactions in [cursor, tip], oldest first, from a node at or past tip."""
+    before = None
+    events = []
+    while True:
+        # A load-balanced endpoint may route this call to a node that has not
+        # indexed `tip` yet. Without the floor, the cursor would skip its events.
+        opts = dict(FINAL, limit=100, minContextSlot=tip)
+        if before:
+            opts["before"] = before
+        page = rpc("getSignaturesForAddress", GATE, opts)
+        for entry in page:
+            if cursor <= entry["slot"] <= tip and entry["err"] is None:
+                events.append(entry)
+                if len(events) > 1000:
+                    raise ValueError("proposal history limit exceeded")
+        if len(page) < 100 or page[-1]["slot"] < cursor:
+            break
+        before = page[-1]["signature"]
+    items = []
+    for entry in reversed(events):
+        item = rpc("getTransaction", entry["signature"],
+                   dict(FINAL, encoding="json", maxSupportedTransactionVersion=1, minContextSlot=tip))
+        if not item or not item.get("meta"):
+            raise NodeBehind("finalized gate transaction unavailable")
+        items.append((entry, item))
+    return items
+
+
 def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_lifecycle=None):
     cursor = start if start is not None else rpc("getSlot", FINAL)
     while True:
         tip = rpc("getSlot", FINAL)
-        if cursor <= tip:
-            before = None
-            events = []
-            while True:
-                opts = dict(FINAL, limit=100)
-                if before:
-                    opts["before"] = before
-                page = rpc("getSignaturesForAddress", GATE, opts)
-                for entry in page:
-                    if cursor <= entry["slot"] <= tip and entry["err"] is None:
-                        events.append(entry)
-                        if len(events) > 1000:
-                            raise ValueError("proposal history limit exceeded")
-                if len(page) < 100 or page[-1]["slot"] < cursor:
-                    break
-                before = page[-1]["signature"]
-            for entry in reversed(events):
-                sig = entry["signature"]
-                item = rpc("getTransaction",sig,dict(FINAL,encoding="json",maxSupportedTransactionVersion=1))
-                if not item or not item.get("meta"):
-                    raise RuntimeError("finalized gate transaction unavailable")
-                for name, event in gate_events(item["meta"]["logMessages"] or []):
-                    event = dict(event, slot=entry["slot"], signature=sig)
-                    if name == "ProposalCreated":
-                        on_event(event)
-                    elif on_lifecycle is not None:
-                        on_lifecycle(name, event)
-            cursor = tip + 1
-            if checkpoint is not None:
-                checkpoint(cursor)
-        else:
+        if cursor > tip:
             wait(1)
+            continue
+        try:
+            items = gate_history(cursor, tip)
+        except RuntimeError as exc:
+            if not behind(exc):
+                raise
+            # Retry the same range. The cursor moves only after a complete read.
+            wait(1)
+            continue
+        for entry, item in items:
+            for name, event in gate_events(item["meta"]["logMessages"] or []):
+                event = dict(event, slot=entry["slot"], signature=entry["signature"])
+                if name == "ProposalCreated":
+                    on_event(event)
+                elif on_lifecycle is not None:
+                    on_lifecycle(name, event)
+        cursor = tip + 1
+        if checkpoint is not None:
+            checkpoint(cursor)
 
 
 def invoked(item, target):
@@ -168,7 +194,7 @@ def capture(snapshot, limit, validate_transaction=None, include_baseline=False):
     baseline = {}
     inspected = 0
     while True:
-        options = dict(FINAL, limit=min(1000, limit + 1))
+        options = dict(FINAL, limit=min(1000, limit + 1), minContextSlot=start + span)
         if before:
             options["before"] = before
         page = rpc("getSignaturesForAddress", target, options)
@@ -180,7 +206,7 @@ def capture(snapshot, limit, validate_transaction=None, include_baseline=False):
                 raise ValueError("address history scan limit exceeded")
             if start <= entry["slot"] <= start + span and entry["err"] is None:
                 sig = entry["signature"]
-                options_tx = dict(FINAL, maxSupportedTransactionVersion=1)
+                options_tx = dict(FINAL, maxSupportedTransactionVersion=1, minContextSlot=start + span)
                 item = rpc("getTransaction", sig, dict(options_tx, encoding="json"))
                 if not item or not item.get("meta"):
                     raise RuntimeError("finalized transaction metadata unavailable")

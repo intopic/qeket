@@ -391,6 +391,26 @@ def verify_job(event, bundle, policy, limit, attestor):
     return count, attest_job(event, bundle, policy, attestor)
 
 
+EXECUTED_EARLY = "upgrade executed before this node finished verification"
+
+
+def observe_upgrade(admissions, live_jobs, running, attestor, proposal, now):
+    """Close a job once the gate executed its upgrade.
+
+    A vote may still be finalizing in the worker thread. Then the job stays open
+    so its outcome is recorded first, and is marked executed afterwards.
+    """
+    bundle = live_jobs.get(proposal)
+    if bundle is not None and proposal in running:
+        bundle["executed"] = True
+        return
+    live_jobs.pop(proposal, None)
+    if attestor is not None:
+        attestor.discard(proposal)
+    if not admissions.finish(proposal, now, "executed", EXECUTED_EARLY):
+        admissions.record_executed(proposal)
+
+
 def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attestor=None, executor=None, running=None):
     """Start, collect and close verification jobs. Never waits for a job to finish.
 
@@ -430,16 +450,20 @@ def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attesto
                     count = None
                 if count is not None:
                     admissions.record_traffic_preflight(proposal, count)
+                if outcome is None and bundle.get("executed"):
+                    outcome = "executed", EXECUTED_EARLY, None
         if outcome is not None:
             status, reason, notice = outcome
             admissions.finish(proposal, now, status, reason)
+            if bundle.get("executed"):
+                admissions.record_executed(proposal)
             live_jobs.pop(proposal)
             running.pop(proposal, None)
             if attestor is not None:
                 attestor.discard(proposal)
             if isinstance(notice, tuple):
                 on_notice(*notice)
-            else:
+            elif notice is not None:
                 on_notice(notice, dict(proposal=proposal, reason=reason))
 
 
@@ -521,11 +545,8 @@ def main():
             refresh_policies()
             if event["target"] in admissions.policies:
                 if name == "UpgradeExecuted":
-                    live_jobs.pop(event["proposal"], None)
-                    if attestor is not None:
-                        attestor.discard(event["proposal"])
-                    if not admissions.finish(event["proposal"], datetime.now(timezone.utc), "executed"):
-                        admissions.record_executed(event["proposal"])
+                    observe_upgrade(admissions, live_jobs, running, attestor, event["proposal"],
+                                    datetime.now(timezone.utc))
                 notify(name, event)
 
         next_capture = 0
