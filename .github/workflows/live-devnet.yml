@@ -19,6 +19,7 @@ on:
       - 'scripts/worker_notify.py'
       - 'scripts/customer_admin.py'
       - 'packages/squads-adapter/**'
+      - 'packages/github-action/**'
       - 'scripts/test_fly_listener.py'
       - 'scripts/test_watch.py'
       - 'scripts/test_worker_http.py'
@@ -116,6 +117,12 @@ jobs:
           python scripts/e2e_verifier.py start --workdir "$RUNNER_TEMP/verifier-b" --key vote1
           python scripts/live_cycle.py run
           for node in a b; do python scripts/e2e_verifier.py wait --workdir "$RUNNER_TEMP/verifier-$node" --timeout 300 --until executed; done
+          # The client CLI reads the same gate accounts the cycle just used.
+          gate=$(python -c 'import sys; sys.path.insert(0, "scripts"); from live_cycle import key; print(key("gate").pubkey())')
+          target=$(python -c 'import sys; sys.path.insert(0, "scripts"); from live_cycle import key; print(key("target").pubkey())')
+          status=$(node packages/squads-adapter/dist/cli.js status --gate "$gate" --target "$target")
+          echo "$status"
+          echo "$status" | python -c 'import json, sys; s = json.load(sys.stdin); assert s["status"] == "Executed" and s["voted"], s'
       - name: Run finalized cycle
         if: github.event_name == 'workflow_dispatch'
         env:

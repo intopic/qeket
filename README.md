@@ -143,6 +143,26 @@ Workflow-i **Deploy Fly verifiers** kërkon secret-et e repos `FLY_API_TOKEN_VER
 
 Ndryshimet e politikës dhe të autoriteteve zbatohen pas timelock-ut. Zbatimi i politikës së re zhvlerëson propozimet e hapura. Te `executeAuthorityChange` dhe `transferProgramAuthority` nënshkruan edhe marrësi i ri, sipas mënyrës si ai autoritet nënshkruan. `emergencyOverrideUpgrade` e nënshkruan autoriteti emergjent. Kur ai është Vault Squads, mbështille me `createVaultTransaction` të multisig-ut të tij. Paketa krijon instruksionet dhe payload-in e Vault-it. Testi krahason çdo instruksion me rendin e llogarive te `contexts.rs`. Integrimi me një Vault të publikuar kërkon ende test on-chain.
 
+### CLI `canary` dhe GitHub Action
+
+`canary` është ana e klientit për një upgrade përmes gate-it. Ndodhet te `packages/squads-adapter` (`npm run build`, pastaj `node dist/cli.js`):
+
+| Komanda | Çfarë bën |
+| --- | --- |
+| `config-address` | Adresa e konfigurimit të gate-it. Asaj i kalohet autoriteti i programit dhe i buffer-it. |
+| `window` | Mat trafikun e fundit të programit dhe zgjedh `replay_slots`, që dritarja të arrijë minimumin e gate-it dhe të mbetet nën tavanin e planit (`--max-replay-txs`). |
+| `propose` | Kontrollon që buffer-i mban binarin e ndërtuar dhe që autoriteti i tij është gate-i. Pastaj hap në Squads një propozim për `propose_buffer_upgrade`, me hash-in, commit-in dhe dritaren. |
+| `status` | Votat, dritarja, afati dhe nëse propozimi mund të ekzekutohet. |
+| `execute` | Thërret `execute_gated_upgrade` vetëm kur kuorumi, timelock-u dhe afati e lejojnë. |
+
+`propose` nënshkruhet nga një anëtar i multisig-ut që ka vetëm të drejtën Initiate. Një çelës i rrjedhur mund vetëm të hapë propozime. Miratimin e japin gjithmonë nënshkruesit e multisig-ut, dhe votat verifikuesit tanë, që e kapin propozimin nga eventi `ProposalCreated`.
+
+[`packages/github-action`](packages/github-action/README.md) e ekzekuton CLI-në në repon e klientit:
+- **Në çdo push:** ndërton programin me të njëjtin builder si verifikuesit, shkruan buffer-in dhe hap propozimin.
+- **Me orar:** provon `execute`.
+
+Rezultati del në përmbledhjen e workflow-it. CI-ja e provon `status` kundrejt gate-it real pas çdo cikli në validatorin lokal. Rruga e plotë me Squads dhe build-in e Action-it ende nuk është provuar në një cluster.
+
 ## Provat paralele dhe Trident
 
 - [Tre job-e në Sprite](docs/test-results/sprite-parallel-7d57210.json). Secili ndërton kandidatin dhe e riekzekuton mbi 1,000 transaksione të veta. Matja përdor një namespace Linux pa rrjet. RAM-i i raportuar është maksimumi i një procesi fëmijë.
