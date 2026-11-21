@@ -403,7 +403,8 @@ def main():
         raise ValueError("expected Solana Devnet")
     keypair = load_keypair()
     runner, toolchain = os.environ.get("CANARY_GATE_BIN"), os.environ.get("CANARY_SBF_TOOLCHAIN")
-    attestor = Attestor(runner, toolchain, args.jobs, keypair, GATE) if runner and toolchain else None
+    tools = toolchain or os.environ.get("CANARY_PLATFORM_TOOLS")
+    attestor = Attestor(runner, toolchain, args.jobs, keypair, GATE) if runner and tools else None
     print(json.dumps(dict(event="worker_started", gate=GATE, attestation=attestor is not None,
                           verifier=keypair.address if keypair else None)), flush=True)
     with closing(sqlite3.connect(args.database)) as database:

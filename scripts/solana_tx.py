@@ -1,7 +1,9 @@
 """Dependency-free Ed25519 signing and legacy Solana transactions for the worker vote."""
 import hashlib
 import json
+import os
 import struct
+import sys
 
 from devnet import from_base58, to_base58
 
@@ -185,3 +187,18 @@ def attestation_payload(mode, target, nonce, buffer, anchor_slot, replay_slots, 
     if len(payload) != 186:
         raise ValueError("attestation payload must be 186 bytes")
     return payload
+
+
+def generate_keypair():
+    seed = os.urandom(32)
+    return Keypair(seed + public_key(seed))
+
+
+if __name__ == "__main__":
+    # `keygen` prints the secret keypair for a secret store on stdout and only
+    # the public address on stderr.
+    if sys.argv[1:] != ["keygen"]:
+        raise SystemExit("usage: solana_tx.py keygen")
+    generated = generate_keypair()
+    print(json.dumps(list(generated.seed + generated.public), separators=(",", ":")))
+    print(generated.address, file=sys.stderr)

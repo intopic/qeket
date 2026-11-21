@@ -35,6 +35,10 @@ def run(args, cwd=None, timeout=1800, stdout=None, env=None):
 
 def platform_root(toolchain):
     """Return the platform-tools directory that holds rust/ and llvm/."""
+    if os.environ.get("CANARY_PLATFORM_TOOLS"):
+        # Hosts without rustup (the Fly verifier image) unpack the pinned
+        # release directly.
+        return Path(os.environ["CANARY_PLATFORM_TOOLS"]).resolve()
     compiler = run(["rustup", "which", "--toolchain", toolchain, "rustc"]).stdout.decode().strip()
     return Path(os.path.realpath(compiler)).parent.parent.parent
 
@@ -65,7 +69,8 @@ def vendor(directory):
 
 def ensure_image():
     if subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode:
-        subprocess.run(["docker", "build", "-t", IMAGE, "-"], input=DOCKERFILE.encode(), check=True,
+        # Host networking lets daemons without a bridge network run apt-get.
+        subprocess.run(["docker", "build", "--network", "host", "-t", IMAGE, "-"], input=DOCKERFILE.encode(), check=True,
                        capture_output=True, timeout=1800)
 
 

@@ -159,6 +159,18 @@ class BuilderTest(unittest.TestCase):
                 with self.assertRaises(BuildFailed):
                     fetch_commit(url, commit, Path(tmp) / "checkout")
 
+    def test_fly_image_uses_unpacked_platform_tools(self):
+        from worker_build import platform_root
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {"CANARY_PLATFORM_TOOLS": tmp}):
+            self.assertEqual(platform_root("unused-toolchain"), Path(tmp).resolve())
+
+    def test_keygen_prints_secret_on_stdout_only(self):
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name("solana_tx.py")), "keygen"],
+                                capture_output=True, text=True, check=True)
+        keypair = Keypair(json.loads(result.stdout))
+        self.assertEqual(result.stderr.strip(), keypair.address)
+        self.assertNotIn("[", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,40 @@
+# Independent verifier b. Deploy from a staged repository copy with
+#   flyctl deploy -c deploy/fly/verifier/fly.verifier-b.toml --dockerfile deploy/fly/verifier/Dockerfile
+app = "canary-verifier-b"
+primary_region = "iad"
+swap_size_mb = 2048
+kill_timeout = 30
+
+[build.args]
+  GATE_PROGRAM_ID = "GdmM9gBp8j8reyHyoLTPGfvYtMYpqd2yU1yeob5z1MJw"
+
+[env]
+  GATE_PROGRAM_ID = "GdmM9gBp8j8reyHyoLTPGfvYtMYpqd2yU1yeob5z1MJw"
+  CANARY_GATE_BIN = "/usr/local/bin/canary-gate"
+  CANARY_HTTP_PORT = "8080"
+  # The Machine itself bounds CPU and memory.
+  CANARY_DOCKER_RESOURCE_LIMITS = "0"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"
+
+# Platform tools (1.7 GB), the builder image, Docker layers, jobs and SQLite.
+[mounts]
+  source = "canary_data"
+  destination = "/data"
+  initial_size = "20gb"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10m"
+    method = "GET"
+    path = "/health"
