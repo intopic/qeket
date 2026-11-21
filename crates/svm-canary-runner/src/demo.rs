@@ -363,6 +363,17 @@ pub fn run(
         accounts: vec![],
         clocks: vec![],
         final_accounts: vec![],
+        // The demo cluster's own features, so the replay builds its VM from them.
+        features: Some({
+            let mut active: Vec<_> = vm
+                .get_feature_set()
+                .active()
+                .iter()
+                .map(|(id, slot)| (*id, *slot))
+                .collect();
+            active.sort();
+            active
+        }),
         records: vec![],
     };
     let capture_started = Instant::now();
