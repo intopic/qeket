@@ -29,7 +29,9 @@ def start(args):
     (work / "customers.json").write_text(json.dumps(customers, indent=2), encoding="utf-8")
     env = dict(os.environ, GATE_PROGRAM_ID=gate, PYTHONPATH=str(ROOT / "scripts"),
                CANARY_VERIFIER_KEYPAIR_FILE=str(PRIVATE / args.key),
-               CANARY_GATE_BIN=str((ROOT / "target/debug/canary-gate").resolve()))
+               CANARY_GATE_BIN=str((ROOT / "target/debug/canary-gate").resolve()),
+               # Test runs keep archives as CI artifacts. Production workers delete them.
+               CANARY_KEEP_JOB_FILES="1")
     env.pop("CANARY_HTTP_PORT", None)
     log = (work / "worker.log").open("ab")
     process = subprocess.Popen(

@@ -13,7 +13,7 @@ from devnet import from_base58, to_base58
 from solana_tx import (INSTRUCTIONS_SYSVAR, Keypair, anchor_discriminator, attestation_payload,
                        ed25519_instruction, find_program_address, public_key, sign, transaction)
 import worker_vote
-from worker_vote import CandidateRejected, VoteRefused, attest, verify_replay
+from worker_vote import CandidateRejected, ReplayIncomplete, VoteRefused, attest, verify_replay
 
 SEED = bytes(range(32))
 KEYPAIR = Keypair(SEED + public_key(SEED))
@@ -99,15 +99,32 @@ class AttestationTest(unittest.TestCase):
                 with self.assertRaisesRegex(CandidateRejected, "proposed hash"):
                     attest({}, self.bundle([]), None, Path(tmp) / "r", "canary-gate", build, None, "gate")
 
-    def test_runner_failure_is_a_rejection(self):
-        script = "import sys; sys.stderr.write('Error: post-state differs for X\\n\\nCaused by: y\\n'); sys.exit(1)"
+    def test_only_candidate_faults_reject_the_candidate(self):
+        def runner(tmp, code, message):
+            script = f"import sys; sys.stderr.write('Error: {message}\\n\\nCaused by: y\\n'); sys.exit({code})"
+            path = Path(tmp) / (f"runner{code}.cmd" if os.name == "nt" else f"runner{code}")
+            path.write_text(f"@\"{sys.executable}\" -c \"{script}\"\n" if os.name == "nt"
+                            else f"#!/bin/sh\nexec '{sys.executable}' -c \"{script}\"\n")
+            path.chmod(0o755)
+            return str(path)
+
         with TemporaryDirectory() as tmp:
-            runner = Path(tmp) / ("runner.cmd" if os.name == "nt" else "runner")
-            runner.write_text(f"@\"{sys.executable}\" -c \"{script}\"\n" if os.name == "nt"
-                              else f"#!/bin/sh\nexec '{sys.executable}' -c \"{script}\"\n")
-            runner.chmod(0o755)
             with self.assertRaisesRegex(CandidateRejected, "^post-state differs for X$"):
-                verify_replay(str(runner), "a", "b", "c")
+                verify_replay(runner(tmp, 3, "post-state differs for X"), "a", "b", "c")
+            # A failing baseline or missing state says nothing about the candidate.
+            with self.assertRaisesRegex(ReplayIncomplete, "^baseline failed at 1:0$") as caught:
+                verify_replay(runner(tmp, 1, "baseline failed at 1:0"), "a", "b", "c")
+            self.assertNotIsInstance(caught.exception, CandidateRejected)
+
+    def test_job_files_are_discarded_but_evidence_stays(self):
+        from worker_vote import discard_job_files
+        with TemporaryDirectory() as tmp:
+            job = Path(tmp)
+            for name in ("archive.json", "baseline.so", "evidence.json", "build/candidate/x.so"):
+                (job / name).parent.mkdir(parents=True, exist_ok=True)
+                (job / name).write_text("x")
+            discard_job_files(job)
+            self.assertEqual(sorted(p.name for p in job.iterdir()), ["evidence.json"])
 
     def test_gate_refusals_are_final(self):
         event = dict(target=to_base58(bytes([1]) * 32), nonce=0, anchor_slot=1, replay_slots=2,

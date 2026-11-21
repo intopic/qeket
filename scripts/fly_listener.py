@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event
 from contextlib import closing
 from dataclasses import dataclass
@@ -18,7 +19,8 @@ from live_prestate import PrestateRefused, capture_prestate, replay_archive
 from worker_build import FEATURE, BuildFailed, build_candidate
 from worker_http import start_http
 from worker_notify import notify
-from worker_vote import CandidateRejected, VoteRefused, attest, load_keypair
+from worker_vote import (CandidateRejected, ReplayIncomplete, VoteRefused, attest, discard_job_files,
+                         load_keypair)
 
 MAX_BUILD_ATTEMPTS = 3
 
@@ -301,6 +303,7 @@ class Attestor:
     jobs: Path
     keypair: object
     gate: str
+    keep_files: bool = False
 
     def build(self, policy, commit, work):
         return build_candidate(policy.repo_url, commit, policy.build_subdir or ".", policy.library_name,
@@ -309,6 +312,29 @@ class Attestor:
     def __call__(self, event, bundle, policy):
         return attest(event, bundle, policy, self.jobs / event["proposal"], self.runner, self.build,
                       self.keypair, self.gate)
+
+    def discard(self, proposal):
+        """Customer state lives on disk only while canary-gate needs to read it."""
+        if not self.keep_files and len(from_base58(proposal)) == 32:
+            discard_job_files(self.jobs / proposal)
+
+    def discard_all(self):
+        if not self.keep_files and self.jobs.is_dir():
+            for directory in self.jobs.iterdir():
+                if directory.is_dir():
+                    discard_job_files(directory)
+
+
+class InlineExecutor:
+    """Runs submitted work immediately. Tests and one-shot tools use it."""
+
+    def submit(self, function, *args):
+        future = Future()
+        try:
+            future.set_result(function(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
 
 
 def attest_job(event, bundle, policy, attestor):
@@ -326,6 +352,9 @@ def attest_job(event, bundle, policy, attestor):
         return "refused", f"candidate build failed: {str(exc)[:300]}", "ReplayFailed"
     except CandidateRejected as exc:
         return "rejected", str(exc), "CandidateRejected"
+    except ReplayIncomplete as exc:
+        # The replay could not judge the candidate. Report it as missing evidence.
+        return "refused", f"replay evidence incomplete: {exc}", "ReplayFailed"
     except VoteRefused as exc:
         return "refused", f"vote refused: {exc}", "ReplayFailed"
     except (OSError, RuntimeError) as exc:
@@ -341,7 +370,38 @@ def attest_job(event, bundle, policy, attestor):
     return "verified", f"diff_root {result['diff_root']}; not a configured verifier", ("ReplayVerified", details)
 
 
-def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attestor=None):
+def verify_job(event, bundle, policy, limit, attestor):
+    """Runs off the event loop. Returns (preflight count or None, final outcome or None)."""
+    count = None
+    if "archive" not in bundle:
+        try:
+            archive = replay_archive(event, bundle, limit)
+        except (OSError, RuntimeError):
+            print(json.dumps(dict(event="traffic_preflight_retry", proposal=event["proposal"])), flush=True)
+            return None, None
+        except ValueError as exc:
+            return None, ("refused", str(exc), "ReplayFailed")
+        except (KeyError, TypeError):
+            return None, ("refused", "invalid finalized transaction metadata", "ReplayFailed")
+        count = len(archive["records"])
+        bundle["archive"] = archive
+        bundle["transaction_count"] = count
+    if attestor is None:
+        return count, None
+    return count, attest_job(event, bundle, policy, attestor)
+
+
+def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attestor=None, executor=None, running=None):
+    """Start, collect and close verification jobs. Never waits for a job to finish.
+
+    With a thread pool as `executor`, replay capture, builds and vote finalization
+    run beside the event loop, so new proposals are still captured within the
+    anchor drift limit.
+    """
+    executor = InlineExecutor() if executor is None else executor
+    running = {} if running is None else running
+    for proposal in [p for p in running if p not in live_jobs]:
+        running.pop(proposal)
     for event in admissions.active_jobs():
         proposal = event["proposal"]
         bundle = live_jobs.get(proposal)
@@ -353,25 +413,30 @@ def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attesto
             outcome = "refused", "customer inactive", "ReplayFailed"
         elif now.timestamp() > bundle["expires_at"]:
             outcome = "refused", "proposal expired", "ReplayFailed"
-        elif "archive" not in bundle and event["anchor_slot"] + event["replay_slots"] < next_slot:
-            try:
-                archive = replay_archive(event, bundle, min(policy.max_replay_txs, event["max_replay_txs"]))
-                count = len(archive["records"])
-                admissions.record_traffic_preflight(proposal, count)
-                bundle["archive"] = archive
-                bundle["transaction_count"] = count
-            except (OSError, RuntimeError):
-                print(json.dumps(dict(event="traffic_preflight_retry", proposal=proposal)), flush=True)
-            except ValueError as exc:
-                outcome = "refused", str(exc), "ReplayFailed"
-            except (KeyError, TypeError):
-                outcome = "refused", "invalid finalized transaction metadata", "ReplayFailed"
-        if outcome is None and "archive" in bundle and attestor is not None:
-            outcome = attest_job(event, bundle, policy, attestor)
+        else:
+            finalized = event["anchor_slot"] + event["replay_slots"] < next_slot
+            pending = "archive" not in bundle or attestor is not None
+            if proposal not in running and finalized and pending:
+                limit = min(policy.max_replay_txs, event["max_replay_txs"])
+                running[proposal] = executor.submit(verify_job, event, bundle, policy, limit, attestor)
+            task = running.get(proposal)
+            if task is not None and task.done():
+                running.pop(proposal)
+                try:
+                    count, outcome = task.result()
+                except Exception as exc:  # A bug in one job must not stop the listener.
+                    print(json.dumps(dict(event="verification_error", proposal=proposal,
+                                          error=f"{type(exc).__name__}: {str(exc)[:200]}")), flush=True)
+                    count = None
+                if count is not None:
+                    admissions.record_traffic_preflight(proposal, count)
         if outcome is not None:
             status, reason, notice = outcome
             admissions.finish(proposal, now, status, reason)
             live_jobs.pop(proposal)
+            running.pop(proposal, None)
+            if attestor is not None:
+                attestor.discard(proposal)
             if isinstance(notice, tuple):
                 on_notice(*notice)
             else:
@@ -404,7 +469,13 @@ def main():
     keypair = load_keypair()
     runner, toolchain = os.environ.get("CANARY_GATE_BIN"), os.environ.get("CANARY_SBF_TOOLCHAIN")
     tools = toolchain or os.environ.get("CANARY_PLATFORM_TOOLS")
-    attestor = Attestor(runner, toolchain, args.jobs, keypair, GATE) if runner and tools else None
+    keep = os.environ.get("CANARY_KEEP_JOB_FILES") == "1"
+    attestor = Attestor(runner, toolchain, args.jobs, keypair, GATE, keep) if runner and tools else None
+    if attestor is not None:
+        # Nothing survives a restart, so no captured state may either.
+        attestor.discard_all()
+    # One job at a time beside the event loop. Builds need the Machine's memory.
+    executor, running = ThreadPoolExecutor(max_workers=1, thread_name_prefix="verify"), {}
     print(json.dumps(dict(event="worker_started", gate=GATE, attestation=attestor is not None,
                           verifier=keypair.address if keypair else None)), flush=True)
     with closing(sqlite3.connect(args.database)) as database:
@@ -451,6 +522,8 @@ def main():
             if event["target"] in admissions.policies:
                 if name == "UpgradeExecuted":
                     live_jobs.pop(event["proposal"], None)
+                    if attestor is not None:
+                        attestor.discard(event["proposal"])
                     if not admissions.finish(event["proposal"], datetime.now(timezone.utc), "executed"):
                         admissions.record_executed(event["proposal"])
                 notify(name, event)
@@ -466,7 +539,7 @@ def main():
             if time.monotonic() >= next_capture:
                 refresh_policies()
                 now = datetime.now(timezone.utc)
-                check_live_traffic(admissions, live_jobs, slot, now, notify, attestor)
+                check_live_traffic(admissions, live_jobs, slot, now, notify, attestor, executor, running)
                 capture_ready(admissions, args.snapshots, slot, now, notify, live_jobs)
                 next_capture = time.monotonic() + 30
             if verifier_address and time.monotonic() >= balance_check:
