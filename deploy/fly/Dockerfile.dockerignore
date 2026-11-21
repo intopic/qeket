@@ -12,3 +12,6 @@
 !scripts/worker_http.py
 !scripts/worker_notify.py
 !scripts/live_prestate.py
+!scripts/solana_tx.py
+!scripts/worker_build.py
+!scripts/worker_vote.py

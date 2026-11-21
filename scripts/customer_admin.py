@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--webhook-url")
     parser.add_argument("--live-prestate", action="store_true")
     parser.add_argument("--seed-account", action="append")
+    parser.add_argument("--build-feature", action="append")
     args = parser.parse_args()
     customers = json.loads(args.file.read_text(encoding="utf-8")) if args.file.exists() else {}
     if args.action == "set":
@@ -40,6 +41,10 @@ def main():
             entry["seed_accounts"] = args.seed_account or []
         elif "seed_accounts" in previous:
             entry["seed_accounts"] = previous["seed_accounts"]
+        if args.build_feature:
+            entry["build_features"] = args.build_feature
+        elif "build_features" in previous:
+            entry["build_features"] = previous["build_features"]
         customers[args.customer] = entry
     elif args.customer not in customers:
         parser.error("unknown customer")
