@@ -96,6 +96,36 @@ class AttestationPipelineTest(unittest.TestCase):
             self.assertEqual(attestor.call_count, 1)
         self.assertEqual(running, {})
 
+    def test_upgrade_during_the_vote_keeps_both_outcomes(self):
+        from fly_listener import observe_upgrade
+        release = Event()
+        attestor = Mock(side_effect=lambda *_: release.wait(10) and dict(
+            status="voted", signature="sig", verifier="node", diff_root="aa", replayed_tx_count=2,
+            max_cu_delta_bps=0))
+        cache = {self.proposal: {"expires_at": self.now.timestamp() + 60}}
+        running = {}
+        with closing(sqlite3.connect(":memory:")) as db, ThreadPoolExecutor(max_workers=1) as pool, patch(
+                "fly_listener.replay_archive", return_value={"records": [1]}):
+            ledger = Admissions(db, self.policies)
+            ledger.consume(self.event, self.now, enqueue=True)
+            check_live_traffic(ledger, cache, 111, self.now, self.notice, attestor, pool, running)
+            # Other verifiers reached quorum. The gate executed while this vote finalizes.
+            observe_upgrade(ledger, cache, running, None, self.proposal, self.now)
+            self.assertEqual(len(ledger.active_jobs()), 1)
+            release.set()
+            running[self.proposal].result(timeout=10)
+            check_live_traffic(ledger, cache, 112, self.now, self.notice, attestor, pool, running)
+            self.assertEqual(db.execute("SELECT status, reason FROM job_outcomes").fetchone(),
+                             ("executed", "vote sig; diff_root aa; upgrade executed"))
+            # Without a job in flight the upgrade closes the job directly.
+            other = dict(self.event, proposal=to_base58(bytes([9]) * 32))
+            ledger.policies = customer_policies(json.dumps({"other": {"targets": [self.target]}}))
+            ledger.consume(other, self.now.replace(month=12, day=2), enqueue=True)
+            observe_upgrade(ledger, {other["proposal"]: {}}, {}, None, other["proposal"], self.now)
+            self.assertEqual(db.execute("SELECT status, reason FROM job_outcomes WHERE proposal = ?",
+                                        (other["proposal"],)).fetchone(),
+                             ("executed", "upgrade executed before this node finished verification"))
+
     def test_outcome_discards_the_job_files(self):
         from fly_listener import Attestor
         with TemporaryDirectory() as tmp:

@@ -20,6 +20,7 @@ on:
       - 'scripts/customer_admin.py'
       - 'packages/squads-adapter/**'
       - 'scripts/test_fly_listener.py'
+      - 'scripts/test_watch.py'
       - 'scripts/test_worker_http.py'
       - 'scripts/worker_build.py'
       - 'scripts/worker_vote.py'
