@@ -12,6 +12,87 @@ from unittest.mock import Mock, patch
 from devnet import to_base58
 from fly_listener import Admissions, capture_ready, check_live_traffic, customer_policies
 from live_prestate import PrestateRefused
+from worker_build import BuildFailed
+from worker_vote import CandidateRejected
+
+
+class AttestationPipelineTest(unittest.TestCase):
+    """After the replay preflight, each node builds, verifies and votes on its own."""
+
+    def setUp(self):
+        self.now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self.target, self.proposal = [to_base58(bytes([n]) * 32) for n in (1, 2)]
+        self.event = dict(target=self.target, proposal=self.proposal, anchor_slot=100, replay_slots=10)
+        self.policies = customer_policies(json.dumps({"client": {
+            "targets": [self.target], "seed_accounts": [], "repo_url": "https://github.com/example/program",
+            "library_name": "program", "build_subdir": "programs/program", "build_features": ["candidate"],
+        }}))
+        self.notice = Mock()
+
+    def run_cycles(self, attestor, slots=(111,), archive=None, policies=None):
+        cache = {self.proposal: {"expires_at": self.now.timestamp() + 60}}
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger = Admissions(db, policies or self.policies)
+            ledger.consume(self.event, self.now, enqueue=True)
+            with patch("fly_listener.replay_archive", return_value=archive or {"records": [1, 2]}) as replay:
+                for slot in slots:
+                    check_live_traffic(ledger, cache, slot, self.now, self.notice, attestor)
+            outcome = db.execute("SELECT status, reason FROM job_outcomes").fetchone()
+            return ledger.active_jobs(), cache, outcome, replay
+
+    def test_vote_closes_the_job(self):
+        attestor = Mock(return_value=dict(status="voted", signature="sig", verifier="node", diff_root="aa",
+                                          replayed_tx_count=2, max_cu_delta_bps=0))
+        active, cache, outcome, replay = self.run_cycles(attestor, slots=(110, 111, 112))
+        replay.assert_called_once()
+        attestor.assert_called_once()
+        event, bundle, policy = attestor.call_args.args
+        self.assertEqual(bundle["archive"], {"records": [1, 2]})
+        self.assertEqual(policy.build_features, ("candidate",))
+        self.assertEqual((active, cache), ([], {}))
+        self.assertEqual(outcome, ("voted", "vote sig; diff_root aa"))
+        self.assertEqual(self.notice.call_args.args[0], "VoteSubmitted")
+        self.assertEqual(self.notice.call_args.args[1]["signature"], "sig")
+
+    def test_rejected_candidate_and_build_failures_are_final(self):
+        active, _, outcome, _ = self.run_cycles(Mock(side_effect=CandidateRejected("post-state differs")))
+        self.assertEqual((active, outcome), ([], ("rejected", "post-state differs")))
+        self.assertEqual(self.notice.call_args.args[0], "CandidateRejected")
+        failing = Mock(side_effect=BuildFailed("cargo exited with 101"))
+        active, cache, outcome, _ = self.run_cycles(failing, slots=(111, 112))
+        self.assertEqual((len(active), outcome[0]), (1, "traffic_preflight_passed"))
+        self.assertEqual(cache[self.proposal]["build_attempts"], 2)
+        active, _, outcome, _ = self.run_cycles(failing, slots=(111, 112, 113))
+        self.assertEqual((active, outcome), ([], ("refused", "candidate build failed: cargo exited with 101")))
+
+    def test_transient_errors_keep_the_job(self):
+        attestor = Mock(side_effect=RuntimeError("getSlot: endpoint unavailable"))
+        active, cache, outcome, _ = self.run_cycles(attestor, slots=(111, 112))
+        self.assertEqual((len(active), outcome[0], attestor.call_count), (1, "traffic_preflight_passed", 2))
+        self.assertIn("archive", cache[self.proposal])
+        self.notice.assert_not_called()
+
+    def test_build_source_is_required(self):
+        policies = customer_policies(json.dumps({"client": {"targets": [self.target], "seed_accounts": []}}))
+        attestor = Mock()
+        active, _, outcome, _ = self.run_cycles(attestor, policies=policies)
+        attestor.assert_not_called()
+        self.assertEqual((active, outcome), ([], ("refused", "customer build source is not configured")))
+
+    def test_vote_outcome_survives_execution(self):
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger = Admissions(db, self.policies)
+            ledger.consume(self.event, self.now, enqueue=True)
+            ledger.finish(self.proposal, self.now, "voted", "vote sig")
+            self.assertFalse(ledger.finish(self.proposal, self.now, "executed"))
+            ledger.record_executed(self.proposal)
+            self.assertEqual(db.execute("SELECT status, reason FROM job_outcomes").fetchone(),
+                             ("executed", "vote sig; upgrade executed"))
+
+    def test_build_features_are_cargo_names(self):
+        for features in (["a b"], ["--all-features"], "candidate", [f"f{i}" for i in range(17)]):
+            with self.subTest(features=features), self.assertRaisesRegex(ValueError, "build_features"):
+                customer_policies(json.dumps({"c": {"targets": [self.target], "build_features": features}}))
 
 
 class AdmissionsTest(unittest.TestCase):
@@ -25,7 +106,7 @@ class AdmissionsTest(unittest.TestCase):
         with closing(sqlite3.connect(":memory:")) as db:
             ledger = Admissions(db, policies)
             ledger.consume(event, now, enqueue=True)
-            with patch("fly_listener.preflight_traffic", side_effect=PrestateRefused("missing state")) as check:
+            with patch("fly_listener.replay_archive", side_effect=PrestateRefused("missing state")) as check:
                 check_live_traffic(ledger, cache, 110, now, notice)
                 check.assert_not_called()
                 check_live_traffic(ledger, cache, 111, now, notice)
@@ -113,7 +194,7 @@ class AdmissionsTest(unittest.TestCase):
                     collect.assert_not_called()
                     capture_ready(ledger, root, 111, now)
                     capture_ready(ledger, root, 112, now)
-                    collect.assert_called_once_with(json.loads(snapshot.read_text()), 500)
+                    collect.assert_called_once_with(json.loads(snapshot.read_text()), 500, include_baseline=True)
                 self.assertEqual(json.loads(archive.read_text()), {"records": [1]})
         finally:
             archive.unlink(missing_ok=True)

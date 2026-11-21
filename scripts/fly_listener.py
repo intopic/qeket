@@ -14,9 +14,13 @@ from urllib.parse import urlsplit
 
 from devnet import GENESIS, from_base58, to_base58
 from live_capture import GATE, UnsupportedReplayVersion, capture, rpc, watch
-from live_prestate import PrestateRefused, capture_prestate, preflight_traffic
+from live_prestate import PrestateRefused, capture_prestate, replay_archive
+from worker_build import FEATURE, BuildFailed, build_candidate
 from worker_http import start_http
 from worker_notify import notify
+from worker_vote import CandidateRejected, VoteRefused, attest, load_keypair
+
+MAX_BUILD_ATTEMPTS = 3
 
 
 PLANS = {"starter": (5, 500), "pro": (20, 2000), "enterprise": (None, 5000)}
@@ -35,6 +39,7 @@ class Policy:
     build_subdir: str | None
     webhook_url: str | None
     seed_accounts: tuple[str, ...] | None
+    build_features: tuple[str, ...] = ()
 
 
 def optional_https(value, field):
@@ -71,7 +76,12 @@ def build_options(policy):
         or len(set(seed_accounts)) != len(seed_accounts)
     ):
         raise ValueError("seed_accounts must contain at most 96 unique public keys")
-    return repo, library, subdir, webhook, None if seed_accounts is None else tuple(seed_accounts)
+    features = policy.get("build_features", [])
+    if (not isinstance(features, list) or len(features) > 16
+            or any(not isinstance(f, str) or not FEATURE.fullmatch(f) for f in features)):
+        raise ValueError("build_features must list at most 16 cargo feature names")
+    return (repo, library, subdir, webhook, None if seed_accounts is None else tuple(seed_accounts),
+            tuple(features))
 
 
 def customer_policies(raw):
@@ -215,6 +225,14 @@ class Admissions:
             self._record_outcome(db, proposal, "traffic_preflight_passed",
                                  f"{count} finalized target transactions checked for account coverage and unrelated writes")
 
+    def record_executed(self, proposal):
+        """Keep the vote record and mark that the gate later executed the upgrade."""
+        with self.database as db:
+            db.execute("""
+                UPDATE job_outcomes SET status = 'executed', reason = coalesce(reason || '; ', '') || 'upgrade executed'
+                WHERE gate = ? AND proposal = ? AND status IN ('voted', 'verified')
+            """, (GATE, proposal))
+
     def cursor(self):
         row = self.database.execute("SELECT next_slot FROM cursors WHERE gate = ?", (GATE,)).fetchone()
         return row[0] if row else None
@@ -255,7 +273,7 @@ def capture_ready(admissions, snapshots, next_slot, now, on_notice=None, live_jo
                     or any(snapshot.get(field) != event[field] for field in ("anchor_slot", "replay_slots", "nonce"))):
                 raise ValueError("snapshot does not match proposal event")
             limit = min(policy.max_replay_txs, event["max_replay_txs"])
-            archive = capture(snapshot, limit)
+            archive = capture(snapshot, limit, include_baseline=True)
             staged = directory / ".archive.json.tmp"
             staged.write_text(json.dumps(archive, separators=(",", ":")), encoding="utf-8")
             staged.replace(archive_path)
@@ -275,35 +293,89 @@ def capture_ready(admissions, snapshots, next_slot, now, on_notice=None, live_jo
         break
 
 
-def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice):
+@dataclass(frozen=True)
+class Attestor:
+    """Build -> verify -> vote for one proposal, using this node's own tools and key."""
+    runner: str
+    toolchain: str
+    jobs: Path
+    keypair: object
+    gate: str
+
+    def build(self, policy, commit, work):
+        return build_candidate(policy.repo_url, commit, policy.build_subdir or ".", policy.library_name,
+                               policy.build_features, work, self.toolchain)
+
+    def __call__(self, event, bundle, policy):
+        return attest(event, bundle, policy, self.jobs / event["proposal"], self.runner, self.build,
+                      self.keypair, self.gate)
+
+
+def attest_job(event, bundle, policy, attestor):
+    """Return (status, reason, notice) for a final outcome, or None to retry later."""
+    proposal = event["proposal"]
+    if policy.repo_url is None or policy.library_name is None:
+        return "refused", "customer build source is not configured", "ReplayFailed"
+    try:
+        result = attestor(event, bundle, policy)
+    except BuildFailed as exc:
+        bundle["build_attempts"] = bundle.get("build_attempts", 0) + 1
+        if bundle["build_attempts"] < MAX_BUILD_ATTEMPTS:
+            print(json.dumps(dict(event="candidate_build_retry", proposal=proposal, error=str(exc)[:300])), flush=True)
+            return None
+        return "refused", f"candidate build failed: {str(exc)[:300]}", "ReplayFailed"
+    except CandidateRejected as exc:
+        return "rejected", str(exc), "CandidateRejected"
+    except VoteRefused as exc:
+        return "refused", f"vote refused: {exc}", "ReplayFailed"
+    except (OSError, RuntimeError) as exc:
+        print(json.dumps(dict(event="attestation_retry", proposal=proposal, error=type(exc).__name__)), flush=True)
+        return None
+    except (ValueError, KeyError, TypeError):
+        return "refused", "invalid verifier evidence", "ReplayFailed"
+    details = dict(proposal=proposal, **result)
+    print(json.dumps(dict(details, event="attestation_" + result["status"])), flush=True)
+    if result["status"] == "voted":
+        reason = f"vote {result['signature'] or 'already recorded'}; diff_root {result['diff_root']}"
+        return "voted", reason, ("VoteSubmitted", details)
+    return "verified", f"diff_root {result['diff_root']}; not a configured verifier", ("ReplayVerified", details)
+
+
+def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attestor=None):
     for event in admissions.active_jobs():
         proposal = event["proposal"]
         bundle = live_jobs.get(proposal)
         if bundle is None:
             continue
         policy = admissions.policies.get(event["target"])
-        refusal = None
+        outcome = None
         if policy is None or not policy.active or now >= policy.expires:
-            refusal = "customer inactive"
+            outcome = "refused", "customer inactive", "ReplayFailed"
         elif now.timestamp() > bundle["expires_at"]:
-            refusal = "proposal expired"
-        elif "transaction_count" not in bundle and event["anchor_slot"] + event["replay_slots"] < next_slot:
+            outcome = "refused", "proposal expired", "ReplayFailed"
+        elif "archive" not in bundle and event["anchor_slot"] + event["replay_slots"] < next_slot:
             try:
-                count = preflight_traffic(event, bundle, min(policy.max_replay_txs, event["max_replay_txs"]))
-                if count == 0:
-                    raise PrestateRefused("replay window contains no successful target transactions")
+                archive = replay_archive(event, bundle, min(policy.max_replay_txs, event["max_replay_txs"]))
+                count = len(archive["records"])
                 admissions.record_traffic_preflight(proposal, count)
+                bundle["archive"] = archive
                 bundle["transaction_count"] = count
             except (OSError, RuntimeError):
                 print(json.dumps(dict(event="traffic_preflight_retry", proposal=proposal)), flush=True)
             except ValueError as exc:
-                refusal = str(exc)
+                outcome = "refused", str(exc), "ReplayFailed"
             except (KeyError, TypeError):
-                refusal = "invalid finalized transaction metadata"
-        if refusal is not None:
-            admissions.finish(proposal, now, "refused", refusal)
+                outcome = "refused", "invalid finalized transaction metadata", "ReplayFailed"
+        if outcome is None and "archive" in bundle and attestor is not None:
+            outcome = attest_job(event, bundle, policy, attestor)
+        if outcome is not None:
+            status, reason, notice = outcome
+            admissions.finish(proposal, now, status, reason)
             live_jobs.pop(proposal)
-            on_notice("ReplayFailed", dict(proposal=proposal, reason=refusal))
+            if isinstance(notice, tuple):
+                on_notice(*notice)
+            else:
+                on_notice(notice, dict(proposal=proposal, reason=reason))
 
 
 def main():
@@ -311,6 +383,7 @@ def main():
     parser.add_argument("--database", default="/data/admissions.sqlite3")
     parser.add_argument("--customers", type=Path, default=Path("/data/customers.json"))
     parser.add_argument("--snapshots", type=Path, default=Path("/data/snapshots"))
+    parser.add_argument("--jobs", type=Path, default=Path("/data/jobs"))
     parser.add_argument("--finish", metavar="PROPOSAL")
     args = parser.parse_args()
     if args.finish:
@@ -324,8 +397,15 @@ def main():
         return customer_policies(raw)
 
     policies = load_policies()
-    if rpc("getGenesisHash") != GENESIS:
+    # A loopback endpoint is a disposable validator used for the rehearsal.
+    local = urlsplit(os.environ["RPC_URL"]).hostname in ("127.0.0.1", "localhost")
+    if not local and rpc("getGenesisHash") != GENESIS:
         raise ValueError("expected Solana Devnet")
+    keypair = load_keypair()
+    runner, toolchain = os.environ.get("CANARY_GATE_BIN"), os.environ.get("CANARY_SBF_TOOLCHAIN")
+    attestor = Attestor(runner, toolchain, args.jobs, keypair, GATE) if runner and toolchain else None
+    print(json.dumps(dict(event="worker_started", gate=GATE, attestation=attestor is not None,
+                          verifier=keypair.address if keypair else None)), flush=True)
     with closing(sqlite3.connect(args.database)) as database:
         admissions = Admissions(database, policies, notify)
         live_jobs = {}
@@ -355,7 +435,9 @@ def main():
                         admissions.finish(proposal, datetime.now(timezone.utc), "refused", str(exc))
                         notify("ReplayFailed", dict(proposal=proposal, reason=str(exc)))
                         return
-                    except (OSError, KeyError, RuntimeError, TypeError, ValueError):
+                    except (OSError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+                        print(json.dumps(dict(event="prestate_error", proposal=proposal,
+                                              error=f"{type(exc).__name__}: {str(exc)[:200]}")), flush=True)
                         reason = "unable to read consistent live pre-state"
                         admissions.finish(proposal, datetime.now(timezone.utc), "refused", reason)
                         notify("ReplayFailed", dict(proposal=proposal, reason=reason))
@@ -368,13 +450,14 @@ def main():
             if event["target"] in admissions.policies:
                 if name == "UpgradeExecuted":
                     live_jobs.pop(event["proposal"], None)
-                    admissions.finish(event["proposal"], datetime.now(timezone.utc), "executed")
+                    if not admissions.finish(event["proposal"], datetime.now(timezone.utc), "executed"):
+                        admissions.record_executed(event["proposal"])
                 notify(name, event)
 
         next_capture = 0
         balance_check = 0
         low_balance = False
-        verifier_address = os.environ.get("CANARY_VERIFIER_PUBKEY")
+        verifier_address = os.environ.get("CANARY_VERIFIER_PUBKEY") or (keypair.address if keypair else None)
 
         def checkpoint(slot):
             nonlocal next_capture, balance_check, low_balance
@@ -382,7 +465,7 @@ def main():
             if time.monotonic() >= next_capture:
                 refresh_policies()
                 now = datetime.now(timezone.utc)
-                check_live_traffic(admissions, live_jobs, slot, now, notify)
+                check_live_traffic(admissions, live_jobs, slot, now, notify, attestor)
                 capture_ready(admissions, args.snapshots, slot, now, notify, live_jobs)
                 next_capture = time.monotonic() + 30
             if verifier_address and time.monotonic() >= balance_check:
