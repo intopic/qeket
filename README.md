@@ -113,6 +113,18 @@ Abonimet B2B faturohen jashtë zinxhirit.
 
 Mund të caktohen `active`, `cooldown_minutes`, `max_upgrades_per_month` dhe `max_replay_txs`. Përditëso `CANARY_CUSTOMERS` ose menaxho skedarin `/data/customers.json` me `python scripts/customer_admin.py --file customers.json set CLIENT --plan starter --target PROGRAM`. Për një klient ekzistues përdor `suspend CLIENT` ose `plan CLIENT --plan pro`. Skedari në volum ka përparësi ndaj secret-it. Një job i pranuar bllokon pranimin e job-eve të tjera të klientit deri në mbyllje. Në fazën aktuale operatori mund ta mbyllë me `python fly_listener.py --finish PROPOSAL`. Tavani i replay-it ruhet në payload-in e job-it. SQLite zbaton kuotën për një instancë. Për kuotë të përbashkët mes nyjeve, kërkohet ruajtje e përbashkët e vendimeve të pranimit.
 
+### Dy verifikues të pavarur në Fly.io
+
+`deploy/fly/verifier/` publikon dy aplikacione: `canary-verifier-a` në `fra` dhe `canary-verifier-b` në `iad`. Secili ka `shared-cpu-2x`, 2 GB RAM, 2 GB swap dhe volum `/data` 20 GB. Imazhi përmban `canary-gate`, të ndërtuar me ID-në e gate-it Devnet, dhe Docker. Në nisjen e parë, worker-i shkarkon platform-tools v1.58 në volum dhe kontrollon SHA-256. Build-et e kandidatit përdorin të njëjtin kontejner offline si CI-ja.
+
+Gjenero çelësin e votës veçmas për secilin aplikacion, në kompjuterin tënd. Çelësi sekret shkon vetëm te `fly secrets`, ndërsa adresa publike shfaqet në ekran:
+
+```powershell
+fly secrets set -a canary-verifier-a CANARY_VERIFIER_KEYPAIR="$(python scripts/solana_tx.py keygen)"
+```
+
+Workflow-i **Deploy Fly verifiers** kërkon secret-et e repos `FLY_API_TOKEN_VERIFIER_A` dhe `FLY_API_TOKEN_VERIFIER_B`. Nëse aplikacioni nuk ka `RPC_URL`, workflow-i e merr nga secret-i `RPC_URL` i repos. Deploy-i ndalet nëse mungon `CANARY_VERIFIER_KEYPAIR` ose `CANARY_CUSTOMERS`.
+
 ### Adapteri Squads v4
 
 `packages/squads-adapter` ndërton instruksionet e gate-it dhe i mbështjell me `vaultTransactionCreate` nga SDK Squads. Kalo adresën e gate-it të publikuar, adresën e multisig-ut, indeksin e Vault-it dhe të dhënat aktuale të propozimit. Vault-i duhet të jetë autoriteti për veprimet e qeverisjes dhe të ketë SOL për llogaritë e përdorura gjatë inicializimit ose propozimit. Ndiq rrjedhën e zakonshme Squads për krijimin e propozimit, miratimet dhe ekzekutimin. Për transferimin e autoritetit, rruga e qeverisjes kërkon `proposeProgramAuthorityTransfer` dhe timelock. Në ekzekutim duhet të sigurohet edhe nënshkrimi i marrësit të ri, sipas mënyrës si ai autoritet nënshkruan. Paketa krijon instruksionet dhe payload-in e Vault-it. Integrimi me një Vault të publikuar kërkon ende test on-chain.
