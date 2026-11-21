@@ -217,4 +217,5 @@ if __name__ == "__main__":
             parser.error("invalid variant name")
         variants.append((name, [f for f in features.split(",") if f]))
     check_options(".", "unused", [f for _, fs in variants for f in fs])
-    build_tree(args.source.resolve(), args.out.resolve(), variants, os.environ["CANARY_SBF_TOOLCHAIN"])
+    # CANARY_PLATFORM_TOOLS, used by the GitHub Action, takes precedence over a rustup toolchain.
+    build_tree(args.source.resolve(), args.out.resolve(), variants, os.environ.get("CANARY_SBF_TOOLCHAIN"))

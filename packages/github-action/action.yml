@@ -1,0 +1,152 @@
+name: Canary upgrade gate
+description: >-
+  Build a Solana program reproducibly and propose it through the Canary gate, report a
+  proposal's votes, or execute it once quorum and timelock allow.
+inputs:
+  command:
+    description: "propose, status or execute"
+    required: true
+  rpc-url:
+    description: RPC endpoint of the cluster the gate runs on.
+    required: true
+  gate-program:
+    description: Address of the Canary gate program.
+    required: true
+  target-program:
+    description: Address of the program the gate protects.
+    required: true
+  multisig:
+    description: Squads v4 multisig that governs the gate (propose).
+    default: ""
+  vault-index:
+    description: Squads vault index that is the gate's governance authority (propose).
+    default: "0"
+  keypair:
+    description: >-
+      JSON keypair. For propose, a multisig member with only the Initiate permission, which
+      pays the buffer rent and fees. For execute, any fee payer. Pass it from a secret.
+    default: ""
+  build-subdir:
+    description: Directory of the program's Cargo workspace, as registered with Canary.
+    default: "."
+  library-name:
+    description: Cargo library name of the program, as registered with Canary (propose).
+    default: ""
+  build-features:
+    description: Comma-separated Cargo features, as registered with Canary (propose).
+    default: ""
+  max-replay-txs:
+    description: Replay transaction cap of your Canary plan. The window is sized to stay under it.
+    default: "500"
+  spill:
+    description: Account that receives the buffer rent after the upgrade. Defaults to the vault.
+    default: ""
+  nonce:
+    description: Proposal nonce for status and execute. Defaults to the latest proposal.
+    default: ""
+outputs:
+  result:
+    description: JSON result of the canary command.
+    value: ${{ steps.run.outputs.result }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+    - name: Install the Canary CLI
+      shell: bash
+      working-directory: ${{ github.action_path }}/../squads-adapter
+      run: |
+        npm ci --no-audit --no-fund
+        npm run build
+        echo "CANARY_CLI=$PWD/dist/cli.js" >> "$GITHUB_ENV"
+    - name: Install pinned platform tools and the Solana CLI
+      if: inputs.command == 'propose'
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/tools.tbz" \
+          https://github.com/anza-xyz/platform-tools/releases/download/v1.58/platform-tools-linux-x86_64.tar.bz2
+        echo "7b82eb420b5aebd1e5590db0ae25c523eca06724d4238ae02139690535636c37  $RUNNER_TEMP/tools.tbz" | sha256sum -c -
+        mkdir -p "$RUNNER_TEMP/platform-tools"
+        tar xjf "$RUNNER_TEMP/tools.tbz" -C "$RUNNER_TEMP/platform-tools"
+        curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/cli.tbz" \
+          https://github.com/anza-xyz/agave/releases/download/v2.3.13/solana-release-x86_64-unknown-linux-gnu.tar.bz2
+        echo "c43539ebdf6942472e8b87635d6ea55f428a51e3d0219f7b6f720fc6b19fade0  $RUNNER_TEMP/cli.tbz" | sha256sum -c -
+        tar xjf "$RUNNER_TEMP/cli.tbz" -C "$RUNNER_TEMP"
+        echo "CANARY_PLATFORM_TOOLS=$RUNNER_TEMP/platform-tools" >> "$GITHUB_ENV"
+        echo "$RUNNER_TEMP/platform-tools/rust/bin" >> "$GITHUB_PATH"
+        echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"
+    - name: Build the program like the verifiers do
+      if: inputs.command == 'propose'
+      shell: bash
+      env:
+        SUBDIR: ${{ inputs.build-subdir }}
+        LIBRARY: ${{ inputs.library-name }}
+        FEATURES: ${{ inputs.build-features }}
+      run: |
+        set -euo pipefail
+        test -n "$LIBRARY" || { echo "library-name is required for propose"; exit 1; }
+        # Same builder as the verifiers: offline Docker, pinned platform tools,
+        # source copied without .git, target and local Cargo overrides.
+        python3 "$GITHUB_ACTION_PATH/../../scripts/worker_build.py" \
+          "$GITHUB_WORKSPACE/$SUBDIR" "$RUNNER_TEMP/canary-build" "candidate=$FEATURES"
+        elf="$RUNNER_TEMP/canary-build/candidate/sbpf-solana-solana/release/${LIBRARY//-/_}.so"
+        test -f "$elf"
+        echo "CANARY_ELF=$elf" >> "$GITHUB_ENV"
+        echo "Built $(sha256sum "$elf" | cut -c1-64) from $GITHUB_SHA"
+    - name: Write the buffer with the gate as its authority
+      if: inputs.command == 'propose'
+      shell: bash
+      env:
+        RPC_URL: ${{ inputs.rpc-url }}
+        CANARY_KEYPAIR: ${{ inputs.keypair }}
+        GATE: ${{ inputs.gate-program }}
+        TARGET: ${{ inputs.target-program }}
+      run: |
+        set -euo pipefail
+        test -n "$CANARY_KEYPAIR" || { echo "keypair is required for propose"; exit 1; }
+        umask 077
+        key="$RUNNER_TEMP/canary-key.json"
+        trap 'rm -f "$key"' EXIT
+        printf '%s' "$CANARY_KEYPAIR" > "$key"
+        config=$(node "$CANARY_CLI" config-address --gate "$GATE" --target "$TARGET" \
+          | python3 -c 'import json, sys; print(json.load(sys.stdin)["configAddress"])')
+        buffer=$(solana program write-buffer "$CANARY_ELF" --url "$RPC_URL" --keypair "$key" --output json \
+          | python3 -c 'import json, sys; print(json.load(sys.stdin)["buffer"])')
+        # The gate refuses a buffer it does not control, so its bytes cannot change after the proposal.
+        solana program set-buffer-authority "$buffer" --new-buffer-authority "$config" --url "$RPC_URL" --keypair "$key"
+        echo "CANARY_BUFFER=$buffer" >> "$GITHUB_ENV"
+    - name: Run canary
+      id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        RPC_URL: ${{ inputs.rpc-url }}
+        CANARY_KEYPAIR: ${{ inputs.keypair }}
+        GATE: ${{ inputs.gate-program }}
+        TARGET: ${{ inputs.target-program }}
+        MULTISIG: ${{ inputs.multisig }}
+        VAULT_INDEX: ${{ inputs.vault-index }}
+        MAX_REPLAY_TXS: ${{ inputs.max-replay-txs }}
+        SPILL: ${{ inputs.spill }}
+        NONCE: ${{ inputs.nonce }}
+      run: |
+        set -euo pipefail
+        args=(--gate "$GATE" --target "$TARGET")
+        case "$COMMAND" in
+          propose)
+            test -n "$MULTISIG" || { echo "multisig is required for propose"; exit 1; }
+            args+=(--multisig "$MULTISIG" --vault-index "$VAULT_INDEX" --buffer "$CANARY_BUFFER" --elf "$CANARY_ELF"
+                   --commit "$GITHUB_SHA" --max-replay-txs "$MAX_REPLAY_TXS")
+            if [ -n "$SPILL" ]; then args+=(--spill "$SPILL"); fi;;
+          status|execute)
+            if [ -n "$NONCE" ]; then args+=(--nonce "$NONCE"); fi;;
+          *) echo "command must be propose, status or execute"; exit 1;;
+        esac
+        if [ "$COMMAND" = status ]; then unset CANARY_KEYPAIR; fi
+        result=$(node "$CANARY_CLI" "$COMMAND" "${args[@]}")
+        echo "$result"
+        { echo "result<<CANARY_RESULT"; echo "$result"; echo "CANARY_RESULT"; } >> "$GITHUB_OUTPUT"
+        { echo "### Canary $COMMAND"; echo '```json'; echo "$result"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
