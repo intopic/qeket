@@ -2,7 +2,7 @@ import json
 import sqlite3
 from uuid import uuid4
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,10 +12,49 @@ import time
 from unittest.mock import Mock, patch
 
 from devnet import to_base58
-from fly_listener import Admissions, capture_ready, check_live_traffic, customer_policies
+from fly_listener import (GATE, LIVE_CACHE_BYTES, Admissions, capture_ready, check_live_traffic, collect_captures,
+                          customer_policies, reconcile_votes)
 from live_prestate import PrestateRefused
 from worker_build import BuildFailed
-from worker_vote import CandidateRejected, ReplayIncomplete
+from worker_vote import CandidateRejected, ReplayIncomplete, VoteRefused
+
+VOTED = dict(status="voted", signature="sig", verifier="node", diff_root="aa", replayed_tx_count=2, max_cu_delta_bps=0)
+
+
+def settled(result=None, error=None):
+    future = Future()
+    if error is not None:
+        future.set_exception(error)
+    else:
+        future.set_result(result)
+    return future
+
+
+class QueuedExecutor:
+    """Accepts work and never starts it, like a pool whose worker is busy."""
+
+    def __init__(self):
+        self.futures = []
+
+    def submit(self, function, *args):
+        self.futures.append(Future())
+        return self.futures[-1]
+
+
+def ledger_for(db, now, count):
+    """Admissions with one active live pre-state job per customer."""
+    targets = [to_base58(bytes([10 + n]) * 32) for n in range(count)]
+    ledger = Admissions(db, customer_policies(json.dumps(
+        {f"c{n}": {"targets": [target], "seed_accounts": []} for n, target in enumerate(targets)})))
+    proposals = [to_base58(bytes([40 + n]) * 32) for n in range(count)]
+    for n, (target, proposal) in enumerate(zip(targets, proposals)):
+        ledger.consume(dict(target=target, proposal=proposal, nonce=n, anchor_slot=100, replay_slots=10),
+                       now, enqueue=True)
+    return ledger, proposals
+
+
+def outcome_of(db, proposal):
+    return db.execute("SELECT status, reason FROM job_outcomes WHERE proposal = ?", (proposal,)).fetchone()
 
 
 class AttestationPipelineTest(unittest.TestCase):
@@ -173,6 +212,196 @@ class AttestationPipelineTest(unittest.TestCase):
         for features in (["a b"], ["--all-features"], "candidate", [f"f{i}" for i in range(17)]):
             with self.subTest(features=features), self.assertRaisesRegex(ValueError, "build_features"):
                 customer_policies(json.dumps({"c": {"targets": [self.target], "build_features": features}}))
+
+    def run_until_expired(self, attestor, finish_before_expiry=False):
+        """Expire the proposal while its job runs in the worker thread."""
+        started, release = Event(), Event()
+
+        def blocked(event, bundle, policy):
+            started.set()
+            release.wait(10)
+            return attestor(event, bundle, policy)
+
+        work = Mock(side_effect=blocked)
+        cache = {self.proposal: {"expires_at": self.now.timestamp() + 60}}
+        later = self.now + timedelta(minutes=2)
+        running = {}
+        with closing(sqlite3.connect(":memory:")) as db, ThreadPoolExecutor(max_workers=1) as pool, patch(
+                "fly_listener.replay_archive", return_value={"records": [1]}):
+            ledger = Admissions(db, self.policies)
+            ledger.consume(self.event, self.now, enqueue=True)
+            check_live_traffic(ledger, cache, 111, self.now, self.notice, work, pool, running)
+            self.assertTrue(started.wait(10))
+            if finish_before_expiry:
+                release.set()
+                running[self.proposal].result(timeout=10)
+            check_live_traffic(ledger, cache, 112, later, self.notice, work, pool, running)
+            if not finish_before_expiry:
+                # The job stays open until the worker thread stops, and may not vote.
+                self.assertEqual(len(ledger.active_jobs()), 1)
+                self.assertTrue(cache[self.proposal]["cancelled"])
+                release.set()
+                running[self.proposal].result(timeout=10)
+                check_live_traffic(ledger, cache, 113, later, self.notice, work, pool, running)
+            self.assertEqual((ledger.active_jobs(), cache, running), ([], {}, {}))
+            return db.execute("SELECT status, reason FROM job_outcomes").fetchone()
+
+    def test_expiry_during_a_running_job_blocks_its_vote(self):
+        seen = []
+
+        def attestor(event, bundle, policy):
+            seen.append(bundle.get("cancelled"))
+            if bundle.get("cancelled"):  # Attestor's authorize() refuses before signing.
+                raise VoteRefused("proposal or customer authorization expired or changed")
+            return VOTED
+
+        self.assertEqual(self.run_until_expired(attestor), ("refused", "proposal expired"))
+        self.assertEqual(seen, [True])
+
+    def test_vote_signed_before_expiry_is_kept(self):
+        outcome = self.run_until_expired(Mock(return_value=VOTED), finish_before_expiry=True)
+        self.assertEqual(outcome, ("voted", "vote sig; diff_root aa"))
+        self.assertEqual(self.notice.call_args.args[0], "VoteSubmitted")
+
+    def test_queued_job_is_cancelled_on_expiry(self):
+        attestor, queue = Mock(), QueuedExecutor()
+        cache = {self.proposal: {"expires_at": self.now.timestamp() + 60}}
+        running = {}
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger = Admissions(db, self.policies)
+            ledger.consume(self.event, self.now, enqueue=True)
+            check_live_traffic(ledger, cache, 111, self.now, self.notice, attestor, queue, running)
+            check_live_traffic(ledger, cache, 112, self.now + timedelta(minutes=2), self.notice, attestor, queue,
+                               running)
+            self.assertTrue(queue.futures[0].cancelled())
+            self.assertEqual((ledger.active_jobs(), cache, running), ([], {}, {}))
+            self.assertEqual(outcome_of(db, self.proposal), ("refused", "proposal expired"))
+        attestor.assert_not_called()
+
+    def test_vote_is_authorized_against_the_current_customer_policy(self):
+        from fly_listener import Attestor
+        calls = []
+        current = {"policies": self.policies}
+        with TemporaryDirectory() as tmp, patch("fly_listener.attest", side_effect=lambda *args: calls.append(args)):
+            attestor = Attestor("canary-gate", None, Path(tmp), None, "gate",
+                                load_policies=lambda: current["policies"])
+            bundle = {"expires_at": time.time() + 60}
+            attestor(self.event, bundle, self.policies[self.target])
+            authorize = calls[0][-1]
+            authorize()
+            # The customer changed the build source while this job ran.
+            current["policies"] = customer_policies(json.dumps({"client": {
+                "targets": [self.target], "seed_accounts": [], "repo_url": "https://github.com/example/fork",
+                "library_name": "program", "build_subdir": "programs/program", "build_features": ["candidate"],
+            }}))
+            with self.assertRaisesRegex(VoteRefused, "changed"):
+                authorize()
+            current["policies"] = {}
+            with self.assertRaisesRegex(VoteRefused, "changed"):
+                authorize()
+            current["policies"] = self.policies
+            bundle["cancelled"] = True
+            with self.assertRaisesRegex(VoteRefused, "expired"):
+                authorize()
+            del bundle["cancelled"]
+            bundle["expires_at"] = time.time() - 1
+            with self.assertRaisesRegex(VoteRefused, "expired"):
+                authorize()
+
+
+class LiveCaptureTest(unittest.TestCase):
+    """Live pre-state reads run beside the event loop and are collected at checkpoints."""
+
+    def setUp(self):
+        self.now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self.notice = Mock()
+
+    def test_finished_captures_enter_the_cache_or_refuse_their_job(self):
+        alpenglow = "replay window is too close to the Alpenglow activation"
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger, (ready, pending, refused, broken) = ledger_for(db, self.now, 4)
+            waiting = Future()
+            captures = {ready: settled(dict(encoded_bytes=10, capture_slot=105)), pending: waiting,
+                        refused: settled(error=PrestateRefused(alpenglow)),
+                        broken: settled(error=RuntimeError("getMultipleAccounts: endpoint unavailable"))}
+            live = {}
+            collect_captures(ledger, captures, live, self.now, self.notice)
+            self.assertEqual((list(live), captures), ([ready], {pending: waiting}))
+            self.assertEqual(outcome_of(db, ready), ("prestate_captured", "live state captured at slot 105"))
+            self.assertIsNone(outcome_of(db, pending))
+            self.assertEqual(outcome_of(db, refused), ("refused", alpenglow))
+            self.assertEqual(outcome_of(db, broken), ("refused", "unable to read consistent live pre-state"))
+            self.assertEqual({job["proposal"] for job in ledger.active_jobs()}, {ready, pending})
+            self.assertEqual([c.args for c in self.notice.call_args_list], [
+                ("ReplayFailed", dict(proposal=refused, reason=alpenglow)),
+                ("ReplayFailed", dict(proposal=broken, reason="unable to read consistent live pre-state")),
+            ])
+
+    def test_full_cache_refuses_and_closed_jobs_are_not_cached(self):
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger, (full, closed) = ledger_for(db, self.now, 2)
+            live = {"cached": dict(encoded_bytes=LIVE_CACHE_BYTES)}
+            collect_captures(ledger, {full: settled(dict(encoded_bytes=1, capture_slot=105))}, live, self.now,
+                             self.notice)
+            self.assertEqual((list(live), outcome_of(db, full)), (["cached"], ("refused", "live pre-state cache is full")))
+            # The operator closed this job while its capture was still running.
+            ledger.finish(closed, self.now, "closed")
+            live = {}
+            collect_captures(ledger, {closed: settled(dict(encoded_bytes=1, capture_slot=105))}, live, self.now,
+                             self.notice)
+            self.assertEqual((live, outcome_of(db, closed)), ({}, ("closed", None)))
+            self.assertEqual(self.notice.call_count, 1)
+
+
+class InterruptedVoteTest(unittest.TestCase):
+    """After a restart, a vote sent before it is settled from finalized chain state."""
+
+    def test_interrupted_votes_settle_from_finalized_state(self):
+        now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        notice = Mock()
+        root = "ab" * 32
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger, proposals = ledger_for(db, now, 7)
+            landed, executed, waiting, expired, late, offline, differs = proposals
+            jobs = {job["proposal"]: job for job in ledger.active_jobs()}
+
+            def receipt(last_height=500, **extra):
+                return dict(evidence=dict(diff_root=[0xAB] * 32), verifier="node", last_height=last_height, **extra)
+
+            interrupted = {p: (jobs[p], receipt()) for p in (landed, expired, late, offline, differs)}
+            interrupted[executed] = (jobs[executed], receipt(executed=True))
+            # Its blockhash is still valid at the finalized height 600.
+            interrupted[waiting] = (jobs[waiting], receipt(last_height=900))
+            answers = {landed: [True], executed: [True], waiting: [False], expired: [False, False],
+                       late: [False, True], offline: [RuntimeError("getAccountInfo: endpoint unavailable")],
+                       differs: [VoteRefused("finalized verifier vote has a different root")]}
+
+            def finalized_vote(job, bundle, evidence, verifier, gate):
+                self.assertEqual((verifier, gate), ("node", GATE))
+                answer = answers[job["proposal"]].pop(0)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+
+            with patch("fly_listener.finalized_vote", side_effect=finalized_vote), patch(
+                    "fly_listener.rpc", return_value=600) as rpc:
+                reconcile_votes(ledger, interrupted, now, notice)
+                self.assertEqual(rpc.call_args.args, ("getBlockHeight", {"commitment": "finalized"}))
+                self.assertEqual(outcome_of(db, landed), ("voted", f"vote confirmed on chain; diff_root {root}"))
+                self.assertEqual(outcome_of(db, executed),
+                                 ("executed", f"vote confirmed on chain; diff_root {root}; upgrade executed"))
+                self.assertEqual(outcome_of(db, expired), ("refused", "interrupted vote expired without confirmation"))
+                self.assertEqual(outcome_of(db, differs),
+                                 ("refused", "vote reconciliation failed: finalized verifier vote has a different root"))
+                # Still able to land, found on the re-read, or unreadable: the job stays open.
+                self.assertEqual(set(interrupted), {waiting, late, offline})
+                self.assertEqual({job["proposal"] for job in ledger.active_jobs()}, {waiting, late, offline})
+                self.assertEqual([c.args[0] for c in notice.call_args_list], ["VoteSubmitted", "VoteSubmitted"])
+                answers.update({waiting: [False], late: [True], offline: [True]})
+                reconcile_votes(ledger, interrupted, now, notice)
+            self.assertEqual(set(interrupted), {waiting})
+            self.assertEqual(outcome_of(db, late)[0], "voted")
+            self.assertEqual(outcome_of(db, offline)[0], "voted")
 
 
 class AdmissionsTest(unittest.TestCase):

@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 import struct
@@ -7,6 +8,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from devnet import from_base58, to_base58
@@ -162,6 +164,50 @@ class AttestationTest(unittest.TestCase):
                 worker_vote.submit_vote(event, bundle, evidence, KEYPAIR, to_base58(bytes([5]) * 32))
 
 
+    def test_vote_intent_is_written_after_authorization_and_before_sending(self):
+        event = dict(target=to_base58(bytes([1]) * 32), nonce=0, anchor_slot=1, replay_slots=2,
+                     proposal=to_base58(bytes([2]) * 32))
+        gate = to_base58(bytes([5]) * 32)
+        bundle = dict(buffer=to_base58(bytes([3]) * 32), config_address=to_base58(bytes([4]) * 32),
+                      config={"verifiers": [KEYPAIR.address]})
+        evidence = dict(replay_mode="StrictEquality", elf_sha256=[0] * 32, diff_root=[0] * 32,
+                        replayed_tx_count=1, max_cu_delta_bps=0)
+        sent = []
+        with TemporaryDirectory() as tmp:
+            job = Path(tmp)
+
+            def rpc(method, *params):
+                if method == "getAccountInfo":
+                    return {"value": None}  # No finalized vote yet.
+                if method == "getSlot":
+                    return 10
+                if method == "getLatestBlockhash":
+                    return {"value": {"blockhash": to_base58(bytes(32)), "lastValidBlockHeight": 77}}
+                if method == "sendTransaction":
+                    sent.append((json.loads((job / "vote-intent.json").read_text()), base64.b64decode(params[0])))
+                    return "sig"
+                raise AssertionError(method)
+
+            def refuse():
+                raise VoteRefused("proposal or customer authorization expired or changed")
+
+            with patch("worker_vote.rpc", side_effect=rpc), patch("worker_vote.wait_finalized") as finalized:
+                with self.assertRaisesRegex(VoteRefused, "authorization"):
+                    worker_vote.submit_vote(event, bundle, evidence, KEYPAIR, gate, refuse, job)
+                # Nothing was signed, recorded or sent.
+                self.assertEqual((sent, list(job.iterdir())), ([], []))
+                self.assertEqual(worker_vote.submit_vote(event, bundle, evidence, KEYPAIR, gate, lambda: None, job),
+                                 "sig")
+            finalized.assert_called_once_with("sig")
+        (intent, raw), = sent
+        # The receipt names the exact transaction, so a restart can settle it.
+        self.assertEqual(intent["signature"], to_base58(raw[1:65]))
+        self.assertEqual((intent["last_height"], intent["verifier"], intent["buffer"]), (77, KEYPAIR.address,
+                                                                                        bundle["buffer"]))
+        self.assertEqual((intent["config"], intent["evidence"]), (bundle["config"], evidence))
+        self.assertEqual(bundle["confirmed_signature"], "sig")
+
+
 class BuilderTest(unittest.TestCase):
     def test_build_tree_excludes_local_overrides_and_links(self):
         from worker_build import BuildFailed, check_options, copy_source, fetch_commit
@@ -192,6 +238,76 @@ class BuilderTest(unittest.TestCase):
         from worker_build import platform_root
         with TemporaryDirectory() as tmp, patch.dict(os.environ, {"CANARY_PLATFORM_TOOLS": tmp}):
             self.assertEqual(platform_root("unused-toolchain"), Path(tmp).resolve())
+
+    def test_remote_build_round_trip_through_the_restricted_command(self):
+        """The verifier's request is exactly what the builder's forced SSH command reads."""
+        import worker_build
+        from worker_build import remote_build
+        policy = SimpleNamespace(repo_url="https://github.com/example/program", build_subdir=None,
+                                 library_name="program", build_features=("candidate",))
+        commit, elf = "ab" * 20, b"\x7fELF" + bytes(60)
+        builds, commands = [], []
+
+        def build_candidate(repo_url, commit, subdir, library, features, work, toolchain):
+            builds.append((repo_url, commit, subdir, library, features, toolchain))
+            (work / "program.so").write_bytes(elf)
+            return work / "program.so"
+
+        def ssh(command, input, stdout, stderr, timeout):
+            # Stand in for sshd: run the forced command with the request on stdin.
+            commands.append((command, timeout))
+            with patch.object(worker_build.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(input))), \
+                    patch.object(worker_build.sys, "stdout", SimpleNamespace(buffer=stdout)):
+                worker_build.serve_build()
+            return SimpleNamespace(returncode=0)
+
+        with TemporaryDirectory() as tmp, patch("worker_build.build_candidate", side_effect=build_candidate), \
+                patch("worker_build.subprocess.run", side_effect=ssh):
+            output = remote_build("canary-builder-a.internal", policy, commit, Path(tmp) / "build")
+            self.assertEqual(output.read_bytes(), elf)
+        self.assertEqual(builds, [("https://github.com/example/program", commit, ".", "program", ["candidate"], None)])
+        (command, timeout), = commands
+        self.assertEqual((command[:4], timeout), (["sh", "-c", 'ulimit -f 20480 && exec "$@"', "sh"], 5400))
+        for option in ("BatchMode=yes", "IdentitiesOnly=yes", "StrictHostKeyChecking=yes",
+                       "UserKnownHostsFile=/run/canary/known_hosts"):
+            self.assertIn(option, command)
+        self.assertEqual(command[-5:], ["-i", "/run/canary/build_key", "-p", "2222", "builder@canary-builder-a.internal"])
+
+    def test_remote_build_failures_are_build_failures(self):
+        from worker_build import BuildFailed, remote_build
+        policy = SimpleNamespace(repo_url="https://github.com/example/program", build_subdir=None,
+                                 library_name="program", build_features=())
+
+        def returns(code, data):
+            def run(command, input, stdout, stderr, timeout):
+                stdout.write(data)
+                return SimpleNamespace(returncode=code)
+            return run
+
+        def times_out(command, **kwargs):
+            raise subprocess.TimeoutExpired(command, 5400)
+
+        cases = {"ssh exit status": returns(255, b"\x7fELF"), "empty output": returns(0, b""),
+                 "oversized output": returns(0, bytes(10 * 1024 * 1024 + 1)), "no ssh client": FileNotFoundError,
+                 "timeout": times_out}
+        with TemporaryDirectory() as tmp:
+            for name, run in cases.items():
+                with self.subTest(name), patch("worker_build.subprocess.run", side_effect=run), \
+                        self.assertRaises(BuildFailed):
+                    remote_build("canary-builder-a.internal", policy, "ab" * 20, Path(tmp) / name)
+            with patch("worker_build.subprocess.run") as run:
+                for host in ("builder host", "-oProxyCommand=sh", "Builder.internal", ""):
+                    with self.subTest(host=host), self.assertRaisesRegex(BuildFailed, "hostname"):
+                        remote_build(host, policy, "ab" * 20, Path(tmp) / "host")
+                run.assert_not_called()
+
+    def test_serve_build_refuses_oversized_requests(self):
+        import worker_build
+        with patch.object(worker_build.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b" " * 8193))), \
+                patch("worker_build.build_candidate") as build, \
+                self.assertRaisesRegex(worker_build.BuildFailed, "too large"):
+            worker_build.serve_build()
+        build.assert_not_called()
 
     def test_keygen_prints_secret_on_stdout_only(self):
         result = subprocess.run([sys.executable, str(Path(__file__).with_name("solana_tx.py")), "keygen"],
