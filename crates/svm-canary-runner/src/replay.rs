@@ -238,12 +238,8 @@ pub struct Archive {
     pub records: Vec<Record>,
 }
 
-/// A VM with the cluster's features. The steps follow `LiteSVM::new`, because
-/// builtins, precompiles and the program runtime depend on the feature set.
-fn replay_vm(features: Option<&[(Pubkey, u64)]>, anchor_slot: u64) -> Result<LiteSVM> {
-    let Some(features) = features else {
-        return Ok(LiteSVM::new());
-    };
+/// Exactly the features the archive lists, each active from its slot.
+fn cluster_feature_set(features: &[(Pubkey, u64)], anchor_slot: u64) -> Result<FeatureSet> {
     let mut set = FeatureSet::default();
     for (id, slot) in features {
         ensure!(
@@ -252,8 +248,17 @@ fn replay_vm(features: Option<&[(Pubkey, u64)]>, anchor_slot: u64) -> Result<Lit
         );
         set.activate(id, *slot);
     }
+    Ok(set)
+}
+
+/// A VM with the cluster's features. The steps follow `LiteSVM::new`, because
+/// builtins, precompiles and the program runtime depend on the feature set.
+fn replay_vm(features: Option<&[(Pubkey, u64)]>, anchor_slot: u64) -> Result<LiteSVM> {
+    let Some(features) = features else {
+        return Ok(LiteSVM::new());
+    };
     Ok(LiteSVM::default()
-        .with_feature_set(set)
+        .with_feature_set(cluster_feature_set(features, anchor_slot)?)
         .with_builtins()
         .with_lamports(1_000_000_000_000_000)
         .with_sysvars()
@@ -692,8 +697,7 @@ mod tests {
     #[test]
     fn replay_enables_only_the_cluster_features() {
         // Older archives keep the previous behaviour: every known feature.
-        let all = replay_vm(None, 10).unwrap().get_feature_set();
-        assert!(all.inactive().is_empty());
+        let all = FeatureSet::all_enabled();
         // A cluster without one feature that does not affect execution. The
         // bundled SPL programs need the syscall features to load.
         let disabled = agave_feature_set::full_inflation::devnet_and_testnet::id();
@@ -704,13 +708,14 @@ mod tests {
             .map(|id| (*id, 7))
             .collect();
         cluster.sort();
-        let set = replay_vm(Some(&cluster), 10).unwrap().get_feature_set();
+        let set = cluster_feature_set(&cluster, 10).unwrap();
         assert_eq!(set.activated_slot(&cluster[0].0), Some(7));
         assert!(all.is_active(&disabled) && !set.is_active(&disabled));
+        assert!(replay_vm(Some(&cluster), 10).is_ok() && replay_vm(None, 10).is_ok());
         // A feature activated after the anchor, or listed twice, is invalid evidence.
         assert!(replay_vm(Some(&[(cluster[0].0, 11)]), 10).is_err());
         cluster.push(cluster[0]);
-        assert!(replay_vm(Some(&cluster), 10).is_err());
+        assert!(cluster_feature_set(&cluster, 10).is_err());
     }
 
     #[test]

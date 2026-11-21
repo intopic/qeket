@@ -363,10 +363,10 @@ pub fn run(
         accounts: vec![],
         clocks: vec![],
         final_accounts: vec![],
-        // The demo cluster's own features, so the replay builds its VM from them.
+        // The demo VM runs LiteSVM::new, which enables every feature. Listing
+        // them makes the replay build its VM from the archive's feature set.
         features: Some({
-            let mut active: Vec<_> = vm
-                .get_feature_set()
+            let mut active: Vec<_> = agave_feature_set::FeatureSet::all_enabled()
                 .active()
                 .iter()
                 .map(|(id, slot)| (*id, *slot))
