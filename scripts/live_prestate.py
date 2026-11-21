@@ -19,6 +19,8 @@ INSTRUCTIONS = "Sysvar1nstructions1111111111111111111111111"
 # instructions sysvar is derived from the transaction itself.
 RUNTIME_ACCOUNTS = {SYSTEM, "ComputeBudget111111111111111111111111111111", CLOCK, INSTRUCTIONS}
 REPLAY_MODES = ("StrictEquality", "NoRevertAndCuBound")
+FEATURE_OWNER = "Feature111111111111111111111111111111111111"
+ALPENGLOW_FEATURE = "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS"
 RENT_EXEMPT_EPOCH = 2 ** 64 - 1
 
 
@@ -120,13 +122,36 @@ def check_transaction_prestate(item, accounts, fee_payers=()):
     return keys
 
 
+def epoch_of(slot, schedule):
+    return schedule["firstNormalEpoch"] + (slot - schedule["firstNormalSlot"]) // schedule["slotsPerEpoch"]
+
+
 def check_window_epoch(anchor, end):
     schedule = rpc("getEpochSchedule")
     first = schedule["firstNormalSlot"]
     size = schedule["slotsPerEpoch"]
     if size <= 0 or anchor < first or (anchor - first) // size != (end - first) // size:
         raise PrestateRefused("replay window crosses an epoch boundary or is in epoch warmup")
-    return schedule["firstNormalEpoch"] + (anchor - first) // size
+    return epoch_of(anchor, schedule)
+
+
+def parent_clock(anchor, epoch):
+    """True when transactions in slot S read blockTime(parent(S)) instead of blockTime(S).
+
+    Under Alpenglow the bank keeps the parent footer time while transactions
+    run, and blockTime(S) is the footer time of S itself (anza-xyz/agave#15441).
+    """
+    value = rpc("getAccountInfo", ALPENGLOW_FEATURE, dict(FINAL, encoding="base64"))["value"]
+    if value is None:
+        return False
+    data = account_bytes(value, FEATURE_OWNER)
+    if len(data) < 9 or data[0] != 1:
+        return False
+    activated, = struct.unpack_from("<Q", data, 1)
+    # The switch slot follows neither rule. Stay clear of the activation epoch.
+    if activated > anchor or epoch <= epoch_of(activated, rpc("getEpochSchedule")) + 1:
+        raise PrestateRefused("replay window is too close to the Alpenglow activation")
+    return True
 
 
 def possible_writes(tx):
@@ -200,7 +225,7 @@ def check_window_isolation(event, records, tracked, accounts, synthesized=None):
     if len(expected) != len(records):
         raise PrestateRefused("duplicate replay transaction positions")
     observed = set()
-    times = {}
+    times, parents = {}, {}
     parent = None
     for slot, confirmed in finalized_blocks(anchor, slots + next_slots):
         if slot > end:
@@ -208,6 +233,7 @@ def check_window_isolation(event, records, tracked, accounts, synthesized=None):
         if parent is None:
             parent = confirmed["parentSlot"]
         times[slot] = confirmed.get("blockTime")
+        parents[slot] = confirmed["parentSlot"]
         for index, tx in enumerate(confirmed["transactions"]):
             position = (slot, index)
             signature = expected.pop(position, None)
@@ -221,7 +247,7 @@ def check_window_isolation(event, records, tracked, accounts, synthesized=None):
                 raise PrestateRefused("captured account modified by non-target transaction during replay window")
     if expected:
         raise PrestateRefused("target replay transaction was absent from the finalized window")
-    return {"parent_slot": parent, "block_times": times}
+    return {"parent_slot": parent, "block_times": times, "parents": parents}
 
 
 def check_captured_accounts_unchanged(anchor, capture_slot, tracked):
@@ -235,22 +261,29 @@ def check_captured_accounts_unchanged(anchor, capture_slot, tracked):
                 raise PrestateRefused(f"captured account could have changed before the snapshot at slot {slot}")
 
 
-def window_clocks(event, bundle, epoch, scan):
-    """One Clock per slot. Skipped slots carry the last produced timestamp."""
+def window_clocks(event, bundle, epoch, scan, from_parent=False):
+    """One Clock per slot, as the transactions in that slot read it.
+
+    TowerBFT: blockTime of the slot. Alpenglow: blockTime of its parent block.
+    No transaction runs in a skipped slot, so it carries the last value.
+    """
     clock = bundle["clock"]
     if clock["epoch"] != epoch:
         raise PrestateRefused("live state was captured in a different epoch than the replay window")
-    times = scan["block_times"]
-    if any(type(value) is not int for value in times.values()):
+    produced = scan["block_times"]
+    if any(type(value) is not int for value in produced.values()):
         raise PrestateRefused("finalized block time is unavailable")
+    times = dict(produced)
     timestamp = None
-    if event["anchor_slot"] not in times:
+    if from_parent or event["anchor_slot"] not in produced:
         timestamp = rpc("getBlockTime", scan["parent_slot"])
         if type(timestamp) is not int:
             raise PrestateRefused("finalized block time is unavailable")
+        times.setdefault(scan["parent_slot"], timestamp)
     clocks = []
     for slot in range(event["anchor_slot"], event["anchor_slot"] + event["replay_slots"] + 1):
-        timestamp = times.get(slot, timestamp)
+        if slot in produced:
+            timestamp = times[scan["parents"][slot]] if from_parent else produced[slot]
         clocks.append(dict(slot=slot, epoch_start_timestamp=clock["epoch_start_timestamp"], epoch=epoch,
                            leader_schedule_epoch=clock["leader_schedule_epoch"], unix_timestamp=timestamp))
     return clocks
@@ -262,9 +295,33 @@ def archive_account(account):
                 rentEpoch=account["rentEpoch"])
 
 
+def final_states(keys, end):
+    """Read reconstructed accounts after the window and disprove writes since it ended.
+
+    The runner checks that the baseline replay ends in this state, which turns the
+    assumed starting state of each fee payer into a checked one.
+    """
+    keys = sorted(keys)
+    if not keys:
+        return []
+    result = rpc("getMultipleAccounts", keys, dict(FINAL, encoding="base64", minContextSlot=end + 1))
+    slot = result["context"]["slot"]
+    if len(result["value"]) != len(keys):
+        raise PrestateRefused("RPC did not return all requested accounts")
+    slots = rpc("getBlocks", end + 1, slot, FINAL)
+    if not slots or slots[-1] != slot:
+        raise PrestateRefused("finalized block coverage is incomplete")
+    for _, confirmed in finalized_blocks(end + 1, slots):
+        for tx in confirmed["transactions"]:
+            if possible_writes(tx).intersection(keys):
+                raise PrestateRefused("reconstructed fee payer was used again before its final state was read")
+    return [[list(from_base58(key)), None if value is None else archive_account(value)]
+            for key, value in zip(keys, result["value"])]
+
+
 def system_account(lamports):
-    # A fee payer must be a System account. A durable-nonce payer would differ in
-    # data, which the baseline balance and compute checks surface during replay.
+    # The runtime accepts only System fee payers with no data or nonce data.
+    # `final_states` checks the no-data assumption against the chain.
     return dict(lamports=lamports, data=[], owner=list(bytes(32)), executable=False, rentEpoch=RENT_EXEMPT_EPOCH)
 
 
@@ -273,6 +330,7 @@ def replay_archive(event, bundle, limit):
     anchor = event["anchor_slot"]
     span = event["replay_slots"]
     epoch = check_window_epoch(anchor, anchor + span)
+    from_parent = parent_clock(anchor, epoch)
     snapshot = dict(target=list(from_base58(event["target"])), anchor_slot=anchor, replay_slots=span)
     items = []
     captured = capture(snapshot, limit, validate_transaction=items.append, include_baseline=True)
@@ -312,7 +370,8 @@ def replay_archive(event, bundle, limit):
         baseline_elf=list(sha256(baseline_elf(bundle)).digest()),
         buffer=archive_account(accounts[bundle["buffer"]]), anchor_slot=anchor, replay_slots=span,
         min_txs=policy["min_replay_txs"], cu_limit_bps=policy["max_cu_delta_bps"],
-        accounts=present, clocks=window_clocks(event, bundle, epoch, scan), records=records,
+        accounts=present, clocks=window_clocks(event, bundle, epoch, scan, from_parent), records=records,
+        final_accounts=final_states(synthesized.keys(), anchor + span),
     )
 
 
