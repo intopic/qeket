@@ -3,6 +3,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import time
 
@@ -12,10 +13,18 @@ from solana_tx import (INSTRUCTIONS_SYSVAR, Keypair, anchor_discriminator, attes
                        ed25519_instruction, transaction)
 
 VOTE_VALIDITY_SLOTS = 300
+# `canary-gate verify` exits with this code only when the candidate failed a check.
+CANDIDATE_FAULT_EXIT = 3
+# Customer state and build output. evidence.json holds only hashes and counts.
+JOB_FILES = ("archive.json", "baseline.so", "build")
 
 
 class CandidateRejected(ValueError):
     """The replay or binary comparison disproved the candidate."""
+
+
+class ReplayIncomplete(ValueError):
+    """The archive or the replay could not establish the evidence. The candidate is not judged."""
 
 
 class VoteRefused(ValueError):
@@ -45,8 +54,21 @@ def verify_replay(runner, archive_path, baseline_path, rebuilt_path):
     if result.returncode:
         # anyhow prints the outermost context first. Keep the decisive line.
         lines = [line for line in result.stderr.splitlines() if line.strip()]
-        raise CandidateRejected(lines[0].removeprefix("Error: ")[:300] if lines else "verification failed")
+        reason = lines[0].removeprefix("Error: ")[:300] if lines else "verification failed"
+        if result.returncode == CANDIDATE_FAULT_EXIT:
+            raise CandidateRejected(reason)
+        raise ReplayIncomplete(reason)
     return json.loads(result.stdout)
+
+
+def discard_job_files(directory):
+    """Remove captured state and build output once the job has an outcome."""
+    for name in JOB_FILES:
+        path = directory / name
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
 
 
 def wait_finalized(signature, timeout=150):
@@ -100,7 +122,7 @@ def attest(event, bundle, policy, directory, runner, build, keypair, gate):
         if bytes(evidence["elf_sha256"]).hex() != bundle["candidate_sha256"]:
             raise CandidateRejected("rebuilt ELF differs from the proposed hash")
         if evidence["replay_mode"] != bundle["config"]["replay_mode"]:
-            raise CandidateRejected("replay mode differs from the gate policy")
+            raise ReplayIncomplete("replay mode differs from the gate policy")
         write_atomic(directory / "evidence.json", json.dumps(evidence).encode())
         bundle["evidence"] = evidence
     outcome = dict(diff_root=bytes(evidence["diff_root"]).hex(), replayed_tx_count=evidence["replayed_tx_count"],

@@ -6,14 +6,16 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Barrier
+from tempfile import TemporaryDirectory
+from threading import Barrier, Event
+import time
 from unittest.mock import Mock, patch
 
 from devnet import to_base58
 from fly_listener import Admissions, capture_ready, check_live_traffic, customer_policies
 from live_prestate import PrestateRefused
 from worker_build import BuildFailed
-from worker_vote import CandidateRejected
+from worker_vote import CandidateRejected, ReplayIncomplete
 
 
 class AttestationPipelineTest(unittest.TestCase):
@@ -64,6 +66,54 @@ class AttestationPipelineTest(unittest.TestCase):
         self.assertEqual(cache[self.proposal]["build_attempts"], 2)
         active, _, outcome, _ = self.run_cycles(failing, slots=(111, 112, 113))
         self.assertEqual((active, outcome), ([], ("refused", "candidate build failed: cargo exited with 101")))
+
+    def test_incomplete_replay_is_not_a_candidate_rejection(self):
+        active, _, outcome, _ = self.run_cycles(Mock(side_effect=ReplayIncomplete("baseline failed at 1:0")))
+        self.assertEqual((active, outcome), ([], ("refused", "replay evidence incomplete: baseline failed at 1:0")))
+        self.assertEqual(self.notice.call_args.args[0], "ReplayFailed")
+
+    def test_verification_runs_beside_the_event_loop(self):
+        release = Event()
+        attestor = Mock(side_effect=lambda *_: release.wait(10) and dict(
+            status="voted", signature="sig", verifier="node", diff_root="aa", replayed_tx_count=2,
+            max_cu_delta_bps=0))
+        cache = {self.proposal: {"expires_at": self.now.timestamp() + 60}}
+        running = {}
+        with closing(sqlite3.connect(":memory:")) as db, ThreadPoolExecutor(max_workers=1) as pool, patch(
+                "fly_listener.replay_archive", return_value={"records": [1]}):
+            ledger = Admissions(db, self.policies)
+            ledger.consume(self.event, self.now, enqueue=True)
+            started = time.monotonic()
+            check_live_traffic(ledger, cache, 111, self.now, self.notice, attestor, pool, running)
+            # The listener returns to event ingestion while the build is still running.
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual((len(ledger.active_jobs()), list(running)), (1, [self.proposal]))
+            release.set()
+            running[self.proposal].result(timeout=10)
+            check_live_traffic(ledger, cache, 112, self.now, self.notice, attestor, pool, running)
+            self.assertEqual(ledger.active_jobs(), [])
+            self.assertEqual(db.execute("SELECT status FROM job_outcomes").fetchone(), ("voted",))
+            self.assertEqual(attestor.call_count, 1)
+        self.assertEqual(running, {})
+
+    def test_outcome_discards_the_job_files(self):
+        from fly_listener import Attestor
+        with TemporaryDirectory() as tmp:
+            job = Path(tmp) / self.proposal
+            job.mkdir()
+            (job / "archive.json").write_text("{}")
+            (job / "evidence.json").write_text("{}")
+            attestor = Attestor("canary-gate", "toolchain", Path(tmp), None, "gate")
+            with patch.object(Attestor, "__call__", side_effect=CandidateRejected("post-state differs")):
+                self.run_cycles(attestor)
+            self.assertEqual(sorted(p.name for p in job.iterdir()), ["evidence.json"])
+            (job / "archive.json").write_text("{}")
+            keep = Attestor("canary-gate", "toolchain", Path(tmp), None, "gate", keep_files=True)
+            keep.discard(self.proposal)
+            keep.discard_all()
+            self.assertTrue((job / "archive.json").exists())
+            attestor.discard_all()
+            self.assertFalse((job / "archive.json").exists())
 
     def test_transient_errors_keep_the_job(self):
         attestor = Mock(side_effect=RuntimeError("getSlot: endpoint unavailable"))
