@@ -1,0 +1,58 @@
+{
+  "environment": "Fly.io Sprite qeket-test, 8 vCPU",
+  "engine": "LiteSVM 0.7.1",
+  "instruction": "submit_verified_attestation",
+  "transaction": "[Ed25519SigVerify, submit_verified_attestation] signed and executed on each iteration",
+  "command": "canary-gate fuzz-votes canary_upgrade_gate.so 1000000 SEED",
+  "runner_commit": "a1a8e24a31f3a9fc70f99a571c5faa1714be6d94",
+  "harness_sha256": "cbd7a1a97be207a6a59e2a92a7b90a95e57724eb39e6f31e2aed7dcae093e327",
+  "cargo_lock_sha256": "780eba1d8083e4504d16c56269283bd4c34007bd71620b994f465f1057ec1212",
+  "gate_elf_sha256": "0c0d7252e45fdbde344aeb55db4640991b39b8ef8656687e8ad40a4be9b80176",
+  "checks": [
+    "quorum_reached sets Ready, count 2, bitmap 3, the voted diff_root and ready_at",
+    "every refused vote leaves the proposal account byte-identical",
+    "invalid_signature is rejected by the precompile as InstructionError(0, Custom(2))",
+    "InvalidSignatureInstruction covers offset index 0 instead of the u16::MAX self-reference"
+  ],
+  "runs": [
+    {
+      "seed": 1795204278,
+      "iterations": 1000000,
+      "unexpected_outcomes": 0,
+      "outcomes": {
+        "AlreadyVoted": 90945,
+        "Expired": 90793,
+        "InvalidSignatureInstruction": 91485,
+        "InvalidWindow": 90744,
+        "ReplayPolicy": 90829,
+        "RootMismatch": 90898,
+        "UnknownVerifier": 90731,
+        "WrongPayload": 90700,
+        "WrongStatus": 91063,
+        "invalid_signature": 90963,
+        "quorum_reached": 90849
+      },
+      "wall_seconds": 266.889
+    },
+    {
+      "seed": 3141592653,
+      "iterations": 1000000,
+      "unexpected_outcomes": 0,
+      "outcomes": {
+        "AlreadyVoted": 90277,
+        "Expired": 90516,
+        "InvalidSignatureInstruction": 90762,
+        "InvalidWindow": 91209,
+        "ReplayPolicy": 90884,
+        "RootMismatch": 91094,
+        "UnknownVerifier": 90832,
+        "WrongPayload": 90517,
+        "WrongStatus": 91333,
+        "invalid_signature": 91367,
+        "quorum_reached": 91209
+      },
+      "wall_seconds": 267.264
+    }
+  ],
+  "note": "The first seed reproduces the outcome counts of the developer's earlier uncommitted Sprite run of the same harness."
+}
