@@ -1,14 +1,28 @@
 # Independent Fly verifiers
 
-Each verifier uses its own signing Machine and a dedicated build Machine in the same Fly private network. The build host fetches and compiles the customer's commit. The signing Machine receives the resulting ELF over SSH, compares it with the proposal, replays the archive and signs the evidence. Budget for four Machines and their volumes when deploying both pairs.
+Two apps, one Machine each: `canary-verifier-a` in `fra` and `canary-verifier-b` in `iad`. Each Machine listens for gate proposals, captures the live pre-state, rebuilds the candidate in an offline Docker container, replays the window with `canary-gate` and signs its vote. Each has its own Solana key and its own SQLite ledger on a 10 GB volume.
 
-For each suffix `a` and `b`, provision the apps named in the matching TOML files. Generate distinct Ed25519 SSH client and host keys for each pair. Install the following as Fly secrets using the original multiline OpenSSH format for private keys.
+## Setup for each app
 
-| App | Secrets |
-| --- | --- |
-| `canary-builder-<suffix>` | `BUILDER_HOST_KEY` is the SSH host private key. `BUILDER_CLIENT_PUBKEY` is the matching verifier's SSH client public key. |
-| `canary-verifier-<suffix>` | `CANARY_BUILDER_SSH_KEY` is its SSH client private key. `CANARY_BUILDER_KNOWN_HOSTS` is a single line of the form `[canary-builder-<suffix>.internal]:2222 ssh-ed25519 <host-public-key-base64>`. Install the verifier's own `CANARY_VERIFIER_KEYPAIR`, `RPC_URL` and `CANARY_CUSTOMERS` here. |
+1. Create the app and set its secrets:
 
-The builder accepts only the fixed build command over the private network. Its host key must match the pinned key on the verifier. Each signing Machine has its own Solana key and runs without Docker socket access.
+   | Secret | Value |
+   | --- | --- |
+   | `CANARY_VERIFIER_KEYPAIR` | This verifier's own vote key. Generate it locally with `python scripts/solana_tx.py keygen`, which prints the secret on stdout and the address on stderr. Never derive it from a CI secret. |
+   | `CANARY_CUSTOMERS` | The customer policies (see the main README). |
+   | `RPC_URL` | Optional. The deploy workflow copies the repository's `RPC_URL` if the app has none. |
+   | `CANARY_ADMIN_TOKEN`, `HELIUS_WEBHOOK_AUTHORIZATION`, `CANARY_SLACK_WEBHOOK`, `CANARY_TELEGRAM_BOT_TOKEN`, `CANARY_TELEGRAM_CHAT_ID` | Optional status endpoint, webhook ingress and operator notices. |
 
-Install four app-scoped deploy tokens in GitHub Actions as `FLY_API_TOKEN_BUILDER_A`, `FLY_API_TOKEN_BUILDER_B`, `FLY_API_TOKEN_VERIFIER_A` and `FLY_API_TOKEN_VERIFIER_B`. Run **Deploy Fly verifiers** to deploy each builder before its verifier. The health endpoint reports worker checkpoint progress and pending cleanup. A successful deployment still needs a finalized Devnet vote from each verifier to demonstrate that its build host, RPC and signing key work together.
+2. Create an app-scoped deploy token and store it in GitHub Actions as `FLY_API_TOKEN_VERIFIER_A` or `FLY_API_TOKEN_VERIFIER_B`.
+
+3. Run **Deploy Fly verifiers**. It refuses to deploy an app that lacks `CANARY_VERIFIER_KEYPAIR` or `CANARY_CUSTOMERS`.
+
+The first start downloads platform-tools v1.58 to the volume and checks its SHA-256. `CANARY_CLUSTER` in the TOML files selects `devnet` or `mainnet-beta`. The worker refuses an `RPC_URL` from another cluster.
+
+## Isolation
+
+Builds run in Docker with no network, no capabilities and a read-only source tree. The listener needs the Docker socket to start them, which amounts to root on the Machine, where its vote key also lives. A container escape would expose that key. Both verifiers build the same proposer-chosen commit, and their keys are shared by all customers. This is accepted for Devnet.
+
+Before Mainnet, move builds to a Machine without a vote key. Set `CANARY_BUILDER_HOST` to that host. The worker then sends the build request over SSH, with a pinned host key, to the restricted command `worker_build.py serve-build`. The Fly configuration for such a build host is in commit `9238584`.
+
+A successful deployment still needs a finalized Devnet vote from each verifier to show that its build, RPC and signing key work together.
