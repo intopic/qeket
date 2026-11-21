@@ -362,6 +362,7 @@ pub fn run(
         cu_limit_bps: config.policy.max_cu_delta_bps,
         accounts: vec![],
         clocks: vec![],
+        final_accounts: vec![],
         records: vec![],
     };
     let capture_started = Instant::now();
@@ -1064,6 +1065,23 @@ fn check_replay_modes(captured: &Archive, baseline: &[u8], candidate: &[u8]) -> 
         first == verify(&archive, baseline, candidate)?,
         "non-deterministic relaxed evidence"
     );
+    // A reconstructed account must end where the chain says it ended.
+    let mut ended = archive.clone();
+    ended.final_accounts = vec![(
+        payer.pubkey(),
+        Some(Account {
+            lamports: 1,
+            ..Account::default()
+        }),
+    )];
+    check_error(&ended, "final state differs for reconstructed account")?;
+    let error = verify(&ended, baseline, candidate)
+        .err()
+        .context("unexpected successful replay")?;
+    ensure!(
+        !crate::replay::is_candidate_fault(&error),
+        "incomplete evidence was reported as a candidate fault"
+    );
     let mut unchanged = archive.clone();
     unchanged.expected_elf = hash(baseline);
     unchanged
@@ -1078,6 +1096,10 @@ fn check_replay_modes(captured: &Archive, baseline: &[u8], candidate: &[u8]) -> 
     );
     archive.cu_limit_bps = 0;
     check_error(&archive, "compute policy exceeded")?;
+    ensure!(
+        crate::replay::is_candidate_fault(&verify(&archive, baseline, candidate).unwrap_err()),
+        "a compute regression must be a candidate fault"
+    );
     archive.cu_limit_bps = u16::MAX;
     let counter_state = archive
         .accounts
