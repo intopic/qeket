@@ -185,6 +185,15 @@ def run():
     if event["proposal"] != str(proposal) or event["target"] != str(target) or event["replay_slots"] != span:
         raise ValueError("unexpected proposal event")
     start = event["anchor_slot"]
+    if external:
+        # Workers capture the pre-state within 32 slots of the anchor. With
+        # Alpenglow finality the cycle sees the proposal within a few slots, and
+        # earlier traffic would change the counter before their snapshot.
+        deadline = time.monotonic() + 120
+        while rpc("getSlot", FINAL) <= start + 32:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("anchor capture window did not close")
+            time.sleep(1)
     traffic_key = key("traffic")
     bh = Hash.from_string(rpc("getLatestBlockhash", FINAL)["value"]["blockhash"])
     sample_signatures = []
