@@ -15,15 +15,9 @@ jobs:
         include:
           - app: canary-verifier-a
             config: fly.verifier-a.toml
-            builder: canary-builder-a
-            builder_config: fly.builder-a.toml
-            builder_token: FLY_API_TOKEN_BUILDER_A
             token: FLY_API_TOKEN_VERIFIER_A
           - app: canary-verifier-b
             config: fly.verifier-b.toml
-            builder: canary-builder-b
-            builder_config: fly.builder-b.toml
-            builder_token: FLY_API_TOKEN_BUILDER_B
             token: FLY_API_TOKEN_VERIFIER_B
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -48,7 +42,7 @@ jobs:
               names="$names RPC_URL"
             fi;;
           esac
-          for name in RPC_URL CANARY_VERIFIER_KEYPAIR CANARY_CUSTOMERS CANARY_BUILDER_SSH_KEY CANARY_BUILDER_KNOWN_HOSTS; do
+          for name in RPC_URL CANARY_VERIFIER_KEYPAIR CANARY_CUSTOMERS; do
             case " $names " in *" $name "*) ;; *) echo "missing Fly secret $name on ${{ matrix.app }}"; exit 1;; esac
           done
       - name: Stage build context
@@ -58,14 +52,6 @@ jobs:
           cp -r Cargo.toml Cargo.lock crates programs "$context/"
           cp scripts/{devnet,live_capture,live_prestate,fly_listener,customer_admin,worker_http,worker_notify,solana_tx,worker_build,worker_vote}.py "$context/scripts/"
           cp deploy/fly/verifier/* "$context/deploy/fly/verifier/"
-      - name: Deploy dedicated build host
-        working-directory: ${{ runner.temp }}/context
-        env:
-          FLY_API_TOKEN: ${{ secrets[matrix.builder_token] }}
-        run: |
-          test -n "$FLY_API_TOKEN"
-          flyctl secrets list -a ${{ matrix.builder }} --json | python3 -c 'import json,sys; names={s.get("name",s.get("Name")) for s in json.load(sys.stdin)}; assert {"BUILDER_CLIENT_PUBKEY","BUILDER_HOST_KEY"} <= names; assert not {"CANARY_VERIFIER_KEYPAIR","RPC_URL"} & names'
-          flyctl deploy --remote-only --ha=false -a ${{ matrix.builder }} -c deploy/fly/verifier/${{ matrix.builder_config }} --dockerfile deploy/fly/verifier/Dockerfile.builder
       - name: Deploy
         working-directory: ${{ runner.temp }}/context
         run: flyctl deploy --remote-only --ha=false -a ${{ matrix.app }} -c deploy/fly/verifier/${{ matrix.config }} --dockerfile deploy/fly/verifier/Dockerfile

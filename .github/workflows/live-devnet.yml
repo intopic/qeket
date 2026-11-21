@@ -131,40 +131,6 @@ jobs:
           name: devnet-live-${{ github.run_id }}
           path: target/live/
           if-no-files-found: ignore
-      - name: Check optional Fly.io connection
-        if: success() && github.event_name == 'workflow_dispatch'
-        id: fly
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: |
-          if [ -n "$FLY_API_TOKEN" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"; fi
-      - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200
-        if: steps.fly.outputs.enabled == 'true'
-      - name: Deploy proposal listener
-        if: steps.fly.outputs.enabled == 'true'
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          FLY_APP: ${{ vars.FLY_APP }}
-          CANARY_CUSTOMERS: ${{ secrets.CANARY_CUSTOMERS }}
-          HELIUS_WEBHOOK_AUTHORIZATION: ${{ secrets.HELIUS_WEBHOOK_AUTHORIZATION }}
-          CANARY_ADMIN_TOKEN: ${{ secrets.CANARY_ADMIN_TOKEN }}
-          CANARY_SLACK_WEBHOOK: ${{ secrets.CANARY_SLACK_WEBHOOK }}
-          CANARY_TELEGRAM_BOT_TOKEN: ${{ secrets.CANARY_TELEGRAM_BOT_TOKEN }}
-          CANARY_TELEGRAM_CHAT_ID: ${{ secrets.CANARY_TELEGRAM_CHAT_ID }}
-          CANARY_VERIFIER_PUBKEY: ${{ vars.CANARY_VERIFIER_PUBKEY }}
-          RPC_URL: ${{ secrets.RPC_URL }}
-        run: |
-          gate=$(python -c 'import sys;sys.path.insert(0,"scripts");from live_cycle import key;print(key("gate").pubkey())')
-          app="${FLY_APP:-canary-$(echo "$gate" | cut -c1-16 | tr '[:upper:]' '[:lower:]')}"
-          PYTHONPATH=scripts python -c 'import os; from fly_listener import customer_policies; customer_policies(os.environ["CANARY_CUSTOMERS"])'
-          flyctl status -a "$app" >/dev/null 2>&1 || flyctl apps create "$app" --org personal
-          python -c 'import json,os,sys; print("RPC_URL="+os.environ["RPC_URL"]); print("GATE_PROGRAM_ID="+sys.argv[1]); print("CANARY_CUSTOMERS="+json.dumps(json.loads(os.environ["CANARY_CUSTOMERS"]))); [print(k+"="+os.environ[k]) for k in ("HELIUS_WEBHOOK_AUTHORIZATION","CANARY_ADMIN_TOKEN","CANARY_SLACK_WEBHOOK","CANARY_TELEGRAM_BOT_TOKEN","CANARY_TELEGRAM_CHAT_ID","CANARY_VERIFIER_PUBKEY") if os.environ.get(k)]' "$gate" | flyctl secrets import --stage -a "$app"
-          context="$RUNNER_TEMP/fly-worker"
-          mkdir -p "$context/scripts" "$context/deploy/fly"
-          cp scripts/{devnet,live_capture,live_prestate,fly_listener,customer_admin,worker_http,worker_notify,solana_tx,worker_build,worker_vote}.py "$context/scripts/"
-          cp deploy/fly/* "$context/deploy/fly/"
-          cd "$context"
-          flyctl deploy --ha=false --remote-only -c deploy/fly/fly.toml -a "$app"
 
   verifier:
     name: verifier-${{ matrix.node }}

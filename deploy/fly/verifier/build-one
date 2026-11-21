@@ -1,6 +1,0 @@
-#!/bin/sh
-set -eu
-export CANARY_PLATFORM_TOOLS=/data/platform-tools PATH=/data/platform-tools/rust/bin:$PATH
-export TMPDIR=/data/tmp
-export CANARY_DOCKER_RESOURCE_LIMITS=0
-exec python /worker/worker_build.py serve-build
