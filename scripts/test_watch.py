@@ -1,11 +1,102 @@
+import base64
+import struct
 import unittest
 from unittest.mock import patch
 
 import live_capture
+from live_capture import EVENT, GATE
 
 
 class Stop(Exception):
     pass
+
+
+def proposal_logs(proposal, program=GATE):
+    raw = EVENT + bytes([proposal]) * 32 + bytes([1]) * 32 + struct.pack("<QQQ", 0, 90, 10)
+    return [f"Program {program} invoke [1]", "Program data: " + base64.b64encode(raw).decode(),
+            f"Program {program} success"]
+
+
+def block_tx(signature, logs, err=None):
+    return {"transaction": {"signatures": [signature]}, "meta": {"err": err, "logMessages": logs}}
+
+
+# Slot 100 holds more successful gate transactions than gate_history reads.
+BUSY_BLOCK = {"transactions": [
+    block_tx("other", proposal_logs(9, program="11111111111111111111111111111111")),
+    block_tx("first", proposal_logs(2)),
+    block_tx("failed", proposal_logs(3), err={"InstructionError": [0, "InvalidArgument"]}),
+    block_tx("second", proposal_logs(4)),
+]}
+
+
+class BusySlotTest(unittest.TestCase):
+    def watch_busy_slot(self, blocks, tip=100):
+        page = [{"slot": 100, "signature": f"s{i}", "err": None} for i in range(100)]
+        reads, events, checkpoints, waits = [], [], [], []
+
+        def rpc(method, *params):
+            if method == "getSlot":
+                return tip
+            if method == "getSignaturesForAddress":
+                return page
+            if method == "getBlock":
+                reads.append(params[0])
+                result = blocks.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            raise AssertionError(method)
+
+        def checkpoint(cursor):
+            checkpoints.append(cursor)
+            if cursor > tip:
+                raise Stop
+
+        with patch("live_capture.rpc", side_effect=rpc), self.assertRaises(Stop):
+            live_capture.watch(100, on_event=events.append, checkpoint=checkpoint, wait=waits.append)
+        return reads, events, checkpoints, waits
+
+    def assert_busy_events(self, events):
+        self.assertEqual([(e["proposal"], e["signature"], e["slot"]) for e in events], [
+            (live_capture.to_base58(bytes([2]) * 32), "first", 100),
+            (live_capture.to_base58(bytes([4]) * 32), "second", 100),
+        ])
+
+    def test_busy_slot_is_read_from_its_block_in_order(self):
+        reads, events, checkpoints, waits = self.watch_busy_slot([BUSY_BLOCK])
+        self.assertEqual((reads, checkpoints, waits), ([100], [101], []))
+        self.assert_busy_events(events)
+
+    def test_busy_slot_block_read_is_retried_on_a_node_behind(self):
+        """A node that has not stored the block must not stop the listener or skip the slot."""
+        reads, events, checkpoints, waits = self.watch_busy_slot([
+            None,
+            RuntimeError("getBlock: -32004 Block not available for slot 100, logs=None"),
+            RuntimeError("getBlock: -32016 Minimum context slot has not been reached, logs=None"),
+            BUSY_BLOCK,
+        ])
+        self.assertEqual((reads, checkpoints, waits), ([100] * 4, [101], [1, 1, 1]))
+        self.assert_busy_events(events)
+
+    def test_busy_slot_other_block_failures_still_raise(self):
+        def rpc(method, *params):
+            if method == "getSlot":
+                return 100
+            if method == "getSignaturesForAddress":
+                return [{"slot": 100, "signature": "s", "err": None}] * 100
+            raise RuntimeError("getBlock: HTTP 400")
+
+        with patch("live_capture.rpc", side_effect=rpc), self.assertRaisesRegex(RuntimeError, "HTTP 400"):
+            live_capture.watch(100, wait=lambda _: None)
+
+    def test_busy_range_is_split_down_to_the_busy_slot(self):
+        reads, events, checkpoints, waits = self.watch_busy_slot([BUSY_BLOCK], tip=107)
+        # 100..107 and its halves exceed the limit. Slot 100 alone is read from
+        # its block, then the window grows again past the busy slot.
+        self.assertEqual(reads, [100])
+        self.assertEqual(checkpoints, [101, 103, 107, 108])
+        self.assert_busy_events(events)
 
 
 class WatchTest(unittest.TestCase):

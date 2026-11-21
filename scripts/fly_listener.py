@@ -496,6 +496,61 @@ def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attesto
                 on_notice(notice, dict(proposal=proposal, reason=reason))
 
 
+LIVE_CACHE_BYTES = 16 * 1024 * 1024
+
+
+def collect_captures(admissions, captures, live_jobs, now, on_notice):
+    """Move finished live pre-state captures into the cache, or refuse their jobs."""
+    for proposal, future in list(captures.items()):
+        if not future.done():
+            continue
+        del captures[proposal]
+        try:
+            bundle = future.result()
+            if sum(b["encoded_bytes"] for b in live_jobs.values()) + bundle["encoded_bytes"] > LIVE_CACHE_BYTES:
+                raise PrestateRefused("live pre-state cache is full")
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, PrestateRefused) else "unable to read consistent live pre-state"
+            if admissions.finish(proposal, now, "refused", reason):
+                on_notice("ReplayFailed", dict(proposal=proposal, reason=reason))
+            continue
+        if proposal not in {job["proposal"] for job in admissions.active_jobs()}:
+            # The job closed while its capture ran. Nothing would ever release the state.
+            continue
+        live_jobs[proposal] = bundle
+        admissions.record_prestate(proposal, bundle["capture_slot"])
+
+
+def reconcile_votes(admissions, interrupted_votes, now, on_notice, gate=GATE):
+    """Settle votes that may have been sent before a restart, from finalized chain state.
+
+    `interrupted_votes` maps a proposal to (job, receipt), where the receipt is the
+    vote-intent.json written just before the vote was sent. A job stays open while
+    its vote can still land.
+    """
+    for proposal, (job, receipt) in list(interrupted_votes.items()):
+        try:
+            evidence = receipt["evidence"]
+            if finalized_vote(job, receipt, evidence, receipt["verifier"], gate):
+                root = bytes(evidence["diff_root"]).hex()
+                admissions.finish(proposal, now, "voted", f"vote confirmed on chain; diff_root {root}")
+                on_notice("VoteSubmitted", dict(proposal=proposal, verifier=receipt["verifier"], diff_root=root))
+            elif rpc("getBlockHeight", {"commitment": "finalized"}) > receipt["last_height"]:
+                # Re-read after the finalized expiry height in case the vote landed between reads.
+                if finalized_vote(job, receipt, evidence, receipt["verifier"], gate):
+                    continue
+                admissions.finish(proposal, now, "refused", "interrupted vote expired without confirmation")
+            else:
+                continue
+        except (RuntimeError, OSError):
+            continue
+        except (KeyError, ValueError, TypeError) as exc:
+            admissions.finish(proposal, now, "refused", f"vote reconciliation failed: {exc}")
+        if receipt.get("executed"):
+            admissions.record_executed(proposal)
+        del interrupted_votes[proposal]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", default="/data/admissions.sqlite3")
@@ -548,23 +603,6 @@ def main():
         captures = {}
         capture_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="prestate")
 
-        def collect_captures():
-            for proposal, future in list(captures.items()):
-                if not future.done():
-                    continue
-                del captures[proposal]
-                try:
-                    bundle = future.result()
-                    if sum(b["encoded_bytes"] for b in live_jobs.values()) + bundle["encoded_bytes"] > 16 * 1024 * 1024:
-                        raise PrestateRefused("live pre-state cache is full")
-                except Exception as exc:
-                    reason = str(exc) if isinstance(exc, PrestateRefused) else "unable to read consistent live pre-state"
-                    admissions.finish(proposal, datetime.now(timezone.utc), "refused", reason)
-                    notify("ReplayFailed", dict(proposal=proposal, reason=reason))
-                    continue
-                live_jobs[proposal] = bundle
-                admissions.record_prestate(proposal, bundle["capture_slot"])
-
         def refresh_policies():
             admissions.policies = load_policies()
 
@@ -608,34 +646,14 @@ def main():
             nonlocal next_capture, balance_check, low_balance, last_checkpoint
             admissions.checkpoint(slot)
             last_checkpoint = time.monotonic()
-            collect_captures()
+            collect_captures(admissions, captures, live_jobs, datetime.now(timezone.utc), notify)
             if time.monotonic() >= next_capture:
                 refresh_policies()
                 if attestor is not None:
                     for proposal in list(attestor.pending_cleanup):
                         attestor.discard(proposal)
                 now = datetime.now(timezone.utc)
-                for proposal, (job, receipt) in list(interrupted_votes.items()):
-                    try:
-                        evidence = receipt["evidence"]
-                        if finalized_vote(job, receipt, evidence, receipt["verifier"], GATE):
-                            root = bytes(evidence["diff_root"]).hex()
-                            admissions.finish(proposal, now, "voted", f"vote confirmed on chain; diff_root {root}")
-                            notify("VoteSubmitted", dict(proposal=proposal, verifier=receipt["verifier"], diff_root=root))
-                        elif rpc("getBlockHeight", {"commitment": "finalized"}) > receipt["last_height"]:
-                            # Re-read after the finalized expiry height in case the vote landed between reads.
-                            if finalized_vote(job, receipt, evidence, receipt["verifier"], GATE):
-                                continue
-                            admissions.finish(proposal, now, "refused", "interrupted vote expired without confirmation")
-                        else:
-                            continue
-                    except (RuntimeError, OSError):
-                        continue
-                    except (KeyError, ValueError, TypeError) as exc:
-                        admissions.finish(proposal, now, "refused", f"vote reconciliation failed: {exc}")
-                    if receipt.get("executed"):
-                        admissions.record_executed(proposal)
-                    del interrupted_votes[proposal]
+                reconcile_votes(admissions, interrupted_votes, now, notify)
                 check_live_traffic(admissions, live_jobs, slot, now, notify, attestor, executor, running)
                 capture_ready(admissions, args.snapshots, slot, now, notify, live_jobs)
                 next_capture = time.monotonic() + 30

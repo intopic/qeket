@@ -125,6 +125,26 @@ def gate_history(cursor, tip):
     return items
 
 
+def slot_history(slot):
+    """Successful transactions of one finalized slot, in block order.
+
+    Used when a single slot holds more gate transactions than gate_history reads.
+    gate_events only reports lines logged by the gate, so other programs in the
+    block are ignored.
+    """
+    try:
+        confirmed = block(slot, "json")
+    except RuntimeError as exc:
+        # -32004 "Block not available for slot": this node has not stored it yet.
+        if "-32004" in str(exc):
+            raise NodeBehind(str(exc)) from None
+        raise
+    if not confirmed:
+        raise NodeBehind("finalized gate block unavailable")
+    return [(dict(slot=slot, signature=item["transaction"]["signatures"][0]), item)
+            for item in confirmed["transactions"] if item.get("meta") and item["meta"]["err"] is None]
+
+
 def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_lifecycle=None):
     cursor = start if start is not None else rpc("getSlot", FINAL)
     span = 64
@@ -134,18 +154,15 @@ def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_life
             wait(1)
             continue
         try:
-            items = gate_history(cursor, tip)
-        except HistoryLimit:
-            if cursor == tip:
-                # One busy slot cannot be split. Use the block's own order.
-                confirmed = block(cursor, "json")
-                if not confirmed:
-                    raise NodeBehind("finalized gate block unavailable")
-                items = [(dict(slot=cursor, signature=item["transaction"]["signatures"][0]), item)
-                         for item in confirmed["transactions"] if item.get("meta") and item["meta"]["err"] is None]
-            else:
-                span = max(1, (tip - cursor + 1) // 2)
-                continue
+            try:
+                items = gate_history(cursor, tip)
+            except HistoryLimit:
+                if cursor < tip:
+                    span = max(1, (tip - cursor + 1) // 2)
+                    continue
+                # One busy slot cannot be split. Its block read is retried
+                # like any other history read.
+                items = slot_history(cursor)
         except RuntimeError as exc:
             if not behind(exc):
                 raise
