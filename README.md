@@ -115,7 +115,7 @@ Mund të caktohen `active`, `cooldown_minutes`, `max_upgrades_per_month` dhe `ma
 
 ### Dy verifikues të pavarur në Fly.io
 
-`deploy/fly/verifier/` publikon dy aplikacione: `canary-verifier-a` në `fra` dhe `canary-verifier-b` në `iad`. Secili ka `shared-cpu-2x`, 2 GB RAM, 2 GB swap dhe volum `/data` 20 GB. Imazhi përmban `canary-gate`, të ndërtuar me ID-në e gate-it Devnet, dhe Docker. Në nisjen e parë, worker-i shkarkon platform-tools v1.58 në volum dhe kontrollon SHA-256. Build-et e kandidatit përdorin të njëjtin kontejner offline si CI-ja.
+Çdo verifikues në Fly.io përdor dy makina. Makina nënshkruese ekzekuton `canary-gate` dhe mban çelësin Solana. Makina e dedikuar e build-it shkarkon platform-tools v1.58, kontrollon SHA-256 dhe ndërton kandidatin në Docker offline. Dy çiftet vendosen në `fra` dhe `iad`. Emrat e aplikacioneve, çelësat SSH dhe lidhja private për secilin çift përshkruhen te [konfigurimi Fly](deploy/fly/verifier/README.md).
 
 Gjenero çelësin e votës veçmas për secilin aplikacion, në kompjuterin tënd. Çelësi sekret shkon vetëm te `fly secrets`, ndërsa adresa publike shfaqet në ekran:
 
@@ -123,7 +123,7 @@ Gjenero çelësin e votës veçmas për secilin aplikacion, në kompjuterin tën
 fly secrets set -a canary-verifier-a CANARY_VERIFIER_KEYPAIR="$(python scripts/solana_tx.py keygen)"
 ```
 
-Workflow-i **Deploy Fly verifiers** kërkon secret-et e repos `FLY_API_TOKEN_VERIFIER_A` dhe `FLY_API_TOKEN_VERIFIER_B`. Nëse aplikacioni nuk ka `RPC_URL`, workflow-i e merr nga secret-i `RPC_URL` i repos. Deploy-i ndalet nëse mungon `CANARY_VERIFIER_KEYPAIR` ose `CANARY_CUSTOMERS`.
+Workflow-i **Deploy Fly verifiers** përdor nga një token të kufizuar për secilin nga katër aplikacionet. Makina e build-it publikohet para verifikuesit të saj. Nëse verifikuesi nuk ka `RPC_URL`, workflow-i e merr nga secret-i `RPC_URL` i repos.
 
 ### Adapteri Squads v4
 

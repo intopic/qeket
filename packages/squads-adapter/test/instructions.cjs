@@ -13,6 +13,9 @@ test("Squads signer, account order and instruction arguments", () => {
   };
   const [vault] = getVaultPda({ multisigPda: input.multisigPda, index: 0 });
   const ix = adapter.proposeBufferUpgrade(input);
+  assert.throws(() => adapter.initializeGatekeeper({
+    ...input, emergency: key(), policy: { replayMode: "strict" },
+  }), /invalid replay mode/);
   assert.ok(ix.keys[0].pubkey.equals(vault) && ix.keys[0].isSigner && ix.keys[0].isWritable);
   assert.ok(ix.keys[1].pubkey.equals(vault) && ix.keys[1].isSigner);
   assert.ok(ix.keys[4].pubkey.equals(input.buffer));

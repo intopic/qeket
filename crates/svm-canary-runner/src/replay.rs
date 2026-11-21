@@ -413,6 +413,7 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
     let mut signatures = BTreeSet::new();
     let mut leaves = Vec::new();
     let mut peak = 0u16;
+    let mut candidate_error = None;
     for record in records {
         ensure!(
             positions.insert((record.slot, record.index)),
@@ -441,12 +442,6 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
         );
         let msg = &tx.message;
         let keys = resolve_keys(&old, tx, clock.slot, !archive.slot_hashes.is_empty())?;
-        if !msg.address_table_lookups().unwrap_or_default().is_empty() {
-            ensure!(
-                keys == resolve_keys(&new, tx, clock.slot, !archive.slot_hashes.is_empty())?,
-                "lookup resolution diverged"
-            );
-        }
         for key in &keys {
             ensure!(
                 *key == archive.target
@@ -458,6 +453,7 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
                 "missing account snapshot for {key}"
             );
         }
+        let mut candidate_priority_fee = 0;
         if let Some(observed) = &record.baseline {
             observed
                 .check_balances(&old, &keys, &observed.pre_balances, &archive.target)
@@ -477,7 +473,7 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
             // LiteSVM omits so programs and later transactions see the same balance.
             if priority_fee > 0 {
                 debit(&mut old, &keys[0], priority_fee)?;
-                debit(&mut new, &keys[0], priority_fee)?;
+                candidate_priority_fee = priority_fee;
             }
         }
         let a = old.send_transaction(tx.clone()).map_err(|e| {
@@ -501,65 +497,81 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
                 record.index
             );
         }
-        let b = new.send_transaction(tx.clone()).map_err(|e| {
-            CandidateFault(format!(
-                "candidate failed at {}:{}: {:?}",
-                record.slot, record.index, e
-            ))
-        })?;
         ensure!(
             invoked(tx, &keys, archive.target, &a),
             "target was not invoked"
         );
-        ensure!(
-            invoked(tx, &keys, archive.target, &b),
-            CandidateFault(format!(
-                "candidate did not invoke the target at {}:{}",
-                record.slot, record.index
-            ))
-        );
-        let strict = archive.replay_mode == ReplayMode::StrictEquality;
-        ensure!(
-            !strict || a.return_data == b.return_data,
-            CandidateFault("return data changed".into())
-        );
         ensure!(a.compute_units_consumed > 0, "missing compute measurement");
-        let growth = u128::from(
-            b.compute_units_consumed
-                .saturating_sub(a.compute_units_consumed),
-        ) * 10_000;
-        let bp = growth.div_ceil(u128::from(a.compute_units_consumed));
-        ensure!(
-            bp <= u128::from(archive.cu_limit_bps),
-            CandidateFault("compute policy exceeded".into())
-        );
-        peak = peak.max(bp as u16);
-        let writable: BTreeSet<_> = keys
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| msg.is_maybe_writable(*i, None))
-            .map(|(_, k)| *k)
-            .collect();
-        ensure!(!writable.is_empty(), "missing writable accounts");
-        for key in writable {
-            let before = old.get_account(&key);
-            let after = new.get_account(&key);
-            ensure!(
-                !strict || before == after,
+        if candidate_error.is_some() {
+            continue;
+        }
+        let comparison = (|| -> Result<()> {
+            if !msg.address_table_lookups().unwrap_or_default().is_empty() {
+                ensure!(
+                    keys == resolve_keys(&new, tx, clock.slot, !archive.slot_hashes.is_empty())?,
+                    "lookup resolution diverged"
+                );
+            }
+            if candidate_priority_fee > 0 {
+                debit(&mut new, &keys[0], candidate_priority_fee)?;
+            }
+            let b = new.send_transaction(tx.clone()).map_err(|e| {
                 CandidateFault(format!(
-                    "post-state differs for {key} at slot {}, index {}",
+                    "candidate failed at {}:{}: {:?}",
+                    record.slot, record.index, e
+                ))
+            })?;
+            ensure!(
+                invoked(tx, &keys, archive.target, &b),
+                CandidateFault(format!(
+                    "candidate did not invoke the target at {}:{}",
                     record.slot, record.index
                 ))
             );
-            let mut leaf = Sha256::new();
-            leaf.update(b"CANARY_STATE_V1");
-            leaf.update(record.slot.to_le_bytes());
-            leaf.update(record.index.to_le_bytes());
-            leaf.update(tx.signatures[0].as_ref());
-            leaf.update(key.as_ref());
-            leaf.update(hash(&bincode::serialize(&after)?));
-            leaves.push(leaf.finalize().into());
-        }
+            let strict = archive.replay_mode == ReplayMode::StrictEquality;
+            ensure!(
+                !strict || a.return_data == b.return_data,
+                CandidateFault("return data changed".into())
+            );
+            let growth = u128::from(
+                b.compute_units_consumed
+                    .saturating_sub(a.compute_units_consumed),
+            ) * 10_000;
+            let bp = growth.div_ceil(u128::from(a.compute_units_consumed));
+            ensure!(
+                bp <= u128::from(archive.cu_limit_bps),
+                CandidateFault("compute policy exceeded".into())
+            );
+            peak = peak.max(bp as u16);
+            let writable: BTreeSet<_> = keys
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| msg.is_maybe_writable(*i, None))
+                .map(|(_, k)| *k)
+                .collect();
+            ensure!(!writable.is_empty(), "missing writable accounts");
+            for key in writable {
+                let before = old.get_account(&key);
+                let after = new.get_account(&key);
+                ensure!(
+                    !strict || before == after,
+                    CandidateFault(format!(
+                        "post-state differs for {key} at slot {}, index {}",
+                        record.slot, record.index
+                    ))
+                );
+                let mut leaf = Sha256::new();
+                leaf.update(b"CANARY_STATE_V1");
+                leaf.update(record.slot.to_le_bytes());
+                leaf.update(record.index.to_le_bytes());
+                leaf.update(tx.signatures[0].as_ref());
+                leaf.update(key.as_ref());
+                leaf.update(hash(&bincode::serialize(&after)?));
+                leaves.push(leaf.finalize().into());
+            }
+            Ok(())
+        })();
+        candidate_error = comparison.err();
     }
     for (key, expected) in &archive.final_accounts {
         // A reconstructed starting state is only an assumption until the
@@ -576,6 +588,9 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
             _ => false,
         };
         ensure!(same, "final state differs for reconstructed account {key}");
+    }
+    if let Some(error) = candidate_error {
+        return Err(error);
     }
     Ok(Evidence {
         replay_mode: archive.replay_mode,

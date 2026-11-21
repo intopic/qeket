@@ -7,7 +7,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 import re
@@ -16,10 +16,10 @@ from urllib.parse import urlsplit
 from devnet import GENESIS, from_base58, to_base58
 from live_capture import GATE, UnsupportedReplayVersion, capture, rpc, watch
 from live_prestate import PrestateRefused, capture_prestate, replay_archive
-from worker_build import FEATURE, BuildFailed, build_candidate
+from worker_build import FEATURE, BuildFailed, build_candidate, remote_build
 from worker_http import start_http
 from worker_notify import notify
-from worker_vote import (CandidateRejected, ReplayIncomplete, VoteRefused, attest, discard_job_files,
+from worker_vote import (CandidateRejected, ReplayIncomplete, VoteRefused, attest, discard_job_files, finalized_vote,
                          load_keypair)
 
 MAX_BUILD_ATTEMPTS = 3
@@ -304,25 +304,41 @@ class Attestor:
     keypair: object
     gate: str
     keep_files: bool = False
+    load_policies: object = None
+    pending_cleanup: set = field(default_factory=set, compare=False)
 
     def build(self, policy, commit, work):
+        if host := os.environ.get("CANARY_BUILDER_HOST"):
+            return remote_build(host, policy, commit, work)
         return build_candidate(policy.repo_url, commit, policy.build_subdir or ".", policy.library_name,
                                policy.build_features, work, self.toolchain)
 
     def __call__(self, event, bundle, policy):
+        def authorize():
+            now = datetime.now(timezone.utc)
+            current = self.load_policies().get(event["target"]) if self.load_policies else policy
+            if (bundle.get("cancelled") or current != policy or not current.active
+                    or now >= current.expires or now.timestamp() > bundle["expires_at"]):
+                raise VoteRefused("proposal or customer authorization expired or changed")
         return attest(event, bundle, policy, self.jobs / event["proposal"], self.runner, self.build,
-                      self.keypair, self.gate)
+                      self.keypair, self.gate, authorize)
 
     def discard(self, proposal):
         """Customer state lives on disk only while canary-gate needs to read it."""
         if not self.keep_files and len(from_base58(proposal)) == 32:
-            discard_job_files(self.jobs / proposal)
+            try:
+                discard_job_files(self.jobs / proposal)
+            except OSError as exc:
+                self.pending_cleanup.add(proposal)
+                print(json.dumps(dict(event="cleanup_failed", proposal=proposal, error=type(exc).__name__)), flush=True)
+            else:
+                self.pending_cleanup.discard(proposal)
 
     def discard_all(self):
         if not self.keep_files and self.jobs.is_dir():
             for directory in self.jobs.iterdir():
                 if directory.is_dir():
-                    discard_job_files(directory)
+                    self.discard(directory.name)
 
 
 class InlineExecutor:
@@ -433,7 +449,20 @@ def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attesto
             outcome = "refused", "customer inactive", "ReplayFailed"
         elif now.timestamp() > bundle["expires_at"]:
             outcome = "refused", "proposal expired", "ReplayFailed"
-        else:
+        if outcome is not None and proposal in running:
+            bundle["cancelled"] = True
+            task = running[proposal]
+            if not task.cancel():
+                if not task.done():
+                    continue
+                try:
+                    _, completed = task.result()
+                    if completed and completed[0] == "voted":
+                        outcome = completed
+                except Exception as exc:
+                    print(json.dumps(dict(event="cancelled_job_error", proposal=proposal,
+                                          error=type(exc).__name__)), flush=True)
+        if outcome is None:
             finalized = event["anchor_slot"] + event["replay_slots"] < next_slot
             pending = "archive" not in bundle or attestor is not None
             if proposal not in running and finalized and pending:
@@ -492,9 +521,9 @@ def main():
         raise ValueError("expected Solana Devnet")
     keypair = load_keypair()
     runner, toolchain = os.environ.get("CANARY_GATE_BIN"), os.environ.get("CANARY_SBF_TOOLCHAIN")
-    tools = toolchain or os.environ.get("CANARY_PLATFORM_TOOLS")
+    tools = toolchain or os.environ.get("CANARY_PLATFORM_TOOLS") or os.environ.get("CANARY_BUILDER_HOST")
     keep = os.environ.get("CANARY_KEEP_JOB_FILES") == "1"
-    attestor = Attestor(runner, toolchain, args.jobs, keypair, GATE, keep) if runner and tools else None
+    attestor = Attestor(runner, toolchain, args.jobs, keypair, GATE, keep, load_policies) if runner and tools else None
     if attestor is not None:
         # Nothing survives a restart, so no captured state may either.
         attestor.discard_all()
@@ -505,11 +534,36 @@ def main():
     with closing(sqlite3.connect(args.database)) as database:
         admissions = Admissions(database, policies, notify)
         live_jobs = {}
+        interrupted_votes = {}
         # Time-sensitive live snapshots cannot be recovered from the disk after a restart.
         for job in admissions.active_jobs():
+            intent = args.jobs / job["proposal"] / "vote-intent.json"
+            if attestor and intent.is_file():
+                interrupted_votes[job["proposal"]] = (job, json.loads(intent.read_bytes()))
+                continue
             if job.get("live_prestate") or (policies.get(job["target"]) and policies[job["target"]].seed_accounts is not None):
                 admissions.finish(job["proposal"], datetime.now(timezone.utc),
                                   "refused", "live pre-state was lost on restart")
+
+        captures = {}
+        capture_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="prestate")
+
+        def collect_captures():
+            for proposal, future in list(captures.items()):
+                if not future.done():
+                    continue
+                del captures[proposal]
+                try:
+                    bundle = future.result()
+                    if sum(b["encoded_bytes"] for b in live_jobs.values()) + bundle["encoded_bytes"] > 16 * 1024 * 1024:
+                        raise PrestateRefused("live pre-state cache is full")
+                except Exception as exc:
+                    reason = str(exc) if isinstance(exc, PrestateRefused) else "unable to read consistent live pre-state"
+                    admissions.finish(proposal, datetime.now(timezone.utc), "refused", reason)
+                    notify("ReplayFailed", dict(proposal=proposal, reason=reason))
+                    continue
+                live_jobs[proposal] = bundle
+                admissions.record_prestate(proposal, bundle["capture_slot"])
 
         def refresh_policies():
             admissions.policies = load_policies()
@@ -521,23 +575,12 @@ def main():
                 policy = admissions.policies[event["target"]]
                 if policy.seed_accounts is not None:
                     proposal = event["proposal"]
-                    try:
-                        bundle = capture_prestate(event, policy.seed_accounts)
-                        if sum(b["encoded_bytes"] for b in live_jobs.values()) + bundle["encoded_bytes"] > 16 * 1024 * 1024:
-                            raise PrestateRefused("live pre-state cache is full")
-                        live_jobs[proposal] = bundle
-                        admissions.record_prestate(proposal, bundle["capture_slot"])
-                    except PrestateRefused as exc:
-                        admissions.finish(proposal, datetime.now(timezone.utc), "refused", str(exc))
-                        notify("ReplayFailed", dict(proposal=proposal, reason=str(exc)))
-                        return
-                    except (OSError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-                        print(json.dumps(dict(event="prestate_error", proposal=proposal,
-                                              error=f"{type(exc).__name__}: {str(exc)[:200]}")), flush=True)
-                        reason = "unable to read consistent live pre-state"
+                    if len(captures) >= 16:
+                        reason = "live capture queue is full"
                         admissions.finish(proposal, datetime.now(timezone.utc), "refused", reason)
                         notify("ReplayFailed", dict(proposal=proposal, reason=reason))
                         return
+                    captures[proposal] = capture_pool.submit(capture_prestate, event, policy.seed_accounts)
                 print(json.dumps(dict(event, customer=customer)), flush=True)
                 notify("ProposalCreated", dict(event, customer=customer))
 
@@ -545,21 +588,54 @@ def main():
             refresh_policies()
             if event["target"] in admissions.policies:
                 if name == "UpgradeExecuted":
-                    observe_upgrade(admissions, live_jobs, running, attestor, event["proposal"],
-                                    datetime.now(timezone.utc))
+                    capture_task = captures.pop(event["proposal"], None)
+                    if capture_task is not None:
+                        capture_task.cancel()
+                    if event["proposal"] in interrupted_votes:
+                        interrupted_votes[event["proposal"]][1]["executed"] = True
+                    else:
+                        observe_upgrade(admissions, live_jobs, running, attestor, event["proposal"],
+                                        datetime.now(timezone.utc))
                 notify(name, event)
 
         next_capture = 0
+        last_checkpoint = 0
         balance_check = 0
         low_balance = False
         verifier_address = os.environ.get("CANARY_VERIFIER_PUBKEY") or (keypair.address if keypair else None)
 
         def checkpoint(slot):
-            nonlocal next_capture, balance_check, low_balance
+            nonlocal next_capture, balance_check, low_balance, last_checkpoint
             admissions.checkpoint(slot)
+            last_checkpoint = time.monotonic()
+            collect_captures()
             if time.monotonic() >= next_capture:
                 refresh_policies()
+                if attestor is not None:
+                    for proposal in list(attestor.pending_cleanup):
+                        attestor.discard(proposal)
                 now = datetime.now(timezone.utc)
+                for proposal, (job, receipt) in list(interrupted_votes.items()):
+                    try:
+                        evidence = receipt["evidence"]
+                        if finalized_vote(job, receipt, evidence, receipt["verifier"], GATE):
+                            root = bytes(evidence["diff_root"]).hex()
+                            admissions.finish(proposal, now, "voted", f"vote confirmed on chain; diff_root {root}")
+                            notify("VoteSubmitted", dict(proposal=proposal, verifier=receipt["verifier"], diff_root=root))
+                        elif rpc("getBlockHeight", {"commitment": "finalized"}) > receipt["last_height"]:
+                            # Re-read after the finalized expiry height in case the vote landed between reads.
+                            if finalized_vote(job, receipt, evidence, receipt["verifier"], GATE):
+                                continue
+                            admissions.finish(proposal, now, "refused", "interrupted vote expired without confirmation")
+                        else:
+                            continue
+                    except (RuntimeError, OSError):
+                        continue
+                    except (KeyError, ValueError, TypeError) as exc:
+                        admissions.finish(proposal, now, "refused", f"vote reconciliation failed: {exc}")
+                    if receipt.get("executed"):
+                        admissions.record_executed(proposal)
+                    del interrupted_votes[proposal]
                 check_live_traffic(admissions, live_jobs, slot, now, notify, attestor, executor, running)
                 capture_ready(admissions, args.snapshots, slot, now, notify, live_jobs)
                 next_capture = time.monotonic() + 30
@@ -574,7 +650,11 @@ def main():
                     print('{"event":"balance_check_failed"}', flush=True)
 
         wake = Event()
-        server = start_http(args.database, GATE, load_policies, wake)
+        def ready():
+            return bool(last_checkpoint and time.monotonic() - last_checkpoint < 180
+                        and not (attestor and attestor.pending_cleanup))
+
+        server = start_http(args.database, GATE, load_policies, wake, ready=ready)
         initial_cursor = admissions.cursor()
         if initial_cursor is None:
             # Cover webhook traffic that arrived while this Machine was starting.
@@ -588,6 +668,8 @@ def main():
         try:
             watch(initial_cursor, on_event=on_event, checkpoint=checkpoint, wait=wait, on_lifecycle=on_lifecycle)
         finally:
+            capture_pool.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=True)
             if server is not None:
                 server.shutdown()
                 server.server_close()

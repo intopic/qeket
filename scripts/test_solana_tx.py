@@ -129,12 +129,24 @@ class AttestationTest(unittest.TestCase):
     def test_gate_refusals_are_final(self):
         event = dict(target=to_base58(bytes([1]) * 32), nonce=0, anchor_slot=1, replay_slots=2,
                      proposal=to_base58(bytes([2]) * 32))
-        bundle = dict(buffer=to_base58(bytes([3]) * 32), config_address=to_base58(bytes([4]) * 32))
+        gate = to_base58(bytes([5]) * 32)
+        bundle = dict(buffer=to_base58(bytes([3]) * 32), config_address=to_base58(bytes([4]) * 32),
+                      config={"verifiers": [KEYPAIR.address]})
         evidence = dict(replay_mode="StrictEquality", elf_sha256=[0] * 32, diff_root=[0] * 32,
                         replayed_tx_count=1, max_cu_delta_bps=0)
 
         def reply(error):
+            reads = 0
             def rpc(method, *params):
+                nonlocal reads
+                if method == "getAccountInfo":
+                    data = bytearray(248)
+                    data[:8] = worker_vote.PROPOSAL_TAG
+                    data[17:49] = from_base58(event["target"])
+                    data[57:89] = from_base58(bundle["buffer"])
+                    data[221] = int(reads > 0 and "AlreadyVoted" in error)
+                    reads += 1
+                    return {"value": {"owner": gate, "data": [base64.b64encode(data).decode(), "base64"]}}
                 if method == "sendTransaction":
                     raise RuntimeError(error)
                 return {"getSlot": 10, "getLatestBlockhash": {"value": {"blockhash": to_base58(bytes(32))}}}[method]

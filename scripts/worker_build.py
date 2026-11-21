@@ -1,5 +1,7 @@
 """Rebuild a candidate from its commit with the same offline container the proposer uses."""
 import argparse
+import json
+import sys
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -156,12 +158,53 @@ def build_candidate(repo_url, commit, subdir, library, features, work, toolchain
         raise BuildFailed("build_subdir is not a directory in the commit")
     build_tree(source, work, [("candidate", list(features))], toolchain)
     output = work / "candidate/sbpf-solana-solana/release" / f"{library.replace('-', '_')}.so"
-    if not output.is_file():
+    if output.resolve() != output.absolute() or not output.is_file():
         raise BuildFailed("build did not produce the configured library")
     return output
 
 
+def remote_build(host, policy, commit, work):
+    """Fetch an ELF from this verifier's independently provisioned build host."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", host):
+        raise BuildFailed("invalid builder hostname")
+    request = dict(repo_url=policy.repo_url, commit=commit, subdir=policy.build_subdir or ".",
+                   library=policy.library_name, features=list(policy.build_features))
+    work.mkdir(parents=True, exist_ok=True)
+    output = work / "candidate.so"
+    ssh = ["ssh", "-F", "/dev/null", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+           "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=/run/canary/known_hosts",
+           "-o", "ConnectTimeout=15", "-i", "/run/canary/build_key", "-p", "2222", "builder@" + host]
+    try:
+        with output.open("wb") as elf:
+            command = ["sh", "-c", 'ulimit -f 20480 && exec "$@"', "sh", *ssh]
+            result = subprocess.run(command, input=json.dumps(request).encode(), stdout=elf,
+                                    stderr=subprocess.DEVNULL, timeout=5400)
+        if result.returncode or not 0 < output.stat().st_size <= 10 * 1024 * 1024:
+            raise BuildFailed("remote builder did not return a program")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BuildFailed(f"remote build unavailable: {type(exc).__name__}") from None
+    return output
+
+
+def serve_build():
+    """Restricted SSH command on a dedicated builder with no verifier credentials."""
+    raw = sys.stdin.buffer.read(8193)
+    if len(raw) > 8192:
+        raise BuildFailed("build request too large")
+    args = json.loads(raw)
+    with tempfile.TemporaryDirectory(prefix="canary-job-") as directory:
+        output = build_candidate(args["repo_url"], args["commit"], args["subdir"], args["library"],
+                                 args["features"], Path(directory), None)
+        if not 0 < output.stat().st_size <= 10 * 1024 * 1024:
+            raise BuildFailed("invalid build output size")
+        with output.open("rb") as elf:
+            shutil.copyfileobj(elf, sys.stdout.buffer)
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["serve-build"]:
+        serve_build()
+        sys.exit(0)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("out", type=Path)

@@ -7,7 +7,7 @@ from devnet import LOADER, from_base58, to_base58
 from live_prestate import (
     CLOCK, CONFIG_TAG, SYSTEM, PROPOSAL_TAG, SYSVAR_OWNER, PrestateRefused, capture_prestate,
     check_captured_accounts_unchanged, check_transaction_prestate, check_window_epoch,
-    check_window_isolation, replay_archive, window_clocks,
+    check_window_isolation, final_states, replay_archive, window_clocks,
 )
 from solana_tx import find_program_address
 
@@ -230,7 +230,7 @@ class ReplayArchiveTest(unittest.TestCase):
                      "postBalances": [1] * len(keys), "fee": 5000, "computeUnitsConsumed": 300,
                      "loadedAddresses": {"writable": [], "readonly": []}},
             "transaction": {"signatures": [to_base58(signature or bytes([7]) * 64)], "message": {
-                "accountKeys": keys, "instructions": [{"programIdIndex": program_index}],
+                "accountKeys": keys, "instructions": [{"programIdIndex": program_index, "accounts": []}],
                 "header": {"numRequiredSignatures": 1, "numReadonlySignedAccounts": 0,
                            "numReadonlyUnsignedAccounts": readonly},
             }},
@@ -303,6 +303,31 @@ class ReplayArchiveTest(unittest.TestCase):
         reuse = self.transaction([self.payer, self.outsider], 1, balances=[4_995_000, 0])
         with self.assertRaisesRegex(PrestateRefused, "used again"):
             self.run_archive(after=[reuse])
+
+    def test_mixed_role_payer_requires_snapshot(self):
+        tx = self.transaction([self.payer, self.target], 1)
+        tx["transaction"]["message"]["instructions"][0]["accounts"] = [0]
+        with self.assertRaisesRegex(PrestateRefused, "mixed-role"):
+            check_transaction_prestate(tx, self.bundle["accounts"], {self.payer})
+
+    def test_payer_with_nonce_data_requires_snapshot(self):
+        with self.assertRaisesRegex(PrestateRefused, "captured initial state"):
+            self.run_archive(final=account(SYSTEM, bytes(80)))
+
+    def test_final_accounts_batch_at_distinct_banks(self):
+        keys = sorted(address(n) for n in range(1, 103))
+        state = account(SYSTEM, b"")
+        calls = []
+        def rpc(method, *args):
+            if method == "getBlocks":
+                return [104, 105]
+            calls.append(args[0])
+            return {"context": {"slot": 103 + len(calls)}, "value": [state] * len(args[0])}
+        blocks = [dict(parentSlot=103, transactions=[]), dict(parentSlot=104, transactions=[
+            self.transaction([keys[0], self.outsider], 1)])]
+        with patch("live_prestate.rpc", side_effect=rpc), patch("live_prestate.block", side_effect=blocks):
+            self.assertEqual(len(final_states(keys, 103)), 102)
+        self.assertEqual(calls, [keys[:100], keys[100:]])
 
     def test_reconstructed_fee_payer_is_isolated(self):
         # A later failed transaction from the same payer could have charged its fee.

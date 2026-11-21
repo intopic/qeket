@@ -15,9 +15,9 @@ ENV OPENSSL_NO_VENDOR=1 CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODE
 RUN cargo build --release --locked -p svm-canary-runner
 
 FROM python:3.12-slim-bookworm
-# dockerd runs the same offline builder container as CI and the proposer.
+# Signing Machines only run the listener and LiteSVM.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends docker.io git ca-certificates curl bzip2 libssl3 \
+ && apt-get install -y --no-install-recommends openssh-client ca-certificates libssl3 util-linux \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=runner /src/target/release/canary-gate /usr/local/bin/canary-gate
 WORKDIR /worker

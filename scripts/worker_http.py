@@ -42,7 +42,7 @@ def status(database, gate, targets):
     }
 
 
-def start_http(database, gate, load_policies, wake, address=None):
+def start_http(database, gate, load_policies, wake, address=None, ready=None):
     if address is None:
         if "CANARY_HTTP_PORT" not in os.environ:
             return None
@@ -73,7 +73,8 @@ def start_http(database, gate, load_policies, wake, address=None):
 
         def do_GET(self):
             if self.path == "/health":
-                return self.respond(200, {"ready": True})
+                healthy = ready is None or ready()
+                return self.respond(200 if healthy else 503, {"ready": healthy})
             if self.path != "/status":
                 return self.respond(404, {"error": "not found"})
             if not self.authorized(f"Bearer {admin_token}" if admin_token else None):
