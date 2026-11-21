@@ -65,6 +65,122 @@ pub struct Record {
     pub index: u32,
     #[serde(with = "wire_transaction")]
     pub transaction: VersionedTransaction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<BaselineObservation>,
+}
+
+/// Finalized `meta` of the baseline execution. Replay must reproduce it exactly.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BaselineObservation {
+    pub keys: Vec<Pubkey>,
+    pub pre_balances: Vec<u64>,
+    pub post_balances: Vec<u64>,
+    pub compute_units: u64,
+    pub fee: u64,
+}
+
+const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
+const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+
+/// Signature fee and compute-unit price fee charged by the bank.
+/// LiteSVM 0.7 charges only the first part.
+fn fee_parts(tx: &VersionedTransaction) -> Result<(u64, u64)> {
+    use solana_sdk_ids::{compute_budget, ed25519_program, secp256k1_program, secp256r1_program};
+    let keys = tx.message.static_account_keys();
+    let mut signatures = u64::from(tx.message.header().num_required_signatures);
+    let (mut limit, mut price) = (None, None);
+    for ix in tx.message.instructions() {
+        let program = keys
+            .get(usize::from(ix.program_id_index))
+            .context("invalid program index")?;
+        if *program == compute_budget::ID {
+            let (tag, value) = ix
+                .data
+                .split_first()
+                .context("empty compute budget instruction")?;
+            match (tag, value.len()) {
+                (2, 4) => ensure!(
+                    limit
+                        .replace(u32::from_le_bytes(value.try_into()?))
+                        .is_none(),
+                    "duplicate compute unit limit"
+                ),
+                (3, 8) => ensure!(
+                    price
+                        .replace(u64::from_le_bytes(value.try_into()?))
+                        .is_none(),
+                    "duplicate compute unit price"
+                ),
+                (1 | 4, 4) => {}
+                _ => anyhow::bail!("unsupported compute budget instruction"),
+            }
+        } else if [
+            ed25519_program::ID,
+            secp256k1_program::ID,
+            secp256r1_program::ID,
+        ]
+        .contains(program)
+        {
+            signatures += u64::from(ix.data.first().copied().unwrap_or(0));
+        }
+    }
+    let priority = match price.unwrap_or(0) {
+        0 => 0,
+        // The default limit depends on the bank's builtin classification. Refuse
+        // rather than estimate it.
+        price => {
+            let limit = limit
+                .context("compute unit price without an explicit compute unit limit")?
+                .min(MAX_COMPUTE_UNIT_LIMIT);
+            u64::try_from((u128::from(price) * u128::from(limit)).div_ceil(1_000_000))?
+        }
+    };
+    Ok((
+        signatures
+            .checked_mul(LAMPORTS_PER_SIGNATURE)
+            .context("fee overflow")?,
+        priority,
+    ))
+}
+
+fn debit(vm: &mut LiteSVM, key: &Pubkey, lamports: u64) -> Result<()> {
+    let mut account = vm.get_account(key).context("missing fee payer")?;
+    account.lamports = account
+        .lamports
+        .checked_sub(lamports)
+        .context("fee payer cannot cover the observed priority fee")?;
+    vm.set_account(*key, account)?;
+    Ok(())
+}
+
+impl BaselineObservation {
+    /// LiteSVM installs the target with its own loader and balance, so that
+    /// program account is the one entry the chain balance cannot describe.
+    fn check_balances(
+        &self,
+        baseline: &LiteSVM,
+        keys: &[Pubkey],
+        balances: &[u64],
+        emulated: &Pubkey,
+    ) -> Result<()> {
+        ensure!(
+            self.keys == keys && balances.len() == keys.len(),
+            "observed account list differs"
+        );
+        for (key, expected) in keys.iter().zip(balances) {
+            if key == emulated {
+                continue;
+            }
+            let actual = baseline
+                .get_account(key)
+                .map_or(0, |account| account.lamports);
+            ensure!(
+                actual == *expected,
+                "observed balance differs for {key}: {actual} != {expected}"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// A signed legacy/v0 transaction archive. Each listed clock covers one slot,
@@ -317,6 +433,28 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
                 "missing account snapshot for {key}"
             );
         }
+        if let Some(observed) = &record.baseline {
+            observed
+                .check_balances(&old, &keys, &observed.pre_balances, &archive.target)
+                .with_context(|| {
+                    format!("baseline pre-state at {}:{}", record.slot, record.index)
+                })?;
+            let (signature_fee, priority_fee) = fee_parts(tx)
+                .with_context(|| format!("fee at {}:{}", record.slot, record.index))?;
+            ensure!(
+                signature_fee.checked_add(priority_fee) == Some(observed.fee),
+                "observed fee differs at {}:{}: {} != {signature_fee} + {priority_fee}",
+                record.slot,
+                record.index,
+                observed.fee
+            );
+            // The bank debits the full fee before execution. Apply the part
+            // LiteSVM omits so programs and later transactions see the same balance.
+            if priority_fee > 0 {
+                debit(&mut old, &keys[0], priority_fee)?;
+                debit(&mut new, &keys[0], priority_fee)?;
+            }
+        }
         let a = old.send_transaction(tx.clone()).map_err(|e| {
             anyhow!(
                 "baseline failed at {}:{}: {:?}",
@@ -325,6 +463,19 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
                 e
             )
         })?;
+        if let Some(observed) = &record.baseline {
+            observed
+                .check_balances(&old, &keys, &observed.post_balances, &archive.target)
+                .with_context(|| {
+                    format!("baseline post-state at {}:{}", record.slot, record.index)
+                })?;
+            ensure!(
+                observed.compute_units == a.compute_units_consumed,
+                "observed baseline compute differs at {}:{}",
+                record.slot,
+                record.index
+            );
+        }
         let b = new.send_transaction(tx.clone()).map_err(|e| {
             anyhow!(
                 "candidate failed at {}:{}: {:?}",
@@ -460,5 +611,106 @@ mod tests {
             bincode::serialize(&record.transaction).unwrap(),
             bincode::serialize(&legacy).unwrap()
         );
+    }
+
+    #[test]
+    fn baseline_observation_rejects_mismatched_balances_and_loaded_keys() {
+        let mut vm = LiteSVM::new();
+        let payer = Pubkey::new_unique();
+        let nonexistent = Pubkey::new_unique();
+        vm.airdrop(&payer, 100_000).unwrap();
+        let observation = BaselineObservation {
+            keys: vec![payer, nonexistent],
+            pre_balances: vec![100_000, 0],
+            post_balances: vec![95_000, 0],
+            compute_units: 42,
+            fee: 5_000,
+        };
+        let reversed = [nonexistent, payer];
+        assert!(observation
+            .check_balances(
+                &vm,
+                &observation.keys,
+                &observation.pre_balances,
+                &Pubkey::default()
+            )
+            .is_ok());
+        assert!(observation
+            .check_balances(
+                &vm,
+                &observation.keys,
+                &observation.post_balances,
+                &Pubkey::default()
+            )
+            .is_err());
+        assert!(observation
+            .check_balances(
+                &vm,
+                &reversed,
+                &observation.pre_balances,
+                &Pubkey::default()
+            )
+            .is_err());
+        // The target program account is emulated and has no chain balance.
+        assert!(observation
+            .check_balances(&vm, &observation.keys, &observation.post_balances, &payer)
+            .is_ok());
+    }
+
+    #[test]
+    fn priority_fee_is_recomputed_and_applied_before_execution() {
+        use solana_compute_budget_interface::ComputeBudgetInstruction as Budget;
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let transfer = anchor_lang::solana_program::system_instruction::transfer(
+            &payer.pubkey(),
+            &recipient,
+            1_000,
+        );
+        let signed = |instructions: &[anchor_lang::solana_program::instruction::Instruction]| {
+            VersionedTransaction::from(Transaction::new_signed_with_payer(
+                instructions,
+                Some(&payer.pubkey()),
+                &[&payer],
+                Default::default(),
+            ))
+        };
+        let priced = signed(&[
+            Budget::set_compute_unit_limit(200_000),
+            Budget::set_compute_unit_price(1_001),
+            transfer.clone(),
+        ]);
+        assert_eq!(fee_parts(&signed(&[transfer.clone()])).unwrap(), (5_000, 0));
+        // ceil(1_001 * 200_000 / 1_000_000) lamports.
+        assert_eq!(fee_parts(&priced).unwrap(), (5_000, 201));
+        assert!(fee_parts(&signed(&[
+            Budget::set_compute_unit_price(1),
+            transfer.clone()
+        ]))
+        .is_err());
+        assert!(fee_parts(&signed(&[
+            Budget::set_compute_unit_limit(1),
+            Budget::set_compute_unit_limit(2),
+            transfer.clone(),
+        ]))
+        .is_err());
+        let precompile = solana_ed25519_program::new_ed25519_instruction_with_signature(
+            b"m", &[0; 64], &[1; 32],
+        );
+        assert_eq!(
+            fee_parts(&signed(&[precompile, transfer])).unwrap(),
+            (10_000, 0)
+        );
+
+        // LiteSVM charges the signature fee only, so the debit restores bank parity.
+        let mut vm = LiteSVM::new().with_blockhash_check(false);
+        vm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+        debit(&mut vm, &payer.pubkey(), 201).unwrap();
+        vm.send_transaction(priced).unwrap();
+        assert_eq!(
+            vm.get_balance(&payer.pubkey()),
+            Some(1_000_000_000 - 201 - 5_000 - 1_000)
+        );
+        assert!(debit(&mut vm, &Pubkey::new_unique(), 1).is_err());
     }
 }

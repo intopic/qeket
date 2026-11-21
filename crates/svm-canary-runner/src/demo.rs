@@ -6,7 +6,7 @@ use anchor_lang::{
         instruction::{AccountMeta, Instruction},
         system_program, sysvar,
     },
-    AccountDeserialize, AnchorSerialize, InstructionData, ToAccountMetas,
+    AccountDeserialize, AccountSerialize, AnchorSerialize, InstructionData, ToAccountMetas,
 };
 use anyhow::{anyhow, ensure, Context, Result};
 use canary_types::CanaryAttestationPayload;
@@ -197,6 +197,7 @@ fn traffic(target: Pubkey, baseline: &[u8], archive: &mut Archive, count: u32) -
                 .send_transaction(tx.clone())
                 .map_err(|e| anyhow!("capturing baseline: {e:?}"))?;
             archive.records.push(Record {
+                baseline: None,
                 slot: archive.anchor_slot + u64::from(i),
                 index,
                 transaction: tx,
@@ -584,6 +585,180 @@ fn verified_vote(
         &node.pubkey().to_bytes(),
     );
     Ok([verify_ix, submit.clone()])
+}
+
+pub fn fuzz_votes(gate: &[u8], iterations: u64, seed: u64) -> Result<()> {
+    ensure!(
+        iterations > 0 && seed > 0,
+        "iterations and seed must be positive"
+    );
+    let started = Instant::now();
+    let mut vm = LiteSVM::new();
+    vm.add_program(ID, gate)?;
+    let payer = Keypair::new_from_array([72; 32]);
+    vm.airdrop(&payer.pubkey(), 10_000_000_000_000)
+        .map_err(|e| anyhow!("{e:?}"))?;
+    let nodes = [21, 22, 23, 24].map(|n| Keypair::new_from_array([n; 32]));
+    let target = Pubkey::new_from_array([60; 32]);
+    let (config, config_bump) =
+        Pubkey::find_program_address(&[b"gatekeeper_cfg", target.as_ref()], &ID);
+    let nonce = 0u64;
+    let (proposal, bump) =
+        Pubkey::find_program_address(&[b"proposal", target.as_ref(), &nonce.to_le_bytes()], &ID);
+    let mut verifiers = [Pubkey::default(); 7];
+    for (key, signer) in verifiers.iter_mut().zip(&nodes[..3]) {
+        *key = signer.pubkey();
+    }
+    let config_state = GatekeeperConfig {
+        version: 2,
+        bump: config_bump,
+        target_program: target,
+        governance_authority: payer.pubkey(),
+        emergency_authority: nodes[3].pubkey(),
+        proposal_nonce: 0,
+        policy: Policy {
+            replay_mode: Default::default(),
+            verifiers,
+            verifier_count: 3,
+            threshold: 2,
+            max_cu_delta_bps: 1500,
+            min_replay_txs: 1,
+            min_replay_slots: 2,
+            timelock_seconds: 30,
+            proposal_expiry_seconds: 90,
+        },
+    };
+    let mut config_bytes = Vec::new();
+    config_state.try_serialize(&mut config_bytes)?;
+    vm.set_account(config, account(&vm, ID, config_bytes, false))?;
+    clock(&mut vm, 100, 1000);
+    let submit = ix(
+        accounts::SubmitCanaryAttestation {
+            config,
+            proposal,
+            instruction_sysvar: sysvar::instructions::ID,
+        },
+        instruction::SubmitVerifiedAttestation {},
+    );
+    let cases = [
+        "quorum_reached",
+        "WrongStatus",
+        "Expired",
+        "InvalidWindow",
+        "WrongPayload",
+        "ReplayPolicy",
+        "UnknownVerifier",
+        "AlreadyVoted",
+        "RootMismatch",
+        "invalid_signature",
+        "InvalidSignatureInstruction",
+    ];
+    let mut totals = [0u64; 11];
+    let mut random = seed;
+    for ordinal in 0..iterations {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        let case = (random % cases.len() as u64) as usize;
+        let mut root = [0u8; 32];
+        for chunk in root.chunks_exact_mut(8) {
+            chunk.copy_from_slice(&random.to_le_bytes());
+        }
+        let state = UpgradeProposal {
+            bump,
+            nonce,
+            target_program: target,
+            baseline_deploy_slot: 0,
+            buffer_account: Pubkey::new_from_array([61; 32]),
+            spill_account: payer.pubkey(),
+            expected_elf_sha256: [2; 32],
+            git_commit_sha: [3; 20],
+            anchor_slot: 70,
+            replay_slots: 2,
+            diff_root: root,
+            attestation_bitmap: 1,
+            attestation_count: 1,
+            created_at: 950,
+            expires_at: if case == 2 { 999 } else { 1060 },
+            ready_at: 0,
+            status: if case == 1 {
+                ProposalStatus::Cancelled
+            } else {
+                ProposalStatus::Pending
+            },
+        };
+        let mut initial_bytes = Vec::new();
+        state.try_serialize(&mut initial_bytes)?;
+        vm.set_account(proposal, account(&vm, ID, initial_bytes.clone(), false))?;
+        let payload = CanaryAttestationPayload {
+            domain_separator: config_state.policy.replay_mode.domain(),
+            target_program: target,
+            proposal_nonce: nonce + u64::from(case == 4),
+            buffer_account: state.buffer_account,
+            anchor_slot: state.anchor_slot,
+            replay_slots: state.replay_slots,
+            elf_sha256: state.expected_elf_sha256,
+            diff_root: if case == 8 { [0; 32] } else { root },
+            replayed_tx_count: (random % 5000 + 1) as u32,
+            failed_tx_count: 0,
+            max_cu_delta_bps: if case == 5 {
+                1501
+            } else {
+                (random % 1501) as u16
+            },
+            expires_at_slot: if case == 3 { 99 } else { 200 },
+        };
+        let node = &nodes[match case {
+            6 => 3,
+            7 => 0,
+            _ => 1,
+        }];
+        let mut vote = verified_vote(node, &payload, &submit)?;
+        if case == 9 {
+            vote[0].data[48] ^= 1; // Corrupt one signature byte after signing.
+        }
+        if case == 10 {
+            // Ed25519 resolves index zero to this instruction. The gate requires the
+            // canonical self-reference sentinel, even when both spellings verify.
+            vote[0].data[4..6].copy_from_slice(&0u16.to_le_bytes());
+        }
+        let result = send(&mut vm, &payer, &[], &vote);
+        if case == 0 {
+            result.with_context(|| format!("iteration {ordinal}"))?;
+            let after: UpgradeProposal = load(&vm, proposal)?;
+            ensure!(
+                after.status == ProposalStatus::Ready
+                    && after.attestation_count == 2
+                    && after.attestation_bitmap == 3
+                    && after.diff_root == root
+                    && after.ready_at == 1000,
+                "unexpected quorum state at iteration {ordinal}"
+            );
+        } else {
+            let reason = if case == 9 {
+                "InstructionError(0, Custom(2))"
+            } else {
+                cases[case]
+            };
+            rejected(result, reason)
+                .with_context(|| format!("iteration {ordinal} ({})", cases[case]))?;
+            ensure!(
+                vm.get_account(&proposal).context("missing proposal")?.data == initial_bytes,
+                "refused vote modified the proposal at iteration {ordinal}"
+            );
+        }
+        totals[case] += 1;
+    }
+    let outcomes: std::collections::BTreeMap<_, _> = cases.into_iter().zip(totals).collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "engine": "LiteSVM 0.7.1", "instruction": "submit_verified_attestation",
+            "iterations": iterations, "seed": seed, "outcomes": outcomes,
+            "gate_elf_sha256": hex::encode(hash(gate)), "wall_seconds": started.elapsed().as_secs_f64()
+        }))?
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

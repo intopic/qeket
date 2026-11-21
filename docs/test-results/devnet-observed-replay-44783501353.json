@@ -1,0 +1,29 @@
+{
+  "environment": "Fly.io Sprite qeket-test",
+  "purpose": "Check that canary-gate verify reproduces finalized Devnet balances, compute units and fees",
+  "source_run": "GitHub Actions Live Devnet counter 44783501353",
+  "gate_program_id": "GdmM9gBp8j8reyHyoLTPGfvYtMYpqd2yU1yeob5z1MJw",
+  "anchor_slot": 524430273,
+  "replay_slots": 256,
+  "observations": "meta.preBalances, postBalances, computeUnitsConsumed and fee from finalized getTransaction on api.devnet.solana.com",
+  "rebuild": {
+    "builder": "scripts/worker_build.py in Docker without network on the Sprite",
+    "baseline_sha256": "cf2a76abee4e3c1ddc4ac000211365c5937c487b2d78fee21e647fa15f540313",
+    "candidate_sha256": "d080667b6d671bc6eecc987fbb4fb61c2d2dabb8a52ba5f7aa3d1c6cbf5910ae",
+    "matches_ci_archive": true
+  },
+  "result": {
+    "replayed_tx_count": 50,
+    "observed_fee_lamports": [5000],
+    "observed_compute_units": [557],
+    "diff_root": "0243c34aeff831390ebb3b570ea51a9ed71a33285818a5ab0d5c3e494ed6d670",
+    "diff_root_without_observations": "0243c34aeff831390ebb3b570ea51a9ed71a33285818a5ab0d5c3e494ed6d670",
+    "max_cu_delta_bps": 18
+  },
+  "tampered_archive_rejections": {
+    "compute_units_plus_one": "observed baseline compute differs at 524430280:1",
+    "fee_plus_5000": "observed fee differs at 524430279:5: 10000 != 5000 + 0",
+    "post_balance_minus_one": "observed balance differs for FvH9QaBPiJqZFXgXhP91DtC3q1FDsXeVFYUkJMudnuiK: 1935000 != 1934999"
+  },
+  "finding_fixed": "The first run refused every record because LiteSVM installs the target with its own loader and rent balance. The balance check now skips only the target program account."
+}
