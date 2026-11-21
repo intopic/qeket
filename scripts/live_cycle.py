@@ -19,6 +19,7 @@ from live_capture import FINAL, GENESIS, capture, proposals, rpc
 from devnet import LOADER
 import live_capture
 import base64
+import urllib.request
 
 ROOT = Path.cwd()
 OUT = ROOT / "target/live"
@@ -76,6 +77,34 @@ def send(label, ix, fee=None, extra=()):
     tx = Transaction.new_signed_with_payer(ix, fee.pubkey(), [fee, *extra], bh)
     sig = rpc("sendTransaction", base64.b64encode(bytes(tx)).decode(), {"encoding": "base64", "preflightCommitment": "finalized"})
     return receipt(label, sig)
+
+
+def wait_for_verifier_jobs():
+    """Hold the proposal until each external verifier job reports that its worker is watching."""
+    names = [n for n in os.environ.get("CANARY_WAIT_FOR_JOBS", "").split(",") if n]
+    deadline = time.monotonic() + 2400
+    while names:
+        url = (f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+               f"{os.environ['GITHUB_RUN_ID']}/jobs?per_page=100")
+        request = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                                                       "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            jobs = {job["name"]: job for job in json.load(response)["jobs"]}
+        for name in list(names):
+            job = jobs.get(name)
+            if job and job["status"] == "completed":
+                raise RuntimeError(f"verifier job {name} ended before the proposal")
+            if job and any(step["name"] == "Verifier ready" and step["conclusion"] == "success" for step in job["steps"]):
+                names.remove(name)
+        if names:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("external verifiers did not start")
+            time.sleep(10)
+
+
+def proposal_state(data):
+    return dict(diff_root=data[189:221], count=data[222], ready_at=struct.unpack_from("<q", data, 239)[0],
+                status=data[247])
 
 
 def account(value):
@@ -136,8 +165,13 @@ def run():
     send("initialize_gatekeeper",[ix("initialize_gatekeeper",[meta(payer,True,True),meta(payer,False,True),meta(target),meta(pd),meta(cfg,True),meta(system)],policy+bytes(key("emergency").pubkey()))])
     send("transfer upgrade and buffer authorities",[Instruction(loader,pack("<I",4),[meta(k,True),meta(payer,False,True),meta(cfg)]) for k in [pd,buf]])
     rent = rpc("getMinimumBalanceForRentExemption",8)
+    external = os.environ.get("CANARY_EXTERNAL_VERIFIERS") == "1"
+    # Independent workers pay their own vote fees.
+    funding = [transfer(dict(from_pubkey=payer,to_pubkey=v.pubkey(),lamports=20_000_000)) for v in votes[:2]] if external else []
     send("prepare counter and isolated replay payer",[create_account(dict(from_pubkey=payer,to_pubkey=counter,lamports=rent,space=8,owner=target)),
-        transfer(dict(from_pubkey=payer,to_pubkey=traffic,lamports=2_000_000))],extra=[key("counter")])
+        transfer(dict(from_pubkey=payer,to_pubkey=traffic,lamports=2_000_000)),*funding],extra=[key("counter")])
+    if external:
+        wait_for_verifier_jobs()
     # Only the counter and its dedicated payer participate in the one replay transaction.
     snap = rpc("getMultipleAccounts",list(map(str,[counter,traffic,buf,clock_id])),dict(FINAL,encoding="base64"))
     accounts = snap["value"]
@@ -189,7 +223,25 @@ def run():
         raise ValueError("unexpected traffic for dedicated counter snapshot")
     path=OUT/"archive.json"
     path.write_text(json.dumps(archive))
-    for voter,binary in zip(votes,[candidate,rebuilt]):
+    if external:
+        # The workers captured their own state at admission. The root they voted
+        # for must equal the one from this controlled snapshot.
+        evidence=json.loads(subprocess.check_output(["target/debug/canary-gate","verify",path,base,rebuilt]))
+        deadline = time.monotonic() + 2400
+        while (state := proposal_state(base64.b64decode(get(proposal)["data"][0])))["status"] != 1:
+            if state["status"] != 0 or time.monotonic() >= deadline:
+                raise RuntimeError(f"external verifiers did not reach quorum: {state}")
+            time.sleep(5)
+        if state["diff_root"] != bytes(evidence["diff_root"]) or state["count"] != 2:
+            raise ValueError("worker votes differ from the controlled replay")
+        history = rpc("getSignaturesForAddress", str(proposal), dict(FINAL, limit=20))
+        for entry in reversed(history):
+            logs = rpc("getTransaction", entry["signature"], dict(FINAL, encoding="json", maxSupportedTransactionVersion=0))["meta"]["logMessages"]
+            if any("Instruction: SubmitVerifiedAttestation" in line for line in logs):
+                receipt("worker vote (submit_verified_attestation)", entry["signature"])
+        with (OUT / "transactions.md").open("a") as f:
+            print(f"- quorum diff_root `{state['diff_root'].hex()}` matches the controlled replay", file=f)
+    for voter,binary in ([] if external else zip(votes,[candidate,rebuilt])):
         evidence=json.loads(subprocess.check_output(["target/debug/canary-gate","verify",path,base,binary]))
         msg=b"CANARY_GATE_M1__"+bytes(target)+bytes(8)+bytes(buf)+pack("<QQ",start,span)+sha+bytes(evidence["diff_root"])+pack("<IIHQ",evidence["replayed_tx_count"],0,evidence["max_cu_delta_bps"],rpc("getSlot",FINAL)+500)
         ed=Instruction(Pubkey.from_string("Ed25519SigVerify111111111111111111111111111"),pack("<BB7H",1,0,48,65535,16,65535,112,len(msg),65535)+bytes(voter.pubkey())+bytes(voter.sign_message(msg))+msg,[])

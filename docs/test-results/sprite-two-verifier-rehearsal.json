@@ -1,0 +1,39 @@
+{
+  "environment": "Fly.io Sprite qeket-test, Agave solana-test-validator, two worker processes",
+  "procedure": "scripts/live_cycle.py run with CANARY_EXTERNAL_VERIFIERS=1. The cycle script proposes and sends traffic but does not vote.",
+  "source_commit": "36114ff97a5689f4b7fb152c172a58928c41bd3c",
+  "gate_program_id": "2uye9B6KiAiLqT5wqzW8i5Y2tBKtsyTGEMxT4fdfeGoz",
+  "proposal": "HpKPRqt5QHi5qtLgHnbPeH696V2u13YMrGz4JvDFiLBo",
+  "anchor_slot": 229,
+  "replay_slots": 256,
+  "verifiers": [
+    {
+      "node": "a",
+      "verifier": "3usn4zWZD9YKMY1jxHHfrbgkVHac2kYwU1Sqhg8LK997",
+      "vote_signature": "4HPaP4swZf7xu78G7zgX1ZyHZNqrTTZDYzkv7rsnk3yXTJ7Bk6CovHiBKtkefqrZZZfxNeWW2E6QyiEfzK4DujiK",
+      "sqlite_outcome": "executed",
+      "rebuilt_sha256": "d080667b6d671bc6eecc987fbb4fb61c2d2dabb8a52ba5f7aa3d1c6cbf5910ae",
+      "archive": {"records": 50, "accounts": 2, "clocks": 257, "reconstructed_fee_payer_lamports": [2000000], "bytes": 162180},
+      "build_and_verify_seconds": 75.7
+    },
+    {
+      "node": "b",
+      "verifier": "Cf6CGJQwdJjZDD924f9AXF5CqHua2vRner4BjiWUEh8j",
+      "vote_signature": "3yAUzbN9BRNe7sMGFCZAtUNpcEr3gz7e2fvM4UiQhf7pKmrBogf64MSa3XKa8yvYqVerNvhiF24nqVHR3eaxmfGY",
+      "sqlite_outcome": "executed",
+      "rebuilt_sha256": "d080667b6d671bc6eecc987fbb4fb61c2d2dabb8a52ba5f7aa3d1c6cbf5910ae",
+      "archive": {"records": 50, "accounts": 2, "clocks": 257, "reconstructed_fee_payer_lamports": [2000000], "bytes": 162180},
+      "build_and_verify_seconds": 75.7
+    }
+  ],
+  "evidence": {
+    "replay_mode": "StrictEquality",
+    "diff_root": "6e71be02d18d0d285668b2a202dc45ca1aa159e86976ddcb58d533dc4a04cec5",
+    "replayed_tx_count": 50,
+    "max_cu_delta_bps": 18
+  },
+  "quorum_root_matches_controlled_snapshot_replay": true,
+  "execute_gated_upgrade": "48hC5LFxy5jGYNGJb1dZJWNAUdvZenQuCuoFFHfPf69eLs3oLFGDj8KNN2ZazssXiTGBS9fLa9enGYmTDSeUtycm",
+  "builder_settings": "CANARY_DOCKER_ROOT=1 and CANARY_DOCKER_RESOURCE_LIMITS=0, required by Docker on the Sprite",
+  "limits": "Both workers ran on one Sprite and one local validator. The Devnet run uses separate GitHub runners."
+}
