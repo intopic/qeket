@@ -15,6 +15,7 @@ kill_timeout = 30
   CANARY_CLUSTER = "devnet"
   # The Machine itself bounds CPU and memory.
   CANARY_DOCKER_RESOURCE_LIMITS = "0"
+  CANARY_EPHEMERAL_CARGO_HOME = "1"
 
 [[vm]]
   size = "shared-cpu-2x"

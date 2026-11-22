@@ -61,6 +61,16 @@ runs:
         npm ci --no-audit --no-fund
         npm run build
         echo "CANARY_CLI=$PWD/dist/cli.js" >> "$GITHUB_ENV"
+    - name: Check the replay window fits the plan
+      if: inputs.command == 'propose'
+      shell: bash
+      env:
+        RPC_URL: ${{ inputs.rpc-url }}
+        GATE: ${{ inputs.gate-program }}
+        TARGET: ${{ inputs.target-program }}
+        MAX_REPLAY_TXS: ${{ inputs.max-replay-txs }}
+      # Before any rent is spent on a buffer.
+      run: node "$CANARY_CLI" window --gate "$GATE" --target "$TARGET" --max-replay-txs "$MAX_REPLAY_TXS"
     - name: Install pinned platform tools and the Solana CLI
       if: inputs.command == 'propose'
       shell: bash
@@ -113,11 +123,18 @@ runs:
         printf '%s' "$CANARY_KEYPAIR" > "$key"
         config=$(node "$CANARY_CLI" config-address --gate "$GATE" --target "$TARGET" \
           | python3 -c 'import json, sys; print(json.load(sys.stdin)["configAddress"])')
-        buffer=$(solana program write-buffer "$CANARY_ELF" --url "$RPC_URL" --keypair "$key" --output json \
-          | python3 -c 'import json, sys; print(json.load(sys.stdin)["buffer"])')
-        # The gate refuses a buffer it does not control, so its bytes cannot change after the proposal.
-        solana program set-buffer-authority "$buffer" --new-buffer-authority "$config" --url "$RPC_URL" --keypair "$key"
+        # RPC submission: TPU connections from hosted runners are often dropped.
+        buffer=$(solana program write-buffer "$CANARY_ELF" --url "$RPC_URL" --keypair "$key" --use-rpc \
+          --commitment finalized --output json | python3 -c 'import json, sys; print(json.load(sys.stdin)["buffer"])')
         echo "CANARY_BUFFER=$buffer" >> "$GITHUB_ENV"
+        # The gate refuses a buffer it does not control, so its bytes cannot change after the proposal.
+        if ! solana program set-buffer-authority "$buffer" --new-buffer-authority "$config" --url "$RPC_URL" \
+            --keypair "$key" --commitment finalized; then
+          # The uploader still holds the buffer: return its rent now.
+          solana program close "$buffer" --url "$RPC_URL" --keypair "$key" --bypass-warning || true
+          exit 1
+        fi
+        echo "CANARY_BUFFER_HANDED_OFF=1" >> "$GITHUB_ENV"
     - name: Run canary
       id: run
       shell: bash
@@ -150,3 +167,12 @@ runs:
         echo "$result"
         { echo "result<<CANARY_RESULT"; echo "$result"; echo "CANARY_RESULT"; } >> "$GITHUB_OUTPUT"
         { echo "### Canary $COMMAND"; echo '```json'; echo "$result"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+    - name: Explain how to recover the buffer rent
+      if: failure() && env.CANARY_BUFFER_HANDED_OFF == '1'
+      shell: bash
+      run: |
+        {
+          echo "### Buffer $CANARY_BUFFER is held by the gate without a proposal"
+          echo "Its rent returns through governance: approve a Squads transaction with"
+          echo "\`reclaimOrphanBuffer\` from \`@canary-gate/squads-adapter\`, or propose again with this buffer."
+        } | tee -a "$GITHUB_STEP_SUMMARY"
