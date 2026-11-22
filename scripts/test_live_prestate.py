@@ -11,15 +11,19 @@ from live_prestate import (
 )
 
 TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 BPF_LOADER_2 = "BPFLoader2111111111111111111111111111111111"
 
 
-def token_account(mint, owner, amount, state=1):
+def token_account(mint, owner, amount, state=1, program=TOKEN, extensions=None):
     data = bytearray(165)
     data[:32], data[32:64] = from_base58(mint), from_base58(owner)
     data[64:72] = amount.to_bytes(8, "little")
     data[108] = state
-    return account(TOKEN, bytes(data), lamports=2_039_280)
+    if extensions is not None:
+        # Token-2022: account type 2, then type-length-value extensions.
+        data += b"\x02" + b"".join(struct.pack("<HH", kind, len(value)) + value for kind, value in extensions)
+    return account(program, bytes(data), lamports=2_039_280)
 from solana_tx import find_program_address
 
 
@@ -397,19 +401,23 @@ class ReplayArchiveTest(unittest.TestCase):
             with self.subTest(reason), self.assertRaisesRegex(PrestateRefused, reason):
                 self.run_archive(target_tx=tx, chain={key: state})
 
-    def token_window(self, data, amount=500, final_amount=400, owner=None, pre=True, inner=True):
-        """The target moves tokens out of an account the anchor capture did not include."""
+    def token_window(self, data, amount=500, final_amount=400, owner=None, pre=True, inner=True, signer=5,
+                     program=TOKEN, extensions=None):
+        """The target moves tokens out of an account the anchor capture did not include.
+
+        The wallet that owns the token account signs the transfer as its authority.
+        """
         holder, mint, wallet = address(60), address(61), address(62)
-        keys = [self.payer, self.counter, holder, self.target, TOKEN]
-        tx = self.transaction(keys, 3, self.signature, balances=[5_000_000, 100, 2_039_280, 1, 1], readonly=2)
-        tx["transaction"]["message"]["instructions"][0]["accounts"] = [1, 2, 4]
+        keys = [self.payer, self.counter, holder, self.target, program, wallet]
+        tx = self.transaction(keys, 3, self.signature, balances=[5_000_000, 100, 2_039_280, 1, 1, 1], readonly=3)
+        tx["transaction"]["message"]["instructions"][0]["accounts"] = [1, 2, 4, 5]
         tx["meta"]["innerInstructions"] = [dict(index=0, instructions=[
-            dict(programIdIndex=4, accounts=[2, 1, 0], data=to_base58(data))])] if inner else None
+            dict(programIdIndex=4, accounts=[2, 1, signer], data=to_base58(data))])] if inner else None
         if pre:
-            tx["meta"]["preTokenBalances"] = [dict(accountIndex=2, mint=mint, owner=owner or wallet, programId=TOKEN,
+            tx["meta"]["preTokenBalances"] = [dict(accountIndex=2, mint=mint, owner=owner or wallet, programId=program,
                                                    uiTokenAmount=dict(amount=str(amount), decimals=6))]
-        chain = {holder: token_account(mint, wallet, final_amount),
-                 TOKEN: account(BPF_LOADER_2, b"\x7fELF token", True)}
+        chain = {holder: token_account(mint, wallet, final_amount, program=program, extensions=extensions),
+                 program: account(BPF_LOADER_2, b"\x7fELF token", True), wallet: account(SYSTEM, b"")}
         return holder, dict(target_tx=tx, chain=chain)
 
     def test_token_account_is_rebuilt_from_its_first_use(self):
@@ -428,6 +436,19 @@ class ReplayArchiveTest(unittest.TestCase):
         finals = {to_base58(bytes(key)): value for key, value in archive["final_accounts"]}
         self.assertEqual(int.from_bytes(bytes(finals[holder]["data"][64:72]), "little"), 400)
 
+    def test_token_2022_account_with_static_extensions_is_rebuilt(self):
+        checked = bytes([12]) + (100).to_bytes(8, "little") + b"\x06"
+        holder, window = self.token_window(checked, program=TOKEN_2022, extensions=[(7, b"")])
+        # TransferChecked: source, mint, destination, authority.
+        window["target_tx"]["meta"]["innerInstructions"][0]["instructions"][0]["accounts"] = [2, 1, 1, 5]
+        accounts = {to_base58(bytes(key)): value for key, value in self.run_archive(**window)["accounts"]}
+        self.assertEqual(int.from_bytes(bytes(accounts[holder]["data"][64:72]), "little"), 500)
+        self.assertEqual(bytes(accounts[holder]["data"][165:170]), b"\x02\x07\x00\x00\x00")
+        # Tokens credited to the account need no authority check.
+        _, window = self.token_window(bytes([3]) + (100).to_bytes(8, "little"))
+        window["target_tx"]["meta"]["innerInstructions"][0]["instructions"][0]["accounts"] = [1, 2, 0]
+        self.run_archive(**window)
+
     def test_token_account_changed_beyond_its_amount_is_refused(self):
         transfer = bytes([3]) + (100).to_bytes(8, "little")
         cases = [
@@ -435,6 +456,10 @@ class ReplayArchiveTest(unittest.TestCase):
             ("no starting balance", dict(data=transfer, pre=False), "no observed starting balance"),
             ("owner changed", dict(data=transfer, owner=address(63)), "changed mint, owner"),
             ("no inner instructions", dict(data=transfer, inner=False), "inner instructions"),
+            # A delegate's transfer also lowers delegated_amount, which no metadata records.
+            ("delegate debit", dict(data=transfer, signer=0), "debited by a delegate"),
+            ("transfer fee", dict(data=bytes([12]) + (100).to_bytes(8, "little") + b"\x06", program=TOKEN_2022,
+                                  extensions=[(2, bytes(8))]), "extension 2"),
         ]
         for name, options, reason in cases:
             _, window = self.token_window(**options)

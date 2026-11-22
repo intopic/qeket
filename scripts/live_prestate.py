@@ -30,6 +30,14 @@ TOKEN_PROGRAMS = {"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP
 # only a token account's amount, and its lamports for native SOL. Any other
 # instruction can change fields that no transaction metadata records.
 AMOUNT_ONLY = {3, 7, 8, 12, 14, 15}
+# For a debit (Transfer, Burn and their Checked variants): the position of the
+# debited account and of its authority. A delegate as authority also lowers
+# delegated_amount and can clear the delegate, which metadata does not record.
+DEBIT_AUTHORITY = {3: (0, 2), 12: (0, 3), 8: (0, 2), 15: (0, 2)}
+# Token-2022 account extensions that transfers, mints and burns leave unchanged:
+# ImmutableOwner, MemoTransfer, CpiGuard and NonTransferableAccount. Others, such
+# as TransferFeeAmount, change with a transfer.
+STATIC_EXTENSIONS = {7, 8, 11, 13}
 MAX_LATE_BYTES = 16 * 1024 * 1024
 
 
@@ -385,7 +393,7 @@ def instructions_of(item):
         yield from group["instructions"]
 
 
-def check_amount_only(items, key, program):
+def check_amount_only(items, key, program, owner):
     """Refuse a token account that any window instruction can change beyond its amount."""
     for item in items:
         keys = ordered_keys(item)
@@ -400,6 +408,23 @@ def check_amount_only(items, key, program):
             if keys[ix["programIdIndex"]] != program or not data or data[0] not in AMOUNT_ONLY:
                 raise PrestateRefused(f"token account {key} is used by an instruction other than transfer, "
                                       f"mint or burn")
+            debited, authority = DEBIT_AUTHORITY.get(data[0], (None, None))
+            accounts = ix["accounts"]
+            if debited is not None and accounts[debited:debited + 1] == [index] and (
+                    len(accounts) <= authority or keys[accounts[authority]] != owner):
+                raise PrestateRefused(f"token account {key} is debited by a delegate or another authority")
+
+
+def check_static_extensions(key, data):
+    """Refuse Token-2022 extensions that a transfer, mint or burn can change."""
+    offset = 166
+    while len(data) > 165 and offset + 4 <= len(data):
+        kind, length = struct.unpack_from("<HH", data, offset)
+        if kind == 0:
+            break  # Uninitialized: the rest is padding.
+        if kind not in STATIC_EXTENSIONS or offset + 4 + length > len(data):
+            raise PrestateRefused(f"token account {key} has extension {kind}, which the rebuild does not support")
+        offset += 4 + length
 
 
 def rebuild_token_account(items, key, final):
@@ -417,7 +442,8 @@ def rebuild_token_account(items, key, final):
     # extensions follow an account type byte, 2 for a token account.
     if len(data) < 165 or (len(data) > 165 and data[165] != 2) or data[108] != 1:
         raise PrestateRefused(f"account {key} is not an initialized, unfrozen token account")
-    check_amount_only(items, key, final["owner"])
+    check_static_extensions(key, data)
+    check_amount_only(items, key, final["owner"], to_base58(data[32:64]))
     first = next(item for item in items if key in ordered_keys(item))
     index = ordered_keys(first).index(key)
     balances = [entry for entry in first["meta"].get("preTokenBalances") or [] if entry["accountIndex"] == index]
