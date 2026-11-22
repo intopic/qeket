@@ -176,6 +176,18 @@ class AttestationTest(unittest.TestCase):
                 worker_vote.submit_vote(event, bundle, evidence, KEYPAIR, to_base58(bytes([5]) * 32))
 
 
+    def test_vote_priority_fee_is_validated_once_and_empty_means_none(self):
+        self.assertEqual(worker_vote.vote_priority_fee({}), 0)
+        self.assertEqual(worker_vote.vote_priority_fee({"CANARY_VOTE_PRIORITY_FEE": ""}), 0)
+        self.assertEqual(worker_vote.vote_priority_fee({"CANARY_VOTE_PRIORITY_FEE": " 1200 "}), 1200)
+        self.assertEqual(worker_vote.vote_priority_fee({"CANARY_VOTE_PRIORITY_FEE": str(2**64 - 1)}), 2**64 - 1)
+        for value in ("-1", "1.5", "abc", "1e3", str(2**64)):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "micro-lamports"):
+                worker_vote.vote_priority_fee({"CANARY_VOTE_PRIORITY_FEE": value})
+        # fly_listener reads it at startup, before any proposal can be refused over it.
+        source = Path(__file__).with_name("fly_listener.py").read_text(encoding="utf-8")
+        self.assertLess(source.index("vote_priority_fee()"), source.index("attestor = Attestor("))
+
     def test_vote_intent_is_written_after_authorization_and_before_sending(self):
         event = dict(target=to_base58(bytes([1]) * 32), nonce=0, anchor_slot=1, replay_slots=2,
                      proposal=to_base58(bytes([2]) * 32))
@@ -215,8 +227,10 @@ class AttestationTest(unittest.TestCase):
                 finalized.assert_called_once_with("sig", rebroadcast=ANY)
                 finalized.call_args.kwargs["rebroadcast"]()
             signed.assert_called_once()
-            budget, verify, submit = signed.call_args.args[1]
-            self.assertEqual(budget, ("ComputeBudget111111111111111111111111111111", [], struct.pack("<BQ", 3, 1200)))
+            limit, price, verify, submit = signed.call_args.args[1]
+            # The fee is charged on the declared limit, not on the ~200k default.
+            self.assertEqual(limit, ("ComputeBudget111111111111111111111111111111", [], struct.pack("<BI", 2, 60_000)))
+            self.assertEqual(price, ("ComputeBudget111111111111111111111111111111", [], struct.pack("<BQ", 3, 1200)))
             self.assertEqual(verify[0], "Ed25519SigVerify111111111111111111111111111")
             self.assertEqual(submit[0], gate)
         self.assertEqual(len(sent), 2)

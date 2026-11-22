@@ -20,7 +20,7 @@ from worker_build import FEATURE, BuildFailed, build_candidate, remote_build
 from worker_http import start_http
 from worker_notify import notify
 from worker_vote import (CandidateRejected, ReplayIncomplete, VoteRefused, attest, discard_job_files, finalized_vote,
-                         load_keypair)
+                         load_keypair, vote_priority_fee)
 
 MAX_BUILD_ATTEMPTS = 3
 
@@ -526,6 +526,8 @@ def main():
     local = urlsplit(os.environ["RPC_URL"]).hostname in ("127.0.0.1", "localhost")
     cluster = "localnet" if local else check_cluster(rpc("getGenesisHash"))
     keypair = load_keypair()
+    # A bad value must stop the worker here, not refuse a proposal when it votes.
+    vote_priority_fee()
     runner, toolchain = os.environ.get("CANARY_GATE_BIN"), os.environ.get("CANARY_SBF_TOOLCHAIN")
     tools = toolchain or os.environ.get("CANARY_PLATFORM_TOOLS") or os.environ.get("CANARY_BUILDER_HOST")
     keep = os.environ.get("CANARY_KEEP_JOB_FILES") == "1"
