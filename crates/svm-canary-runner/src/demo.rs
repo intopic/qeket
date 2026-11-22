@@ -773,6 +773,55 @@ pub fn fuzz_votes(gate: &[u8], iterations: u64, seed: u64) -> Result<()> {
     Ok(())
 }
 
+/// A buffer handed to the gate without a proposal, as after a failed CI run,
+/// returns its rent through governance. A proposed buffer cannot be closed this way.
+fn check_orphan_reclaim(
+    vm: &mut LiteSVM,
+    payer: &Keypair,
+    gov: &Keypair,
+    cfg: Pubkey,
+    proposed: Pubkey,
+) -> Result<()> {
+    let orphan = Pubkey::new_unique();
+    let mut data = bincode::serialize(&loader::UpgradeableLoaderState::Buffer {
+        authority_address: Some(cfg),
+    })?;
+    data.extend_from_slice(b"\x7fELF orphan");
+    let state = account(vm, loader::ID, data, false);
+    vm.set_account(orphan, state)?;
+    let reclaim = |buffer: Pubkey| {
+        ix(
+            accounts::ReclaimOrphanBuffer {
+                governance_authority: gov.pubkey(),
+                config: cfg,
+                buffer,
+                reservation: Pubkey::find_program_address(
+                    &[b"buffer", cfg.as_ref(), buffer.as_ref()],
+                    &ID,
+                )
+                .0,
+                spill: payer.pubkey(),
+                loader_program: loader::ID,
+            },
+            instruction::ReclaimOrphanBuffer {},
+        )
+    };
+    rejected(
+        send(&mut vm.clone(), payer, &[gov], &[reclaim(proposed)]),
+        "WrongStatus",
+    )?;
+    let mut orphaned = vm.clone();
+    let before = orphaned.get_balance(&payer.pubkey()).unwrap();
+    let rent = orphaned.get_balance(&orphan).unwrap();
+    send(&mut orphaned, payer, &[gov], &[reclaim(orphan)])?;
+    ensure!(
+        orphaned.get_account(&orphan).is_none()
+            && orphaned.get_balance(&payer.pubkey()) == Some(before + rent - 10_000),
+        "orphan buffer rent was not returned"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_governance(
     mut vm: LiteSVM,
@@ -789,6 +838,7 @@ fn check_governance(
     close: &Instruction,
 ) -> Result<()> {
     check_authorities(&vm, payer, gov, emergency, cfg, pd)?;
+    check_orphan_reclaim(&mut vm, payer, gov, cfg, buffer)?;
     let pending = Pubkey::find_program_address(&[b"policy", cfg.as_ref()], &ID).0;
     let mut new = policy.clone();
     new.threshold = 3;

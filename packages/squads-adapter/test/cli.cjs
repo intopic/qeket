@@ -111,7 +111,8 @@ test("propose wraps propose_buffer_upgrade for the multisig after checking the b
     [buffer, adapter.LOADER, bufferData(config, elf)],
   ], { signatures: traffic(0.5) });
   const options = { gate, target, multisigPda, vaultIndex: 0, buffer, elf, commit: "ab".repeat(20), maxReplayTxs: 500,
-                    creator, transactionIndex: 7n, recentBlockhash: PublicKey.default.toBase58() };
+                    creator, transactionIndex: 7n, recentBlockhash: PublicKey.default.toBase58(),
+                    sleep: async () => {}, bufferAttempts: 2 };
   const built = await cli.buildProposal(rpc, options);
   const data = built.gateInstruction.data;
   assert.deepEqual(data.subarray(0, 8), ixTag("propose_buffer_upgrade"));
@@ -139,6 +140,20 @@ test("propose wraps propose_buffer_upgrade for the multisig after checking the b
     [buffer, adapter.LOADER, bufferData(key(), elf)],
   ], { signatures: traffic(0.5) });
   await assert.rejects(cli.buildProposal(foreign, options), /buffer authority must be the gate config/);
+});
+
+test("propose waits until the finalized bank shows the authority handoff", async () => {
+  const gate = key(), target = key(), buffer = key();
+  const elf = Buffer.from("ELF candidate");
+  const config = adapter.configAddress({ gate, target });
+  // The Solana CLI returns at "confirmed": the first finalized reads still show the uploader.
+  const states = [bufferData(key(), elf), bufferData(key(), elf), bufferData(config, elf)];
+  const waits = [];
+  const rpc = { getAccountInfo: async () => ({ owner: adapter.LOADER, data: states.shift() ?? bufferData(config, elf) }) };
+  await cli.waitForBuffer(rpc, buffer, config, elf, async ms => { waits.push(ms); }, 5);
+  assert.deepEqual(waits, [2000, 2000]);
+  const stale = { getAccountInfo: async () => ({ owner: adapter.LOADER, data: bufferData(key(), elf) }) };
+  await assert.rejects(cli.waitForBuffer(stale, buffer, config, elf, async () => {}, 3), /buffer authority must be the gate/);
 });
 
 test("the next Squads transaction index comes from the multisig account", async () => {
@@ -179,11 +194,20 @@ test("status reports votes and execute waits for quorum, timelock and expiry", a
   const executed = await cli.main(["execute", ...args, "--keypair", join(dir, "payer.json")], () => due);
   assert.equal(executed.executed, true);
   const [tx] = due.sent;
-  const [ix] = tx.instructions;
+  const [budget, ix] = tx.instructions;
+  // Upgrading verifies the whole new program, far beyond the default 200,000 CU.
+  assert.equal(budget.programId.toBase58(), "ComputeBudget111111111111111111111111111111");
+  assert.deepEqual([budget.data[0], budget.data.readUInt32LE(1)], [2, 1_400_000]);
   assert.ok(ix.programId.equals(gate));
   assert.deepEqual(ix.data.subarray(0, 8), ixTag("execute_gated_upgrade"));
   assert.ok(ix.keys[1].pubkey.equals(adapter.proposalAddress({ gate, target, nonce })));
   assert.ok(ix.keys[4].pubkey.equals(buffer) && ix.keys[5].pubkey.equals(spill));
+
+  const priced = fakeRpc(accountsFor(ready), { blockTime: 4_600 });
+  await cli.main(["execute", ...args, "--keypair", join(dir, "payer.json"), "--priority-fee", "5000"], () => priced);
+  const price = priced.sent[0].instructions[0];
+  assert.deepEqual([price.data[0], price.data.readBigUInt64LE(1)], [3, 5000n]);
+  await assert.rejects(cli.main(["execute", ...args, "--priority-fee=-1"], () => priced), /micro-lamports/);
 
   for (const [proposal, blockTime, reason] of [
     [{ status: 0 }, 4_600, /is Pending/], [ready, 100_001, /expired/], [{ status: 2 }, 4_600, /is Executed/],

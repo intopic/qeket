@@ -105,6 +105,16 @@ export function proposeBufferUpgrade(input: Upgrade & Vault & {
   ], Buffer.concat([spill.toBuffer(), elfSha256, gitCommit, anchor, u64(replaySlots)]));
 }
 
+/**
+ * Return the rent of a buffer that was handed to the gate but never proposed, for example
+ * after a failed CI run. A proposed buffer is released only through `reclaimBuffer`.
+ */
+export function reclaimOrphanBuffer(input: Context & Vault & { buffer: PublicKey; spill: PublicKey }) {
+  return ix(input.gate, "reclaim_orphan_buffer", [
+    ro(vault(input), true), ro(config(input)), rw(input.buffer), ro(reservation(input)), rw(input.spill), ro(loader),
+  ]);
+}
+
 /** Governance withdraws a pending or ready proposal. `reclaimBuffer` then returns the buffer's rent. */
 export function cancelProposal(input: Context & Vault & { nonce: bigint }) {
   return ix(input.gate, "cancel_proposal", [ro(vault(input), true), ro(config(input)), rw(proposal(input))]);

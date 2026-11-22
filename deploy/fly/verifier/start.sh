@@ -19,13 +19,21 @@ mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup
 mkdir -p /data/docker /data/jobs /data/home /data/tmp
 # Builds use --network none. The bridge is unnecessary, and apt-get in the
 # builder image uses host networking.
+# The log restarts with each boot and keeps warnings only.
 dockerd --data-root /data/docker --bridge=none --iptables=false --ip6tables=false --group docker \
-  >/data/dockerd.log 2>&1 &
+  --log-level=warn >/data/dockerd.log 2>&1 &
 for _ in $(seq 1 60); do
   docker info >/dev/null 2>&1 && break
   sleep 1
 done
 docker info >/dev/null 2>&1 || { tail -20 /data/dockerd.log >&2; exit 1; }
+# Keep the 10 GB volume bounded: crates from earlier builds and builder images
+# from earlier Dockerfiles. Builds now use a Cargo home inside their scratch
+# directory (CANARY_EPHEMERAL_CARGO_HOME).
+rm -rf /data/home/.cargo/registry /data/home/.cargo/git
+current=$(cd /worker && python -c 'import worker_build; print(worker_build.IMAGE)')
+docker image ls --format '{{.Repository}}:{{.Tag}}' canary-live-builder | grep -vxF "$current" \
+  | xargs -r docker image rm >/dev/null 2>&1 || true
 chown 65534:65534 /data /data/jobs /data/home /data/tmp
 export PATH="$tools/rust/bin:$PATH" CANARY_PLATFORM_TOOLS="$tools" HOME=/data/home \
   CARGO_HOME=/data/home/.cargo TMPDIR=/data/tmp

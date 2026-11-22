@@ -1,5 +1,6 @@
 """Rebuild a candidate from its commit with the same offline container the proposer uses."""
 import argparse
+import hashlib
 import json
 import sys
 import os
@@ -9,12 +10,15 @@ import shutil
 import subprocess
 import tempfile
 
-IMAGE = "canary-live-builder"
 # The SBF compiler is mounted read-only from pinned platform tools. The image
-# provides only the host linker and C runtime for build scripts.
-DOCKERFILE = """FROM ubuntu:24.04
+# provides only the host linker and C runtime for build scripts. The base is
+# pinned by digest so verifiers and clients that build it on different days
+# start from the same layers.
+DOCKERFILE = """FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential libssl-dev libclang-dev && rm -rf /var/lib/apt/lists/*
 """
+# Named after the Dockerfile, so a host with an older builder image rebuilds it.
+IMAGE = "canary-live-builder:" + hashlib.sha256(DOCKERFILE.encode()).hexdigest()[:16]
 SKIPPED = {".git", ".cargo", "target", "rust-toolchain", "rust-toolchain.toml"}
 FEATURE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*(/[A-Za-z0-9_][A-Za-z0-9_-]*)?")
 
@@ -65,8 +69,13 @@ def copy_source(source, destination):
 
 def vendor(directory):
     (directory / ".cargo").mkdir()
+    env = None
+    if os.environ.get("CANARY_EPHEMERAL_CARGO_HOME") == "1":
+        # Long-running verifiers download every customer's crates. A Cargo home
+        # inside the build's scratch directory is deleted with it.
+        env = dict(os.environ, CARGO_HOME=str(directory.parent / "cargo-home"))
     with (directory / ".cargo/config.toml").open("wb") as config:
-        run(["cargo", "vendor", "--locked", "vendor"], cwd=directory, stdout=config)
+        run(["cargo", "vendor", "--locked", "vendor"], cwd=directory, stdout=config, env=env)
 
 
 def ensure_image():
