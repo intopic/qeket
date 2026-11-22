@@ -76,7 +76,7 @@ def config_details(account, target, gate):
     if len(data) != 371 or not data.startswith(CONFIG_TAG) or data[8] != 2 or to_base58(data[10:42]) != target:
         raise PrestateRefused("expected the v2 gate config for this target")
     mode, count, threshold = data[106], data[331], data[332]
-    if mode >= len(REPLAY_MODES) or not 2 <= threshold <= count <= 7:
+    if mode >= len(REPLAY_MODES) or not 1 <= threshold <= count <= 7:
         raise PrestateRefused("invalid gate policy")
     max_cu, min_txs, min_slots = struct.unpack_from("<HIQ", data, 333)
     return {

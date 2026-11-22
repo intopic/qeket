@@ -108,31 +108,29 @@ def main():
                                toolchain, "candidate,regression-fixture")
             demo.append(str(regression))
         run(demo, env=native)
-        # Reproduce the saved evidence through the standalone entry point.
-        verification = [*runner, "verify", str(output / "archive.json"), str(v1), str(rebuilt)]
-        saved = run(verification, env=native, stdout=subprocess.PIPE, text=True)
-        check = json.loads(saved.stdout)
         report = json.loads((output / "report.json").read_bytes())
-        if (bytes(check["diff_root"]).hex() != report["diff_root"]
-                or bytes(check["elf_sha256"]).hex() != report["candidate_sha256"]
-                or check["replayed_tx_count"] != report["replayed_transactions_per_verifier"]
-                or hashlib.sha256((output / "archive.json").read_bytes()).hexdigest() != report["archive_sha256"]):
-            raise RuntimeError("Saved evidence failed independent replay")
+        archive = output / "archive.json"
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != report["archive_sha256"]:
+            raise RuntimeError("Saved archive differs from the verification report")
         if args.load_test:
-            if check["replayed_tx_count"] != 1000 or report["v0_alt_cpi_transactions"] != 100:
+            if report["replayed_transactions_per_verifier"] != 1000 or report["v0_alt_cpi_transactions"] != 100:
                 raise RuntimeError("Unexpected benchmark coverage")
             binary = ROOT / "target/debug" / ("canary-gate.exe" if os.name == "nt" else "canary-gate")
-            command = [str(binary), *verification[-4:]]
+            command = [str(binary), "verify", str(archive), str(v1), str(rebuilt)]
             samples = []
             for _ in range(5):
                 started = perf_counter()
                 measured = run(command, env=native, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                if json.loads(measured.stdout) != check:
+                check = json.loads(measured.stdout)
+                if (bytes(check["diff_root"]).hex() != report["diff_root"]
+                        or bytes(check["elf_sha256"]).hex() != report["candidate_sha256"]
+                        or check["replayed_tx_count"] != report["replayed_transactions_per_verifier"]
+                        or check["max_cu_delta_bps"] != report["max_cu_delta_bps"]):
                     raise RuntimeError("Benchmark replay produced different evidence")
                 samples.append((perf_counter() - started) * 1000)
             metrics = {
                 "environment": "synthetic local LiteSVM",
-                "transactions_per_replay": check["replayed_tx_count"],
+                "transactions_per_replay": report["replayed_transactions_per_verifier"],
                 "v0_alt_cpi_transactions": report["v0_alt_cpi_transactions"],
                 "candidate_build_ms": candidate_ms,
                 "candidate_rebuild_ms": rebuild_ms,

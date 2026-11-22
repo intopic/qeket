@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 
+VOTE_KEY = "vote0"
 ROOT = Path(__file__).resolve().parents[1]
 FINAL_STATUSES = {"voted", "executed", "verified", "refused", "rejected"}
 
@@ -27,7 +28,7 @@ def start(args):
     }}
     (work / "customers.json").write_text(json.dumps(customers, indent=2), encoding="utf-8")
     env = dict(os.environ, GATE_PROGRAM_ID=gate, PYTHONPATH=str(ROOT / "scripts"),
-               CANARY_VERIFIER_KEYPAIR_FILE=str(PRIVATE / args.key),
+               CANARY_VERIFIER_KEYPAIR_FILE=str(PRIVATE / VOTE_KEY),
                CANARY_GATE_BIN=str((ROOT / "target/debug/canary-gate").resolve()),
                # Test runs keep archives as CI artifacts. Production workers delete them.
                CANARY_KEEP_JOB_FILES="1")
@@ -45,7 +46,7 @@ def start(args):
         for line in (work / "worker.log").read_text(errors="replace").splitlines():
             if '"worker_started"' in line:
                 started = json.loads(line)
-                if not started["attestation"] or started["verifier"] != str(key(args.key).pubkey()):
+                if not started["attestation"] or started["verifier"] != str(key(VOTE_KEY).pubkey()):
                     raise SystemExit("worker started without attestation: " + line)
                 print(line, flush=True)
                 return
@@ -71,9 +72,12 @@ def wait(args):
     while time.monotonic() < deadline:
         row = outcome(work)
         if row and row[1] in FINAL_STATUSES and (row[1] in want or row[1] in ("refused", "rejected")):
-            evidence = next(work.glob("jobs/*/evidence.json"), None)
-            print(json.dumps(dict(proposal=row[0], status=row[1], reason=row[2],
-                                  evidence=json.loads(evidence.read_text()) if evidence else None)), flush=True)
+            path = work / "jobs" / row[0] / "evidence.json"
+            evidence = json.loads(path.read_text()) if path.is_file() else None
+            if row[1] in want and args.expected_transactions is not None:
+                if not evidence or evidence["replayed_tx_count"] != args.expected_transactions:
+                    raise SystemExit(f"expected {args.expected_transactions} replayed transactions: {evidence}")
+            print(json.dumps(dict(proposal=row[0], status=row[1], reason=row[2], evidence=evidence)), flush=True)
             raise SystemExit(0 if row[1] in want else 1)
         time.sleep(5)
     print(json.dumps(dict(status="timeout", last=outcome(work))), flush=True)
@@ -93,11 +97,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     starter = sub.add_parser("start")
-    starter.add_argument("--key", required=True, choices=["vote0", "vote1", "vote2"])
     starter.add_argument("--repo-url", default=os.environ.get("CANARY_REPO_URL", "https://github.com/intopic/qeket"))
     waiter = sub.add_parser("wait")
     waiter.add_argument("--timeout", type=int, default=2400)
     waiter.add_argument("--until", default="voted,executed")
+    waiter.add_argument("--expected-transactions", type=int)
     stopper = sub.add_parser("stop")
     for command in (starter, waiter, stopper):
         command.add_argument("--workdir", type=Path, required=True)

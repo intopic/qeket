@@ -91,8 +91,13 @@ test("governance instructions follow the gate's account order", () => {
   const emergency = key();
   const init = adapter.initializeGatekeeper({ ...input, emergency, policy });
   assert.deepEqual(init.data.subarray(8, -32), queue.data.subarray(8));
+  const single = { ...policy, verifiers: [verifiers[0]], threshold: 1 };
+  const singleInit = adapter.initializeGatekeeper({ ...input, emergency, policy: single });
+  const singleUpdate = adapter.proposeConfigUpdate({ ...input, policy: single });
+  assert.deepEqual([...singleInit.data.subarray(233, 235)], [1, 1]);
+  assert.deepEqual(singleInit.data.subarray(8, -32), singleUpdate.data.subarray(8));
   assert.ok(new PublicKey(init.data.subarray(-32)).equals(emergency));
-  assert.throws(() => adapter.proposeConfigUpdate({ ...input, policy: { ...policy, threshold: 1 } }), /quorum/);
+  assert.throws(() => adapter.proposeConfigUpdate({ ...input, policy: { ...policy, threshold: 0 } }), /quorum/);
   assert.throws(() => adapter.proposeConfigUpdate({ ...input, policy: { ...policy, replayMode: "Loose" } }), /replay mode/);
 
   const payer = key();

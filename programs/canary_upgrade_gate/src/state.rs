@@ -37,7 +37,7 @@ impl Policy {
         let n = usize::from(self.verifier_count);
         require!(
             n <= self.verifiers.len()
-                && self.threshold >= 2
+                && self.threshold > 0
                 && self.threshold <= self.verifier_count
                 && self.min_replay_txs > 0
                 && self.min_replay_slots > 0
