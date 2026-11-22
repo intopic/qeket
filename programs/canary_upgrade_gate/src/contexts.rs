@@ -166,6 +166,25 @@ pub struct ReclaimBuffer<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ReclaimOrphanBuffer<'info> {
+    pub governance_authority: Signer<'info>,
+    #[account(has_one = governance_authority, seeds = [b"gatekeeper_cfg", config.target_program.as_ref()], bump = config.bump)]
+    pub config: Account<'info, GatekeeperConfig>,
+    /// CHECK: loader ownership here; Buffer variant and gate authority checked in the handler.
+    #[account(mut, owner = loader::ID)]
+    pub buffer: UncheckedAccount<'info>,
+    /// CHECK: the buffer's reservation PDA, which must not exist for an orphan.
+    #[account(seeds = [b"buffer", config.key().as_ref(), buffer.key().as_ref()], bump)]
+    pub reservation: UncheckedAccount<'info>,
+    /// CHECK: rent recipient chosen by governance.
+    #[account(mut)]
+    pub spill: UncheckedAccount<'info>,
+    /// CHECK: native loader.
+    #[account(executable, address = loader::ID)]
+    pub loader_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct QueueAuthority<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,

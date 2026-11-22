@@ -65,6 +65,9 @@ test("governance instructions follow the gate's account order", () => {
     [[vault, true, false], [cfg, false, false], [proposal, false, true]]);
   check(adapter.closeProposal(input), "close_proposal",
     [[vault, true, false], [cfg, false, false], [proposal, false, true], [reservation, false, true], [input.spill, false, true]]);
+  check(adapter.reclaimOrphanBuffer(input), "reclaim_orphan_buffer",
+    [[vault, true, false], [cfg, false, false], [input.buffer, false, true], [reservation, false, false],
+     [input.spill, false, true], [loader, false, false]]);
 
   const verifiers = [key(), key(), key()];
   const policy = {

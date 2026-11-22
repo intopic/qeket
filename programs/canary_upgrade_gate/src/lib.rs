@@ -244,6 +244,36 @@ pub mod canary_upgrade_gate {
         Ok(())
     }
 
+    /// Close a buffer that was handed to the gate but never proposed, for
+    /// example after a failed CI run, and return its rent. A proposed buffer
+    /// has a reservation and is released only through `reclaim_buffer`.
+    pub fn reclaim_orphan_buffer(ctx: Context<ReclaimOrphanBuffer>) -> Result<()> {
+        let a = ctx.accounts;
+        require!(
+            a.reservation.data_is_empty()
+                && a.reservation.owner == &anchor_lang::system_program::ID,
+            GateError::WrongStatus
+        );
+        require_keys_neq!(a.spill.key(), a.buffer.key(), GateError::WrongLoaderAccount);
+        check_buffer(&a.buffer, a.config.key())?;
+        let ix = loader::close_any(&a.buffer.key(), &a.spill.key(), Some(&a.config.key()), None);
+        invoke_signed(
+            &ix,
+            &[
+                a.buffer.to_account_info(),
+                a.spill.to_account_info(),
+                a.config.to_account_info(),
+                a.loader_program.to_account_info(),
+            ],
+            &[&[
+                b"gatekeeper_cfg",
+                a.config.target_program.as_ref(),
+                &[a.config.bump],
+            ]],
+        )?;
+        Ok(())
+    }
+
     pub fn propose_authority_change(
         ctx: Context<QueueAuthority>,
         role: AuthorityRole,
