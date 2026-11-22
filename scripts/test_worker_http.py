@@ -16,7 +16,7 @@ from devnet import to_base58
 from fly_listener import Admissions, GATE, customer_policies
 from live_capture import EMERGENCY, GATE as EVENT_GATE, UPGRADE, UnsupportedReplayVersion, capture, gate_events
 from worker_http import start_http
-from worker_notify import post_customer, public_address
+from worker_notify import notify, post_customer, public_addresses
 
 
 class WorkerTest(unittest.TestCase):
@@ -84,9 +84,9 @@ class WorkerTest(unittest.TestCase):
         addresses = [(None, None, None, None, (ip, 443)) for ip in ("8.8.8.8", "127.0.0.1")]
         with patch("worker_notify.socket.getaddrinfo", return_value=addresses):
             with self.assertRaisesRegex(ValueError, "non-public"):
-                public_address("customer.example", 443)
+                public_addresses("customer.example", 443)
         with patch("worker_notify.HTTPSConnection") as connection, patch(
-                "worker_notify.public_address", return_value="8.8.8.8"):
+                "worker_notify.public_addresses", return_value=["8.8.8.8"]):
             conn = connection.return_value
             conn.port = 443
             conn.getresponse.return_value.status = 307
@@ -95,6 +95,37 @@ class WorkerTest(unittest.TestCase):
             connection.assert_called_once_with("customer.example", 443, timeout=3)
             conn.request.assert_called_once()
             conn.close.assert_called_once()
+
+    def test_customer_webhook_tries_ipv4_before_ipv6(self):
+        """Fly Machines have no public IPv6 route, and dual-stack DNS often lists IPv6 first."""
+        dual = [(None, None, None, None, (ip, 443)) for ip in ("2606:4700::6810:1", "104.16.0.1", "104.16.0.1")]
+        with patch("worker_notify.socket.getaddrinfo", return_value=dual):
+            self.assertEqual(public_addresses("customer.example", 443), ["104.16.0.1", "2606:4700::6810:1"])
+        # Every validated address is tried in order until one connects.
+        with patch("worker_notify.HTTPSConnection") as connection, patch(
+                "worker_notify.public_addresses", return_value=["104.16.0.1", "2606:4700::6810:1"]):
+            conn = connection.return_value
+            conn.port = 443
+            conn.getresponse.return_value.status = 200
+            post_customer("https://customer.example/events", "{}")
+            sock = object()
+            with patch("worker_notify.socket.create_connection", side_effect=[OSError("unreachable"), sock]) as dial:
+                self.assertIs(conn._create_connection(None, 3, None), sock)
+            self.assertEqual([c.args[0] for c in dial.call_args_list], [("104.16.0.1", 443), ("2606:4700::6810:1", 443)])
+            with patch("worker_notify.socket.create_connection", side_effect=OSError("down")):
+                with self.assertRaisesRegex(OSError, "down"):
+                    conn._create_connection(None, 3, None)
+
+    def test_customer_slack_webhook_gets_text_and_blocks(self):
+        details = {"proposal": "P", "verifier": "V"}
+        with patch("worker_notify.post_customer") as post, patch.dict("os.environ", {}, clear=True):
+            notify("VoteSubmitted", details, "https://hooks.slack.com/services/T0/B0/x")
+            notify("VoteSubmitted", details, "https://customer.example/events")
+        slack, plain = (json.loads(call.args[1]) for call in post.call_args_list)
+        self.assertEqual(slack["text"], "VoteSubmitted")
+        self.assertEqual(json.loads(slack["blocks"][0]["text"]["text"]), {"event": "VoteSubmitted", **details})
+        self.assertEqual(slack["blocks"][0]["text"]["type"], "plain_text")
+        self.assertEqual(plain, {"event": "VoteSubmitted", **details})
 
     def test_finalized_gate_lifecycle_decoding(self):
         proposal = bytes([1]) * 32

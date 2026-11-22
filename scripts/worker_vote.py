@@ -33,6 +33,26 @@ class VoteRefused(ValueError):
     """The gate refused the vote. Retrying the same vote cannot succeed."""
 
 
+COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111"
+# The attestation stays under 25,000 CU in the LiteSVM demo. A priority fee is
+# charged on the limit, so a paid vote declares one instead of the ~200k default.
+VOTE_COMPUTE_UNITS = 60_000
+
+
+def vote_priority_fee(environ=os.environ):
+    """CANARY_VOTE_PRIORITY_FEE in micro-lamports per CU. Unset or empty means none.
+
+    fly_listener reads it at startup, so a bad value stops the worker there
+    instead of refusing a proposal when the vote is sent.
+    """
+    raw = environ.get("CANARY_VOTE_PRIORITY_FEE", "").strip()
+    if not raw:
+        return 0
+    if not raw.isdigit() or int(raw) > 2**64 - 1:
+        raise ValueError("CANARY_VOTE_PRIORITY_FEE must be a whole number of micro-lamports per CU")
+    return int(raw)
+
+
 def load_keypair(environ=os.environ):
     if environ.get("CANARY_VERIFIER_KEYPAIR"):
         return Keypair.from_json(environ["CANARY_VERIFIER_KEYPAIR"])
@@ -132,12 +152,11 @@ def submit_vote(event, bundle, evidence, keypair, gate, authorize=None, director
     verify = ed25519_instruction(keypair.public, keypair.sign(payload), payload)
     submit = (gate, [(bundle["config_address"], False, False), (event["proposal"], False, True),
                      (INSTRUCTIONS_SYSVAR, False, False)], anchor_discriminator("submit_verified_attestation"))
-    price = int(os.environ.get("CANARY_VOTE_PRIORITY_FEE", "0"))
-    if not 0 <= price <= 2**64 - 1:
-        raise ValueError("CANARY_VOTE_PRIORITY_FEE must be a u64 in micro-lamports per CU")
+    price = vote_priority_fee()
     instructions = [verify, submit]
     if price:
-        instructions.insert(0, ("ComputeBudget111111111111111111111111111111", [], struct.pack("<BQ", 3, price)))
+        instructions[:0] = [(COMPUTE_BUDGET, [], struct.pack("<BI", 2, VOTE_COMPUTE_UNITS)),
+                            (COMPUTE_BUDGET, [], struct.pack("<BQ", 3, price))]
     raw = transaction(keypair.address, instructions, blockhash, [keypair])
     encoded = base64.b64encode(raw).decode()
     if directory is not None:
