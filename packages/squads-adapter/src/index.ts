@@ -47,7 +47,7 @@ function encodePolicy(policy: Policy) {
   if (policy.replayMode !== "StrictEquality" && policy.replayMode !== "NoRevertAndCuBound") {
     throw new Error("invalid replay mode");
   }
-  if (policy.verifiers.length > 7 || policy.threshold < 2 ||
+  if (policy.verifiers.length > 7 || !Number.isInteger(policy.threshold) || policy.threshold < 1 ||
       policy.threshold > policy.verifiers.length || new Set(policy.verifiers.map(k => k.toBase58())).size !== policy.verifiers.length) {
     throw new Error("invalid verifier quorum");
   }

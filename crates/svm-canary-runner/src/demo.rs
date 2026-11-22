@@ -225,7 +225,7 @@ pub fn run(
     let payer = Keypair::new();
     let governance = Keypair::new();
     let emergency = Keypair::new();
-    let nodes = [Keypair::new(), Keypair::new(), Keypair::new()];
+    let verifier = Keypair::new();
     vm.airdrop(&payer.pubkey(), 100_000_000_000)
         .map_err(|e| anyhow!("{e:?}"))?;
     vm.add_program(ID, gate)?;
@@ -264,14 +264,12 @@ pub fn run(
     vm.set_account(buffer, account(&vm, loader::ID, buf, false))?;
     clock(&mut vm, 100, 1000);
     let mut verifiers = [Pubkey::default(); 7];
-    for (slot, node) in verifiers.iter_mut().zip(&nodes) {
-        *slot = node.pubkey();
-    }
+    verifiers[0] = verifier.pubkey();
     let policy = Policy {
         replay_mode: Default::default(),
         verifiers,
-        verifier_count: 3,
-        threshold: 2,
+        verifier_count: 1,
+        threshold: 1,
         max_cu_delta_bps: 1500,
         min_replay_txs: 250,
         min_replay_slots: 2,
@@ -413,73 +411,47 @@ pub fn run(
     );
     let mut altered_buffer = archive.clone();
     altered_buffer.buffer.data[loader::UpgradeableLoaderState::size_of_buffer_metadata()] ^= 1;
-    for binary in [candidate, rebuilt, candidate] {
-        let error = verify(&altered_buffer, baseline, binary)
-            .err()
-            .context("changed buffer unexpectedly verified")?;
-        ensure!(error.to_string() == "rebuilt ELF differs from locked buffer");
-    }
-    let mut measured = Vec::new();
-    let mut consensus = None;
-    let mut vote_message = None;
-    let mut verifier_ms = Vec::new();
-    // The middle verifier supplies a conflicting vote and is then unavailable.
-    for (node, local_build) in [&nodes[0], &nodes[2]].into_iter().zip([candidate, rebuilt]) {
-        let started = Instant::now();
-        let evidence = verify(&archive, baseline, local_build)?;
-        verifier_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
-        if let Some(previous) = &consensus {
-            ensure!(previous == &evidence, "verifiers disagree");
-        }
-        let payload = CanaryAttestationPayload {
-            domain_separator: evidence.replay_mode.domain(),
-            target_program: target,
-            proposal_nonce: p.nonce,
-            buffer_account: buffer,
-            anchor_slot: p.anchor_slot,
-            replay_slots: p.replay_slots,
-            elf_sha256: evidence.elf_sha256,
-            diff_root: evidence.diff_root,
-            replayed_tx_count: evidence.replayed_tx_count,
-            failed_tx_count: 0,
-            max_cu_delta_bps: evidence.max_cu_delta_bps,
-            expires_at_slot: 150,
-        };
-        let vote = verified_vote(node, &payload, &submit)?;
-        let (size, meta) = send(&mut vm, &payer, &[], &vote)?;
-        if vote_message.is_none() {
-            let message =
-                anchor_lang::solana_program::message::Message::new(&vote, Some(&payer.pubkey()));
-            vote_message = Some(message.serialize());
-        }
-        ensure!(
-            size < 650 && meta.compute_units_consumed < 25_000,
-            "attestation exceeded budget: {size} B / {} CU",
-            meta.compute_units_consumed
-        );
-        measured.push((size, meta.compute_units_consumed));
-        if consensus.is_none() {
-            rejected(send(&mut vm, &payer, &[], &vote), "AlreadyVoted")?;
-            let mut conflict = payload.clone();
-            conflict.diff_root[0] ^= 1;
-            let wrong_vote = verified_vote(&nodes[1], &conflict, &submit)?;
-            rejected(send(&mut vm, &payer, &[], &wrong_vote), "RootMismatch")?;
-            let unchanged: UpgradeProposal = load(&vm, proposal)?;
-            ensure!(
-                unchanged.attestation_count == 1 && unchanged.diff_root == payload.diff_root,
-                "conflicting vote changed the proposal"
-            );
-            rejected(
-                send(&mut vm, &payer, &[], std::slice::from_ref(&execute)),
-                "WrongStatus",
-            )?;
-        }
-        consensus = Some(evidence);
-    }
+    let error = verify(&altered_buffer, baseline, rebuilt)
+        .err()
+        .context("changed buffer unexpectedly verified")?;
+    ensure!(error.to_string() == "rebuilt ELF differs from locked buffer");
+    rejected(
+        send(&mut vm, &payer, &[], std::slice::from_ref(&execute)),
+        "WrongStatus",
+    )?;
+    let started = Instant::now();
+    let evidence = verify(&archive, baseline, rebuilt)?;
+    let verifier_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let payload = CanaryAttestationPayload {
+        domain_separator: evidence.replay_mode.domain(),
+        target_program: target,
+        proposal_nonce: p.nonce,
+        buffer_account: buffer,
+        anchor_slot: p.anchor_slot,
+        replay_slots: p.replay_slots,
+        elf_sha256: evidence.elf_sha256,
+        diff_root: evidence.diff_root,
+        replayed_tx_count: evidence.replayed_tx_count,
+        failed_tx_count: 0,
+        max_cu_delta_bps: evidence.max_cu_delta_bps,
+        expires_at_slot: 150,
+    };
+    let vote = verified_vote(&verifier, &payload, &submit)?;
+    let (size, meta) = send(&mut vm, &payer, &[], &vote)?;
+    let vote_message =
+        anchor_lang::solana_program::message::Message::new(&vote, Some(&payer.pubkey()));
+    ensure!(
+        size < 650 && meta.compute_units_consumed < 25_000,
+        "attestation exceeded budget: {size} B / {} CU",
+        meta.compute_units_consumed
+    );
+    let measured = [(size, meta.compute_units_consumed)];
     let ready: UpgradeProposal = load(&vm, proposal)?;
     ensure!(
-        ready.status == ProposalStatus::Ready && ready.attestation_count == 2,
-        "quorum missing"
+        ready.status == ProposalStatus::Ready
+            && ready.attestation_count == 1
+            && ready.diff_root == evidence.diff_root,
+        "single vote did not approve the proposal"
     );
     rejected(
         send(&mut vm, &payer, &[], std::slice::from_ref(&execute)),
@@ -558,7 +530,6 @@ pub fn run(
         "upgrade exceeded budget: {execution_bytes} B / {} CU",
         meta.compute_units_consumed
     );
-    let evidence = consensus.context("missing quorum evidence")?;
     let archive_bytes = serde_json::to_vec(&archive)?;
     let report = serde_json::json!({"mode":"local-litesvm","source_commit":commit,"candidate_sha256":hex::encode(evidence.elf_sha256),
         "archive_sha256":hex::encode(hash(&archive_bytes)), "gate_sha256":hex::encode(hash(gate)),
@@ -566,18 +537,14 @@ pub fn run(
         "attestations_bytes_and_cu":measured,"execution_bytes":execution_bytes,"execution_cu":meta.compute_units_consumed,
         "reclaim_cancelled_and_expired_checked":true, "authority_rotation_and_exit_checked":true,
         "v0_alt_cpi_transactions":archive.records.iter().filter(|record| matches!(record.transaction.message, solana_message::VersionedMessage::V0(_))).count(),
-        "synthetic_capture_ms":capture_ms, "replay_per_verifier_ms":verifier_ms,
+        "synthetic_capture_ms":capture_ms, "replay_per_verifier_ms":[verifier_ms],
         "late_regression":regression_result,
         "local_fault_checks": {
-            "conflicting_vote_rejected":true,
-            "quorum_with_middle_verifier_absent":true,
-            "modified_buffer_rejections":3
-        }, "relaxed_mode_checked":true, "quorum":"2/3","deployed_program_data_verified":true,"candidate_invoked":true,"proposal_closed":true,"policy_rotation_checked":true,"emergency_checked":true});
+            "execution_without_vote_rejected":true,
+            "modified_buffer_rejections":1
+        }, "relaxed_mode_checked":true, "quorum":"1/1","deployed_program_data_verified":true,"candidate_invoked":true,"proposal_closed":true,"policy_rotation_checked":true,"emergency_checked":true});
     fs::create_dir_all(out)?;
-    fs::write(
-        out.join("vote-message.bin"),
-        vote_message.context("missing verified vote")?,
-    )?;
+    fs::write(out.join("vote-message.bin"), vote_message.serialize())?;
     fs::write(out.join("archive.json"), archive_bytes)?;
     fs::write(out.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -841,7 +808,6 @@ fn check_governance(
     check_orphan_reclaim(&mut vm, payer, gov, cfg, buffer)?;
     let pending = Pubkey::find_program_address(&[b"policy", cfg.as_ref()], &ID).0;
     let mut new = policy.clone();
-    new.threshold = 3;
     new.proposal_expiry_seconds += 500;
     let queue = ix(
         accounts::QueuePolicy {

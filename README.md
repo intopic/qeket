@@ -31,8 +31,8 @@ cargo fetch --locked --manifest-path examples/counter/Cargo.toml
 
 1. Skripti regjistron shembullin e projektit në një depo Git lokale brenda `target/mvp`. Dy dosje burimore marrin skedarët nga commit-i i regjistruar. Ndërtimet e kandidatit përdorin target-e të veçanta, të njëjtin Cargo.lock dhe Cargo offline. Krahasohen të gjithë bajtët.
 2. Kontrata Anchor verifikon autoritetin e qeverisjes. Loader-i i kalon PDA-së së kontratës autoritetin e programit dhe të buffer-it. Propozimi fikson hash-in e kandidatit, commit-in, versionin bazë dhe dritaren e replay-it.
-3. Një VM ekzekuton 252 transaksione lokale të nënshkruara mbi programin bazë. Arkivi ruan pozicionin e secilit në bllok. Secili nga dy verifikuesit krahason ndërtimin përkatës me buffer-in dhe riekzekuton të njëjtat transaksione në dy VM me gjendje fillestare të njëjtë. Të dy modalitetet kontrollojnë suksesin, kufirin CU dhe manifestin e transaksioneve. Çdo slot i shembullit përfshin një transaksion v0 me ComputeBudget dhe një router që thërret programin përmes CPI, duke përdorur një ALT për llogarinë e shkrueshme dhe programin e synuar.
-4. Dy nënshkrime Ed25519 mbi të njëjtën rrënjë plotësojnë kuorumin 2/3. Prova kontrollon refuzimin e votës së dyfishtë, ekzekutimin para kuorumit dhe ekzekutimin gjatë timelock-ut. Instruksioni kompakt lexon direkt mesazhin prej 186 bajtësh nga precompile-i i mëparshëm. Forma origjinale që e përsërit payload-in mbetet e mbështetur.
+3. Një VM ekzekuton transaksionet mbi programin bazë. Një verifikues krahason build-in e vet me buffer-in dhe bën replay në LiteSVM. Krahasimi përdor të njëjtën gjendje fillestare për versionin ekzistues dhe kandidatin. Prova përfshin transaksione v0 me ComputeBudget, ALT dhe CPI.
+4. Një nënshkrim Ed25519 i vlefshëm e kalon propozimin në `Ready` dhe nis timelock-un. Prova kontrollon se ekzekutimi bllokohet para votës dhe gjatë timelock-ut.
 5. Pas timelock-ut, kontrata thërret loader-in me PDA-në. Prova kontrollon bajtët e vendosur në ProgramData, ekzekuton versionin e ri dhe lexon vlerën që ai shkroi. Në një kopje tjetër të VM-së provohen rotacioni i politikës, anulimi, mbyllja e propozimit dhe rikuperimi nga autoriteti emergjent.
 
 ## Matjet në LiteSVM
@@ -79,9 +79,9 @@ Te **Settings → Secrets and variables → Actions** vendos:
 | `DEVNET_PAYER` | Array JSON i 64 bajtëve për një portofol të dedikuar, të financuar me SOL testues për rent dhe tarifa |
 | `GATE_PROGRAM_KEYPAIR` (opsional) | Array JSON i keypair-it të programit. Pa të, workflow derivon një adresë të qëndrueshme Devnet nga payer-i dhe ndërton gate-in dhe runner-in për atë adresë. |
 
-Nis **Actions → Live Devnet counter → Run workflow** në `main`. Një push provon ndërtimin offline dhe gjithë ciklin në një validator të përkohshëm, me dy worker-a të pavarur në të njëjtin runner. Vetëm nisja manuale dërgon transaksione në Devnet. Aty votat i japin job-et `verifier-a` dhe `verifier-b`, secili në runner-in e vet. Secili mban vetëm çelësin e vet të votës, kap gjendjen live në pranim, ndërton kandidatin nga commit-i i propozimit, riekzekuton dritaren dhe voton. Job-i `cycle` nuk voton. Ai pret që të dy worker-at të raportojnë `Verifier ready`, pastaj propozon, dërgon trafikun, pret kuorumin dhe kontrollon që `diff_root` i votuar të jetë i njëjtë me replay-in e snapshot-it të kontrolluar. Pas ekzekutimit, secili worker regjistron `executed`. Çdo nisje e re krijon target të ri dhe konsumon rent Devnet. Nëse një nisje dështon pasi ka inicializuar gate-in, artifact-i përmban hapat e finalizuar deri aty. Ruaj payer-in dhe run ID për rikuperimin e autoriteteve.
+Nis **Actions → Live Devnet counter → Run workflow** në `main`. Një push provon ciklin në validator të përkohshëm me një worker. Nisja manuale përdor Devnet publik. Në të njëjtin runner, skripti i ciklit propozon dhe ekzekuton upgrade-in. Worker-i ndërton kandidatin, kryen replay-in dhe jep votën e vetme. Cikli pret finalizimin e votës para ekzekutimit.
 
-Artifact-i `devnet-live-<run_id>` përmban `transactions.md` dhe arkivin e replay-it. Provën mund ta nisësh me 50–100 transaksione të counter-it, secila me ComputeBudget. Snapshot-i i shembullit merret nga RPC para propozimit për counter-in dhe fee payer-in e izoluar. Workflow kërkon pikërisht transaksionet e pritura në dritaren e finalizuar dhe rikonfirmon bytecode-in e instaluar. Counter-i nuk lexon sysvar Clock. Për programe arbitrare, komanda `python scripts/live_capture.py capture SNAPSHOT.json ARCHIVE.json --max-replay-txs 500` kërkon gjendjen historike të fillimit të dritares, përfshirë ALT, ProgramData dhe sysvars përkatëse. `minContextSlot` nuk rikthen gjendjen historike. CLI ekzistuese `canary-gate verify` riekzekuton arkivin. Në provën Devnet, ndërtimin e kandidatit dhe votimin i bëjnë worker-at e verifikuesve, jo skripti i ciklit. Artifact-et `devnet-verifier-a-<run_id>` dhe `devnet-verifier-b-<run_id>` përmbajnë logun, SQLite-in, arkivin dhe `evidence.json` të secilit.
+Artifact-i `devnet-live-<run_id>` ruan transaksionet e provës. Artifact-i `devnet-verifier-<run_id>` ruan logun, SQLite-in, arkivin e vetëm të replay-it dhe `evidence.json`. Prova përdor 50–100 transaksione të counter-it me ComputeBudget. Për programe të tjera replay-i kërkon gjendjen fillestare të llogarive dhe varësive përkatëse.
 
 
 ### Whitelist dhe kuota e klientëve
@@ -113,11 +113,17 @@ Abonimet B2B faturohen jashtë zinxhirit.
 
 Mund të caktohen `active`, `cooldown_minutes`, `max_upgrades_per_month` dhe `max_replay_txs`. Përditëso `CANARY_CUSTOMERS` ose menaxho skedarin `/data/customers.json` me `python scripts/customer_admin.py --file customers.json set CLIENT --plan starter --target PROGRAM`. Për një klient ekzistues përdor `suspend CLIENT` ose `plan CLIENT --plan pro`. Skedari në volum ka përparësi ndaj secret-it. Një job i pranuar bllokon pranimin e job-eve të tjera të klientit deri në mbyllje. Job-i mbyllet vetë me një rezultat, kur skadon propozimi ose pas një rinisjeje. Operatori mund ta mbyllë edhe me dorë, me `python fly_listener.py --finish PROPOSAL`. Tavani i replay-it ruhet në payload-in e job-it. SQLite zbaton kuotën për një instancë. Për kuotë të përbashkët mes nyjeve, kërkohet ruajtje e përbashkët e vendimeve të pranimit.
 
-### Dy verifikues të pavarur në Fly.io
+### Politika me një verifikues
 
-`deploy/fly/verifier/` publikon dy aplikacione me nga një makinë: `canary-verifier-a` në `fra` dhe `canary-verifier-b` në `iad`. Secila ka `shared-cpu-2x`, 2 GB RAM, 2 GB swap dhe volum `/data` 10 GB. Imazhi përmban `canary-gate`, të ndërtuar me ID-në e gate-it, dhe Docker. Në nisjen e parë, worker-i shkarkon platform-tools v1.58 në volum dhe kontrollon SHA-256. Build-et e kandidatit përdorin të njëjtin kontejner offline si CI-ja: pa rrjet, pa capabilities dhe me burim read-only. Hapat e deploy-it janë te [konfigurimi Fly](deploy/fly/verifier/README.md).
+Vendos një adresë verifikuesi dhe pragun `threshold: 1` për një propozim që kërkon vetëm një replay dhe një votë. Worker-i dërgon votën pas verifikimit të suksesshëm. Vota e vlefshme nis timelock-un dhe upgrade-i mund të ekzekutohet pasi pritja mbaron. Secili propozim i ri përdor politikën aktive on-chain.
 
-Build-i dhe çelësi i votës janë në të njëjtën makinë. Listener-i ka qasje në Docker që të nisë kontejnerin e build-it, dhe kjo në praktikë është qasje root. Një dalje nga kontejneri do ta zbulonte çelësin. Për këtë duhet një gabim në kernel ose në `runc`, dhe kodin e ndërton commit-i që zgjedh propozuesi. Të dy verifikuesit e ndërtojnë të njëjtin commit, dhe çelësat e tyre vlejnë për të gjithë klientët. Për Devnet ky rrezik pranohet. Para Mainnet rekomandohet që build-i të kalojë në një makinë pa çelës. `CANARY_BUILDER_HOST` e dërgon build-in me SSH te një host i tillë, ku `worker_build.py serve-build` është komanda e vetme e lejuar. Konfigurimi Fly për këtë host ndodhet në commit-in `9238584`.
+Një gate ekzistues kërkon versionin e përditësuar të programit dhe një ndryshim të politikës të miratuar nga governance. Kuorumi më i lartë mbetet i konfigurueshëm.
+
+### Një verifikues në Fly.io
+
+Konfigurimi Fly vendos një makinë te aplikacioni `canary-verifier-a` në `fra`. Ai përdor `shared-cpu-2x`, 2 GB RAM, 2 GB swap dhe volum `/data` 10 GB. I njëjti worker ndërton kandidatin në Docker offline, bën replay dhe nënshkruan votën. [Hapat e deploy-it](deploy/fly/verifier/README.md)
+
+Makina mban çelësin e vetëm të votës. Kontejneri i build-it përdor burim vetëm për lexim, rrjet të fikur dhe heqje të capabilities. `CANARY_BUILDER_HOST` mund ta dërgojë build-in me SSH në një host të dedikuar nëse nevojitet izolim i mëtejshëm.
 
 Gjenero çelësin e votës veçmas për secilin aplikacion, në kompjuterin tënd. Çelësi sekret shkon vetëm te `fly secrets`, ndërsa adresa publike shfaqet në ekran:
 
@@ -125,7 +131,7 @@ Gjenero çelësin e votës veçmas për secilin aplikacion, në kompjuterin tën
 fly secrets set -a canary-verifier-a CANARY_VERIFIER_KEYPAIR="$(python scripts/solana_tx.py keygen)"
 ```
 
-Workflow-i **Deploy Fly verifiers** kërkon secret-et e repos `FLY_API_TOKEN_VERIFIER_A` dhe `FLY_API_TOKEN_VERIFIER_B`, nga një token deploy i kufizuar për secilin aplikacion. Nëse aplikacioni nuk ka `RPC_URL`, workflow-i e merr nga secret-i `RPC_URL` i repos. Deploy-i ndalet nëse mungon `CANARY_VERIFIER_KEYPAIR` ose `CANARY_CUSTOMERS`.
+Workflow-i **Deploy Fly verifier** kërkon secret-et e repos `FLY_API_TOKEN_VERIFIER_A`, nga një token deploy i kufizuar për secilin aplikacion. Nëse aplikacioni nuk ka `RPC_URL`, workflow-i e merr nga secret-i `RPC_URL` i repos. Deploy-i ndalet nëse mungon `CANARY_VERIFIER_KEYPAIR` ose `CANARY_CUSTOMERS`.
 
 `CANARY_CLUSTER` zgjedh rrjetin: `devnet`, që është vlera e paracaktuar, ose `mainnet-beta`. Worker-i nuk niset nëse `RPC_URL` i përgjigjet me genesis të një rrjeti tjetër.
 
@@ -170,8 +176,8 @@ Rezultati del në përmbledhjen e workflow-it. CI-ja e provon `status` kundrejt 
 - [Kontrolli vetëm për lexim i Orca Mainnet](docs/test-results/orca-mainnet-preflight.json). Ky raport mat marrjen e nënshkrimeve dhe identifikon versionin e transaksionit të mostrës.
 - [Fushata Trident me 1,000,000 iteracione](docs/test-results/trident-policy-1m.json). Harness-i ekzekuton ELF-in SBF të gate-it dhe krahason vendimet e `propose_config_update` me modelin e politikës për rastet e gjeneruara.
 - [Cikli në Devnet pas rregullimeve](docs/test-results/devnet-two-verifiers-44924610867.json). Me Alpenglow aktiv, arkivi përdor kohën e bllokut prind. Fee payer-i i rindërtuar përfundon në gjendjen e finalizuar dhe të dy worker-at mbyllen si `executed` me votën e tyre.
-- [Cikli i plotë në Devnet publik me dy verifikues në runner-a të veçantë](docs/test-results/devnet-two-verifiers-44847612055.json). `verifier-a` dhe `verifier-b` votuan me të njëjtin `diff_root`. Kuorumi përputhet me replay-in e kontrolluar dhe `execute_gated_upgrade` u finalizua. Cikli zgjati 7 minuta dhe kushtoi rreth 0.55 SOL Devnet.
-- [Cikli i plotë me dy verifikues në Sprite](docs/test-results/sprite-two-verifier-rehearsal.json). Dy worker-a, secili me çelësin e vet, kapën gjendjen, ndërtuan kandidatin nga GitHub, riekzekutuan 50 transaksione dhe votuan. `diff_root` i kuorumit përputhet me replay-in e snapshot-it të kontrolluar dhe upgrade-i u ekzekutua.
+- Raport historik. [Cikli i plotë në Devnet publik me dy verifikues në runner-a të veçantë](docs/test-results/devnet-two-verifiers-44847612055.json). `verifier-a` dhe `verifier-b` votuan me të njëjtin `diff_root`. Kuorumi përputhet me replay-in e kontrolluar dhe `execute_gated_upgrade` u finalizua. Cikli zgjati 7 minuta dhe kushtoi rreth 0.55 SOL Devnet.
+- Raport historik. [Cikli i plotë me dy verifikues në Sprite](docs/test-results/sprite-two-verifier-rehearsal.json). Dy worker-a, secili me çelësin e vet, kapën gjendjen, ndërtuan kandidatin nga GitHub, riekzekutuan 50 transaksione dhe votuan. `diff_root` i kuorumit përputhet me replay-in e snapshot-it të kontrolluar dhe upgrade-i u ekzekutua.
 - [Replay i dritares reale Devnet me vëzhgime](docs/test-results/devnet-observed-replay-44783501353.json). Builder-i i ri riprodhoi në Sprite të njëjtët bajtë si CI-ja për baseline-in dhe kandidatin.
 
 Për ta përsëritur fushatën në Linux, ndërto më parë gate-in me komandën e MVP-së. Nga `trident-tests` ekzekuto:

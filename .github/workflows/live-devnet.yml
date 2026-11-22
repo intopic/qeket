@@ -41,7 +41,6 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-      actions: read
     env:
       CARGO_PROFILE_DEV_DEBUG: '0'
       OPENSSL_NO_VENDOR: '1'
@@ -83,7 +82,7 @@ jobs:
           curl -fsSL --retry 3 --retry-all-errors https://github.com/solana-foundation/solana-verifiable-build/releases/download/v0.4.15/solana-verify-0.4.15-linux -o "$HOME/.cargo/bin/solana-verify"
           echo "251db253040a3c2637f551eb6627aae792da787a5f8dfdedb59874e13f27c2da  $HOME/.cargo/bin/solana-verify" | sha256sum -c -
           chmod +x "$HOME/.cargo/bin/solana-verify"
-      - name: Rebuild counter twice in offline Docker
+      - name: Build the proposer binaries in offline Docker
         run: bash scripts/live_build.sh
       - name: Build gate and replay client
         run: |
@@ -97,104 +96,52 @@ jobs:
           echo "c43539ebdf6942472e8b87635d6ea55f428a51e3d0219f7b6f720fc6b19fade0  $RUNNER_TEMP/cli.tbz" | sha256sum -c -
           tar xf "$RUNNER_TEMP/cli.tbz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"
-      - name: Rehearse complete cycle on disposable validator
-        if: github.event_name == 'push'
+      - name: Run cycle with one verifier
         env:
-          RPC_URL: http://127.0.0.1:8899
-          CANARY_EXTERNAL_VERIFIERS: '1'
+          RPC_URL: ${{ github.event_name == 'push' && 'http://127.0.0.1:8899' || secrets.RPC_URL }}
+          CANARY_SAMPLE_COUNT: ${{ inputs.replay_transactions || '50' }}
           CANARY_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
-          sudo sysctl -w kernel.io_uring_disabled=0
-          solana-test-validator --bind-address 127.0.0.1 --ledger "$RUNNER_TEMP/ledger" --mint "$(solana-keygen pubkey "$RUNNER_TEMP/devnet-keys/payer")" > "$RUNNER_TEMP/validator.log" 2>&1 &
-          validator=$!
-          trap 'tail -40 "$RUNNER_TEMP/validator.log"; tail -40 "$RUNNER_TEMP/ledger/validator.log" || true; tail -60 "$RUNNER_TEMP"/verifier-*/worker.log || true; kill "$validator" 2>/dev/null || true' EXIT
-          for i in {1..90}; do
-            kill -0 "$validator" || exit 1
-            if solana -u "$RPC_URL" slot >/dev/null 2>&1; then break; fi
-            sleep 1
-          done
-          python scripts/e2e_verifier.py start --workdir "$RUNNER_TEMP/verifier-a" --key vote0
-          python scripts/e2e_verifier.py start --workdir "$RUNNER_TEMP/verifier-b" --key vote1
+          work="$RUNNER_TEMP/verifier"
+          validator=
+          cleanup() {
+            tail -120 "$work/worker.log" || true
+            python scripts/e2e_verifier.py stop --workdir "$work"
+            if [ -n "$validator" ]; then
+              tail -40 "$RUNNER_TEMP/validator.log" || true
+              tail -40 "$RUNNER_TEMP/ledger/validator.log" || true
+              kill "$validator" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            sudo sysctl -w kernel.io_uring_disabled=0
+            solana-test-validator --bind-address 127.0.0.1 --ledger "$RUNNER_TEMP/ledger" --mint "$(solana-keygen pubkey "$RUNNER_TEMP/devnet-keys/payer")" > "$RUNNER_TEMP/validator.log" 2>&1 &
+            validator=$!
+            for i in {1..90}; do
+              kill -0 "$validator" || exit 1
+              if solana -u "$RPC_URL" slot >/dev/null 2>&1; then break; fi
+              sleep 1
+            done
+          fi
+          python scripts/e2e_verifier.py start --workdir "$work"
           python scripts/live_cycle.py run
-          for node in a b; do python scripts/e2e_verifier.py wait --workdir "$RUNNER_TEMP/verifier-$node" --timeout 300 --until executed; done
-          # The client CLI reads the same gate accounts the cycle just used.
+          python scripts/e2e_verifier.py wait --workdir "$work" --timeout 300 --until executed --expected-transactions "$CANARY_SAMPLE_COUNT"
           gate=$(python -c 'import sys; sys.path.insert(0, "scripts"); from live_cycle import key; print(key("gate").pubkey())')
           target=$(python -c 'import sys; sys.path.insert(0, "scripts"); from live_cycle import key; print(key("target").pubkey())')
           status=$(node packages/squads-adapter/dist/cli.js status --gate "$gate" --target "$target")
           echo "$status"
-          echo "$status" | python -c 'import json, sys; s = json.load(sys.stdin); assert s["status"] == "Executed" and s["voted"], s'
-      - name: Run finalized cycle
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          RPC_URL: ${{ secrets.RPC_URL }}
-          CANARY_SAMPLE_COUNT: ${{ inputs.replay_transactions }}
-          CANARY_EXTERNAL_VERIFIERS: '1'
-          CANARY_WAIT_FOR_JOBS: verifier-a,verifier-b
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python scripts/live_cycle.py run
+          echo "$status" | python -c 'import json, sys; s = json.load(sys.stdin); assert s["status"] == "Executed" and s["votes"] == "1/1", s'
       - uses: actions/upload-artifact@v4
         if: always() && github.event_name == 'workflow_dispatch'
         with:
           name: devnet-live-${{ github.run_id }}
           path: target/live/
           if-no-files-found: ignore
-
-  verifier:
-    name: verifier-${{ matrix.node }}
-    if: github.event_name == 'workflow_dispatch'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - node: a
-            key: vote0
-          - node: b
-            key: vote1
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    env:
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      OPENSSL_NO_VENDOR: '1'
-      CANARY_SBF_TOOLCHAIN: canary-sbf-v1.58
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - run: pip install --disable-pip-version-check solders==0.26.0
-      - name: Derive this run's identities
-        env:
-          RPC_URL: ${{ secrets.RPC_URL }}
-          DEVNET_PAYER: ${{ secrets.DEVNET_PAYER }}
-          GATE_PROGRAM_KEYPAIR: ${{ secrets.GATE_PROGRAM_KEYPAIR }}
-        run: |
-          umask 077
-          python scripts/live_cycle.py prepare
-          python -c 'import sys; sys.path.insert(0, "scripts"); from live_cycle import key; print("CANARY_E2E_TARGET=" + str(key("target").pubkey())); print("GATE_PROGRAM_ID=" + str(key("gate").pubkey()))' >> "$GITHUB_ENV"
-          # The worker keeps only its own vote key.
-          find "$RUNNER_TEMP/devnet-keys" -type f ! -name '${{ matrix.key }}' -delete
-      - name: Prepare pinned platform tools
-        run: bash scripts/ci_tools.sh
-      - name: Build replay verifier
-        run: |
-          cargo fetch --locked
-          cargo build --offline --locked -p svm-canary-runner
-      - name: Start independent worker
-        env:
-          RPC_URL: ${{ secrets.RPC_URL }}
-          CANARY_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
-        run: |
-          python scripts/e2e_verifier.py start --workdir "$RUNNER_TEMP/verifier" --key ${{ matrix.key }}
-      - name: Verifier ready
-        run: echo "worker for ${{ matrix.key }} is watching the gate"
-      - name: Wait for build, replay and vote
-        run: python scripts/e2e_verifier.py wait --workdir "$RUNNER_TEMP/verifier" --timeout 4200 --until executed
-      - name: Worker log
-        if: always()
-        run: tail -200 "$RUNNER_TEMP/verifier/worker.log" || true
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && github.event_name == 'workflow_dispatch'
         with:
-          name: devnet-verifier-${{ matrix.node }}-${{ github.run_id }}
+          name: devnet-verifier-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/verifier/worker.log
             ${{ runner.temp }}/verifier/admissions.sqlite3

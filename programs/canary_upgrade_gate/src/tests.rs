@@ -60,6 +60,41 @@ fn setup() -> (Policy, UpgradeProposal, CanaryAttestationPayload, Clock) {
 }
 
 #[test]
+fn single_verifier_starts_timelock_with_one_valid_vote() {
+    let (mut policy, mut proposal, payload, clock) = setup();
+    policy.verifiers[1..].fill(Pubkey::default());
+    policy.verifier_count = 1;
+    policy.threshold = 1;
+    policy.validate().unwrap();
+    let execution_time = clock.unix_timestamp + policy.timelock_seconds;
+
+    assert!(proposal
+        .check_execution(&policy, execution_time, 35)
+        .is_err());
+    assert!(proposal
+        .record_vote(&policy, &payload, key(2), &clock)
+        .is_err());
+    let mut invalid = payload.clone();
+    invalid.failed_tx_count = 1;
+    assert!(proposal
+        .record_vote(&policy, &invalid, key(1), &clock)
+        .is_err());
+    assert_eq!(proposal.attestation_count, 0);
+
+    proposal
+        .record_vote(&policy, &payload, key(1), &clock)
+        .unwrap();
+    assert_eq!(proposal.attestation_count, 1);
+    assert_eq!(proposal.status, ProposalStatus::Ready);
+    assert!(proposal
+        .check_execution(&policy, execution_time - 1, 35)
+        .is_err());
+    assert!(proposal
+        .check_execution(&policy, execution_time, 35)
+        .is_ok());
+}
+
+#[test]
 fn distinct_matching_votes_start_timelock_at_quorum() {
     let (policy, mut proposal, payload, mut clock) = setup();
     proposal
@@ -199,7 +234,7 @@ fn policy_checks_active_set_and_timing() {
     p.validate().unwrap();
     for bad in [
         Policy {
-            threshold: 1,
+            threshold: 0,
             ..p.clone()
         },
         Policy {
