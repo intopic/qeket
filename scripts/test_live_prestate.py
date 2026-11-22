@@ -57,6 +57,7 @@ class LivePrestateTest(unittest.TestCase):
             "transaction": {"message": {
                 "accountKeys": [payer, target, "ComputeBudget111111111111111111111111111111"],
                 "addressTableLookups": [{"accountKey": table, "writableIndexes": [0], "readonlyIndexes": []}],
+                "instructions": [{"programIdIndex": 1, "accounts": [0, 3]}],
             }},
         }
         captures = dict.fromkeys([payer, target, loaded_key, table])
@@ -327,11 +328,41 @@ class ReplayArchiveTest(unittest.TestCase):
         with self.assertRaisesRegex(PrestateRefused, "used again"):
             self.run_archive(after=[reuse])
 
-    def test_mixed_role_payer_requires_snapshot(self):
-        tx = self.transaction([self.payer, self.target], 1)
-        tx["transaction"]["message"]["instructions"][0]["accounts"] = [0]
-        with self.assertRaisesRegex(PrestateRefused, "mixed-role"):
-            check_transaction_prestate(tx, self.bundle["accounts"], {self.payer})
+    def test_payer_passed_to_the_program_is_rebuilt_and_checked(self):
+        """The usual DeFi case: the wallet pays the fee and signs as an account of the call."""
+        tx = self.transaction([self.payer, self.counter, self.target], 2, self.signature)
+        tx["transaction"]["message"]["instructions"][0]["accounts"] = [0, 1]
+        archive = self.run_archive(target_tx=tx)
+        accounts = {to_base58(bytes(key)): value for key, value in archive["accounts"]}
+        self.assertEqual((accounts[self.payer]["lamports"], accounts[self.payer]["data"]), (5_000_000, []))
+        self.assertEqual([to_base58(bytes(key)) for key, _ in archive["final_accounts"]], [self.payer])
+        # Data after the window means the program changed more than lamports.
+        with self.assertRaisesRegex(PrestateRefused, "captured initial state"):
+            self.run_archive(target_tx=tx, final=account(SYSTEM, bytes(80)))
+        bad = self.transaction([self.payer, self.target], 1)
+        bad["transaction"]["message"]["instructions"][0]["accounts"] = [7]
+        with self.assertRaisesRegex(PrestateRefused, "invalid compiled instruction account index"):
+            check_transaction_prestate(bad, self.bundle["accounts"], {self.payer})
+
+    def test_written_wallet_is_rebuilt_from_its_first_balance(self):
+        """A wallet that signs and pays out, while another account pays the fee."""
+        wallet = address(70)
+        keys = [self.payer, self.counter, wallet, self.target]
+        tx = self.transaction(keys, 3, self.signature, balances=[5_000_000, 100, 1_000, 1], readonly=1)
+        archive = self.run_archive(target_tx=tx, chain={wallet: account(SYSTEM, b"", lamports=900)})
+        accounts = {to_base58(bytes(key)): value for key, value in archive["accounts"]}
+        self.assertEqual(accounts[wallet], dict(lamports=1_000, data=[], owner=[0] * 32, executable=False,
+                                                rentEpoch=2 ** 64 - 1))
+        finals = {to_base58(bytes(key)): value for key, value in archive["final_accounts"]}
+        self.assertEqual(finals[wallet]["lamports"], 900)
+        # A wallet the window created starts absent.
+        tx = self.transaction(keys, 3, self.signature, balances=[5_000_000, 100, 0, 1], readonly=1)
+        archive = self.run_archive(target_tx=tx, chain={wallet: account(SYSTEM, b"", lamports=900)})
+        self.assertIn(list(from_base58(wallet)), archive["absent_accounts"])
+        # Data or another owner after the window cannot be rebuilt.
+        for state in (account(SYSTEM, bytes(80), lamports=900), account(address(71), b"", lamports=900)):
+            with self.subTest(owner=state["owner"]), self.assertRaisesRegex(PrestateRefused, "not captured"):
+                self.run_archive(target_tx=tx, chain={wallet: state})
 
     def test_payer_with_nonce_data_requires_snapshot(self):
         with self.assertRaisesRegex(PrestateRefused, "captured initial state"):

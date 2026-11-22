@@ -134,18 +134,13 @@ def check_transaction_prestate(item, accounts, fee_payers=(), runtime=RUNTIME_AC
     message = item["transaction"]["message"]
     writable, readonly, lookups = resolved_addresses(item)
     ordered = message["accountKeys"] + writable + readonly
-    # Only the fee debit can be reconstructed. A program receiving this
-    # account can observe or change fields that preBalances does not record.
-    unknown = set(fee_payers)
-    if unknown:
-        referenced = set(ordered[1:]) | {lookup["accountKey"] for lookup in lookups}
-        for ix in message["instructions"]:
-            for index in [ix["programIdIndex"], *ix["accounts"]]:
-                if type(index) is not int or not 0 <= index < len(ordered):
-                    raise PrestateRefused("invalid compiled instruction account index")
-                referenced.add(ordered[index])
-        if unknown.intersection(referenced):
-            raise PrestateRefused("mixed-role fee payer requires captured initial state")
+    for ix in message["instructions"]:
+        for index in [ix["programIdIndex"], *ix["accounts"]]:
+            if type(index) is not int or not 0 <= index < len(ordered):
+                raise PrestateRefused("invalid compiled instruction account index")
+    # A fee payer may also be passed to instructions, as when a wallet pays and
+    # signs a transfer. Its rebuilt System state holds only lamports, which
+    # metadata records, and the runner checks it against the final state.
     keys = {*message["accountKeys"], *writable, *readonly}
     keys.update(lookup["accountKey"] for lookup in lookups)
     # These runtime programs are supplied by LiteSVM. Other executable accounts
@@ -459,6 +454,26 @@ def rebuild_token_account(items, key, final):
                 owner=final["owner"], executable=False, rentEpoch=final["rentEpoch"])
 
 
+def is_wallet(value):
+    return (value is not None and value["owner"] == SYSTEM and not value["executable"]
+            and not account_bytes(value, SYSTEM))
+
+
+def rebuild_wallet(items, key):
+    """A System account with no data at its first use in the window.
+
+    Lamports are its only state, and the first transaction's metadata records
+    them. A program can only read it or move lamports, which the per-transaction
+    balance checks cover. Assign or Allocate would leave data or another owner,
+    and the runner's final state check refuses that.
+    """
+    first = next(item for item in items if key in ordered_keys(item))
+    lamports = first["meta"]["preBalances"][ordered_keys(first).index(key)]
+    if lamports == 0:
+        return None  # The window created it.
+    return dict(lamports=lamports, data=["", "base64"], owner=SYSTEM, executable=False, rentEpoch=RENT_EXEMPT_EPOCH)
+
+
 def late_accounts(items, accounts, payers, end):
     """Read, after the window, every account the window uses that the anchor capture lacks.
 
@@ -466,9 +481,10 @@ def late_accounts(items, accounts, payers, end):
     - An account no target transaction writes, and that nothing else wrote from the
       anchor to its read, had the read state when the window used it. Programs and
       their ProgramData come in this way, with the bytes the cluster executes.
-    - A token account that the target transactions only move tokens in is rebuilt
-      at its first use.
-    The runner checks fee payers and rebuilt token accounts against their final state.
+    - An account the target transactions write is rebuilt at its first use when
+      it is a System wallet with no data after the window, or a token account
+      they only move tokens in.
+    The runner checks fee payers and rebuilt accounts against their final state.
     Writes inside the window by other transactions are refused by the window scan,
     which receives these accounts as tracked.
     """
@@ -492,8 +508,12 @@ def late_accounts(items, accounts, payers, end):
         else:
             initial[key] = value
     for key in sorted(missing & written):
-        initial[key] = rebuild_token_account(items, key, states[key])
-        finals.append([list(from_base58(key)), archive_account(states[key])])
+        final = states[key]
+        if is_wallet(final):
+            initial[key] = rebuild_wallet(items, key)
+        else:
+            initial[key] = rebuild_token_account(items, key, final)
+        finals.append([list(from_base58(key)), archive_account(final)])
     program_data = {program_data_address(value) for value in initial.values()
                     if value is not None and value["executable"] and value["owner"] == LOADER}
     extra, extra_slots = read_after_window(program_data - accounts.keys() - initial.keys(), end)
