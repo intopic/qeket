@@ -41,6 +41,9 @@ inputs:
   spill:
     description: Account that receives the buffer rent after the upgrade. Defaults to the vault.
     default: ""
+  priority-fee:
+    description: Priority fee in micro-lamports per compute unit for propose and execute.
+    default: "0"
   nonce:
     description: Proposal nonce for status and execute. Defaults to the latest proposal.
     default: ""
@@ -149,6 +152,7 @@ runs:
         MAX_REPLAY_TXS: ${{ inputs.max-replay-txs }}
         SPILL: ${{ inputs.spill }}
         NONCE: ${{ inputs.nonce }}
+        PRIORITY_FEE: ${{ inputs.priority-fee }}
       run: |
         set -euo pipefail
         args=(--gate "$GATE" --target "$TARGET")
@@ -162,7 +166,11 @@ runs:
             if [ -n "$NONCE" ]; then args+=(--nonce "$NONCE"); fi;;
           *) echo "command must be propose, status or execute"; exit 1;;
         esac
-        if [ "$COMMAND" = status ]; then unset CANARY_KEYPAIR; fi
+        if [ "$COMMAND" = status ]; then
+          unset CANARY_KEYPAIR
+        else
+          args+=(--priority-fee "$PRIORITY_FEE")
+        fi
         result=$(node "$CANARY_CLI" "$COMMAND" "${args[@]}")
         echo "$result"
         { echo "result<<CANARY_RESULT"; echo "$result"; echo "CANARY_RESULT"; } >> "$GITHUB_OUTPUT"

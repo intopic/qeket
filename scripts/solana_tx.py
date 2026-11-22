@@ -1,9 +1,11 @@
-"""Dependency-free Ed25519 signing and legacy Solana transactions for the worker vote."""
+"""OpenSSL-backed Ed25519 signing and legacy Solana transactions for the worker vote."""
 import hashlib
 import json
 import os
 import struct
 import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from devnet import from_base58, to_base58
 
@@ -11,75 +13,17 @@ ED25519_PROGRAM = "Ed25519SigVerify111111111111111111111111111"
 INSTRUCTIONS_SYSVAR = "Sysvar1nstructions1111111111111111111111111"
 DOMAINS = {"StrictEquality": b"CANARY_GATE_M1__", "NoRevertAndCuBound": b"CANARY_GATE_NR1_"}
 
-# RFC 8032 Ed25519 over GF(2^255 - 19), extended homogeneous coordinates.
+# PDA derivation performs a curve test on public input only.
 P = 2 ** 255 - 19
-L = 2 ** 252 + 27742317777372353535851937790883648493
 D = -121665 * pow(121666, P - 2, P) % P
-SQRT_M1 = pow(2, (P - 1) // 4, P)
-
-
-def _add(a, b):
-    x1, y1, z1, t1 = a
-    x2, y2, z2, t2 = b
-    e = (y1 - x1) * (y2 - x2) % P
-    f = (y1 + x1) * (y2 + x2) % P
-    g = 2 * t1 * t2 * D % P
-    h = 2 * z1 * z2 % P
-    e, f, g, h = f - e, h - g, h + g, f + e
-    return e * f % P, g * h % P, f * g % P, e * h % P
-
-
-def _multiply(scalar, point):
-    result = (0, 1, 1, 0)
-    while scalar:
-        if scalar & 1:
-            result = _add(result, point)
-        point = _add(point, point)
-        scalar >>= 1
-    return result
-
-
-def _encode(point):
-    x, y, z, _ = point
-    inverse = pow(z, P - 2, P)
-    x, y = x * inverse % P, y * inverse % P
-    return (y | (x & 1) << 255).to_bytes(32, "little")
-
-
-def _recover_x(y, sign):
-    x2 = (y * y - 1) * pow(D * y * y + 1, P - 2, P) % P
-    x = pow(x2, (P + 3) // 8, P)
-    if (x * x - x2) % P:
-        x = x * SQRT_M1 % P
-    if (x * x - x2) % P:
-        raise ValueError("not a curve point")
-    return P - x if x & 1 != sign else x
-
-
-_BY = 4 * pow(5, P - 2, P) % P
-_BX = _recover_x(_BY, 0)
-BASE = (_BX, _BY, 1, _BX * _BY % P)
-
-
-def _expand(seed):
-    digest = hashlib.sha512(seed).digest()
-    scalar = int.from_bytes(digest[:32], "little")
-    scalar &= (1 << 254) - 8
-    scalar |= 1 << 254
-    return scalar, digest[32:]
 
 
 def public_key(seed):
-    return _encode(_multiply(_expand(seed)[0], BASE))
+    return Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw()
 
 
 def sign(seed, message):
-    scalar, prefix = _expand(seed)
-    public = _encode(_multiply(scalar, BASE))
-    r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % L
-    encoded_r = _encode(_multiply(r, BASE))
-    k = int.from_bytes(hashlib.sha512(encoded_r + public + message).digest(), "little") % L
-    return encoded_r + ((r + k * scalar) % L).to_bytes(32, "little")
+    return Ed25519PrivateKey.from_private_bytes(seed).sign(message)
 
 
 def on_curve(raw):

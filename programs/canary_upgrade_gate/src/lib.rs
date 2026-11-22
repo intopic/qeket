@@ -271,6 +271,11 @@ pub mod canary_upgrade_gate {
                 &[a.config.bump],
             ]],
         )?;
+        emit!(OrphanBufferReclaimed {
+            target: a.config.target_program,
+            buffer: a.buffer.key(),
+            spill: a.spill.key(),
+        });
         Ok(())
     }
 
@@ -358,7 +363,13 @@ pub mod canary_upgrade_gate {
         )?;
         // Generation invalidation also consumes the queued exit. Governance can
         // recover its rent with cancel_authority_change.
-        a.config.advance_generation()
+        a.config.advance_generation()?;
+        emit!(ProgramAuthorityTransferred {
+            target: a.config.target_program,
+            authority: a.authority.key(),
+            candidate: next,
+        });
+        Ok(())
     }
 
     pub fn close_proposal(ctx: Context<CloseProposal>) -> Result<()> {
@@ -570,4 +581,18 @@ pub struct UpgradeExecuted {
 #[event]
 pub struct ProposalCancelled {
     pub proposal: Pubkey,
+}
+
+#[event]
+pub struct OrphanBufferReclaimed {
+    pub target: Pubkey,
+    pub buffer: Pubkey,
+    pub spill: Pubkey,
+}
+
+#[event]
+pub struct ProgramAuthorityTransferred {
+    pub target: Pubkey,
+    pub authority: Pubkey,
+    pub candidate: Pubkey,
 }

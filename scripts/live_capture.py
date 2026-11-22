@@ -225,8 +225,7 @@ def capture(snapshot, limit, validate_transaction=None, include_baseline=False):
     records = []
     digest = hashlib.sha256(b"CANARY_TX_LIST_V1")
     before = None
-    matches = []
-    baseline = {}
+    selected = {}
     inspected = 0
     while True:
         options = dict(FINAL, limit=min(1000, limit + 1), minContextSlot=start + span)
@@ -239,41 +238,56 @@ def capture(snapshot, limit, validate_transaction=None, include_baseline=False):
             inspected += 1
             if inspected > max(1000, limit * 8):
                 raise ValueError("address history scan limit exceeded")
-            if start <= entry["slot"] <= start + span and entry["err"] is None:
-                sig = entry["signature"]
-                options_tx = dict(FINAL, maxSupportedTransactionVersion=1, minContextSlot=start + span)
-                item = rpc("getTransaction", sig, dict(options_tx, encoding="json"))
-                if not item or not item.get("meta"):
-                    raise RuntimeError("finalized transaction metadata unavailable")
-                if item["slot"] != entry["slot"]:
-                    raise ValueError("transaction slot mismatch")
-                if invoked(item, target):
-                    if item.get("version", "legacy") not in ("legacy", 0):
-                        raise UnsupportedReplayVersion(
-                            f"target transaction at slot {item['slot']} has unsupported version {item['version']}: {sig}"
-                        )
-                    matches.append((item["slot"], sig))
-                    if len(matches) > limit:
-                        raise ValueError("max_replay_txs exceeded")
-                    if validate_transaction is not None:
-                        validate_transaction(item)
-                    if include_baseline:
-                        baseline[sig] = baseline_observation(item)
+            slot = entry["slot"]
+            if start <= slot <= start + span and entry["err"] is None:
+                selected.setdefault(slot, set()).add(entry["signature"])
         if page[-1]["slot"] < start or len(page) < options["limit"]:
             break
-        before = page[-1]["signature"]
-    for slot in sorted({slot for slot, _ in matches}):
-        signatures = rpc("getBlock", slot, dict(FINAL, transactionDetails="signatures", rewards=False, maxSupportedTransactionVersion=1))["signatures"]
-        positions = {sig: i for i, sig in enumerate(signatures)}
-        for index, sig in sorted((positions[s], s) for n,s in matches if n == slot):
-            tx = rpc("getTransaction", sig, dict(FINAL, encoding="base64", maxSupportedTransactionVersion=1))
-            raw = base64.b64decode(tx["transaction"][0], validate=True)
+        next_before = page[-1]["signature"]
+        if before == next_before:
+            raise RuntimeError("address history pagination did not advance")
+        before = next_before
+    for slot, signatures in sorted(selected.items()):
+        decoded = block(slot, "json")
+        if not decoded:
+            raise RuntimeError("finalized transaction metadata unavailable")
+        matches, seen = [], set()
+        for index, item in enumerate(decoded["transactions"]):
+            sig = item["transaction"]["signatures"][0]
+            if sig not in signatures:
+                continue
+            seen.add(sig)
+            if not item.get("meta") or item["meta"]["err"] is not None:
+                raise RuntimeError("finalized block metadata differs from address history")
+            if not invoked(item, target):
+                continue
+            if item.get("version", "legacy") not in ("legacy", 0):
+                raise UnsupportedReplayVersion(
+                    f"target transaction at slot {slot} has unsupported version {item['version']}: {sig}"
+                )
+            matches.append((index, sig, item))
+            if len(records) + len(matches) > limit:
+                raise ValueError("max_replay_txs exceeded")
+        if seen != signatures:
+            raise RuntimeError("address history signature missing from finalized block")
+        if not matches:
+            continue
+        encoded = block(slot, "base64")
+        if not encoded or encoded["blockhash"] != decoded["blockhash"]:
+            raise RuntimeError("RPC encodings differ on the finalized block")
+        transactions = encoded["transactions"]
+        if len(transactions) != len(decoded["transactions"]):
+            raise RuntimeError("RPC encodings differ on the finalized transaction count")
+        for index, sig, item in matches:
+            raw = base64.b64decode(transactions[index]["transaction"][0], validate=True)
             signature = from_base58(sig)
-            if tx["slot"] != slot or len(raw) > 1232 or raw[1:65] != signature:
+            if len(raw) > 1232 or raw[1:65] != signature:
                 raise ValueError("transaction differs from finalized block")
             record = dict(slot=slot, index=index, transaction=raw.hex())
+            if validate_transaction is not None:
+                validate_transaction(dict(item, slot=slot))
             if include_baseline:
-                record["baseline"] = baseline[sig]
+                record["baseline"] = baseline_observation(item)
             records.append(record)
             digest.update(struct.pack("<QI", slot, index) + signature)
     return dict(snapshot, format_version=2, records=records, transaction_manifest=list(digest.digest()))

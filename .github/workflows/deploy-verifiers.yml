@@ -11,12 +11,31 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
+      GATE_PROGRAM_ID: ${{ vars.CANARY_DEVNET_GATE_PROGRAM_ID }}
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_VERIFIER_A }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200
+      - name: Validate the configured Devnet gate
+        env:
+          RPC_URL: ${{ secrets.RPC_URL || 'https://api.devnet.solana.com' }}
+        run: |
+          PYTHONPATH=scripts python3 - <<'PY'
+          import os
+          from devnet import GENESIS, LOADER, from_base58
+          from live_capture import FINAL, rpc
+
+          gate = os.environ["GATE_PROGRAM_ID"]
+          if not gate or len(from_base58(gate)) != 32:
+              raise SystemExit("Set CANARY_DEVNET_GATE_PROGRAM_ID to the deployed 1/1-compatible gate")
+          if rpc("getGenesisHash") != GENESIS:
+              raise SystemExit("Expected a Devnet RPC endpoint")
+          account = rpc("getAccountInfo", gate, dict(FINAL, encoding="base64"))["value"]
+          if not account or not account["executable"] or account["owner"] != LOADER:
+              raise SystemExit("Configured Devnet gate is not a loader-v3 executable")
+          PY
       - name: Check required Fly secrets
         env:
           RPC_URL: ${{ secrets.RPC_URL }}
@@ -40,7 +59,11 @@ jobs:
           mkdir -p "$context/scripts" "$context/deploy/fly/verifier"
           cp -r Cargo.toml Cargo.lock crates programs "$context/"
           cp scripts/{devnet,live_capture,live_prestate,fly_listener,customer_admin,worker_http,worker_notify,solana_tx,worker_build,worker_vote}.py "$context/scripts/"
+          cp scripts/requirements-worker.txt "$context/scripts/"
           cp deploy/fly/verifier/* "$context/deploy/fly/verifier/"
       - name: Deploy
         working-directory: ${{ runner.temp }}/context
-        run: flyctl deploy --remote-only --ha=false -a canary-verifier-a -c deploy/fly/verifier/fly.toml --dockerfile deploy/fly/verifier/Dockerfile
+        run: |
+          flyctl deploy --remote-only --ha=false -a canary-verifier-a -c deploy/fly/verifier/fly.toml \
+            --dockerfile deploy/fly/verifier/Dockerfile --build-arg "GATE_PROGRAM_ID=$GATE_PROGRAM_ID" \
+            --env "GATE_PROGRAM_ID=$GATE_PROGRAM_ID"

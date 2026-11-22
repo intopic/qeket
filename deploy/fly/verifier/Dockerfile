@@ -21,6 +21,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=runner /src/target/release/canary-gate /usr/local/bin/canary-gate
 WORKDIR /worker
+COPY scripts/requirements-worker.txt ./
+RUN pip install --no-cache-dir --only-binary=:all: -r requirements-worker.txt
 COPY scripts/devnet.py scripts/live_capture.py scripts/live_prestate.py scripts/fly_listener.py scripts/customer_admin.py scripts/worker_http.py scripts/worker_notify.py scripts/solana_tx.py scripts/worker_build.py scripts/worker_vote.py ./
 COPY deploy/fly/verifier/start.sh /worker/start.sh
 ENTRYPOINT ["sh", "/worker/start.sh"]

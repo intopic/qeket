@@ -4483,12 +4483,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "solana-account",
+ "solana-compute-budget-instruction",
  "solana-compute-budget-interface",
  "solana-ed25519-program",
  "solana-keypair",
  "solana-message",
  "solana-sdk-ids",
  "solana-signer",
+ "solana-svm-transaction",
  "solana-transaction",
 ]
 

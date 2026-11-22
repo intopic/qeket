@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import struct
 import time
 
 from live_capture import FINAL, rpc
@@ -72,10 +73,23 @@ def discard_job_files(directory):
             path.unlink(missing_ok=True)
 
 
-def wait_finalized(signature, timeout=150):
+def wait_finalized(signature, timeout=150, rebroadcast=None):
     deadline = time.monotonic() + timeout
+    retry_at = time.monotonic() + 4
+    confirmed = False
     while time.monotonic() < deadline:
-        status = rpc("getSignatureStatuses", [signature], {"searchTransactionHistory": True})["value"][0]
+        try:
+            status = rpc("getSignatureStatuses", [signature], {"searchTransactionHistory": True})["value"][0]
+        except (OSError, RuntimeError):
+            status = None
+        if status and status["confirmationStatus"] in ("confirmed", "finalized"):
+            confirmed = True
+        if rebroadcast is not None and not confirmed and time.monotonic() >= retry_at:
+            try:
+                rebroadcast()
+            except (OSError, RuntimeError):
+                pass  # The original signature may already be in flight.
+            retry_at = time.monotonic() + 4
         if status:
             if status["confirmationStatus"] == "finalized":
                 if status["err"]:
@@ -118,13 +132,20 @@ def submit_vote(event, bundle, evidence, keypair, gate, authorize=None, director
     verify = ed25519_instruction(keypair.public, keypair.sign(payload), payload)
     submit = (gate, [(bundle["config_address"], False, False), (event["proposal"], False, True),
                      (INSTRUCTIONS_SYSVAR, False, False)], anchor_discriminator("submit_verified_attestation"))
-    raw = transaction(keypair.address, [verify, submit], blockhash, [keypair])
+    price = int(os.environ.get("CANARY_VOTE_PRIORITY_FEE", "0"))
+    if not 0 <= price <= 2**64 - 1:
+        raise ValueError("CANARY_VOTE_PRIORITY_FEE must be a u64 in micro-lamports per CU")
+    instructions = [verify, submit]
+    if price:
+        instructions.insert(0, ("ComputeBudget111111111111111111111111111111", [], struct.pack("<BQ", 3, price)))
+    raw = transaction(keypair.address, instructions, blockhash, [keypair])
+    encoded = base64.b64encode(raw).decode()
     if directory is not None:
         receipt = dict(signature=to_base58(raw[1:65]), last_height=latest["lastValidBlockHeight"],
                        verifier=keypair.address, buffer=bundle["buffer"], config=bundle["config"], evidence=evidence)
         write_atomic(directory / "vote-intent.json", json.dumps(receipt).encode())
     try:
-        signature = rpc("sendTransaction", base64.b64encode(raw).decode(),
+        signature = rpc("sendTransaction", encoded,
                         {"encoding": "base64", "preflightCommitment": "finalized"})
     except RuntimeError as exc:
         message = str(exc)
@@ -133,7 +154,10 @@ def submit_vote(event, bundle, evidence, keypair, gate, authorize=None, director
         if "AlreadyVoted" not in message and "Error Code:" in message and message.startswith("sendTransaction: -32002 "):
             raise VoteRefused(message[:400]) from None
         raise
-    wait_finalized(signature)
+    def rebroadcast():
+        rpc("sendTransaction", encoded, {"encoding": "base64", "skipPreflight": True, "maxRetries": 0})
+
+    wait_finalized(signature, rebroadcast=rebroadcast)
     bundle["confirmed_signature"] = signature
     return signature
 

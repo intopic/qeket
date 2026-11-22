@@ -98,41 +98,32 @@ pub struct BaselineObservation {
 }
 
 const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
-const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 
 /// Signature fee and compute-unit price fee charged by the bank.
 /// LiteSVM 0.7 charges only the first part.
-fn fee_parts(tx: &VersionedTransaction) -> Result<(u64, u64)> {
-    use solana_sdk_ids::{compute_budget, ed25519_program, secp256k1_program, secp256r1_program};
+fn fee_parts(tx: &VersionedTransaction, features: &FeatureSet) -> Result<(u64, u64)> {
+    use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
+    use solana_sdk_ids::{ed25519_program, secp256k1_program, secp256r1_program};
+    use solana_svm_transaction::instruction::SVMInstruction;
+
     let keys = tx.message.static_account_keys();
+    let instructions = tx.message.instructions();
+    ensure!(
+        instructions
+            .iter()
+            .all(|ix| usize::from(ix.program_id_index) < keys.len()),
+        "invalid program index"
+    );
+    let programs = instructions.iter().map(|ix| {
+        (
+            &keys[usize::from(ix.program_id_index)],
+            SVMInstruction::from(ix),
+        )
+    });
+    let budget = process_compute_budget_instructions(programs.clone(), features)?;
     let mut signatures = u64::from(tx.message.header().num_required_signatures);
-    let (mut limit, mut price) = (None, None);
-    for ix in tx.message.instructions() {
-        let program = keys
-            .get(usize::from(ix.program_id_index))
-            .context("invalid program index")?;
-        if *program == compute_budget::ID {
-            let (tag, value) = ix
-                .data
-                .split_first()
-                .context("empty compute budget instruction")?;
-            match (tag, value.len()) {
-                (2, 4) => ensure!(
-                    limit
-                        .replace(u32::from_le_bytes(value.try_into()?))
-                        .is_none(),
-                    "duplicate compute unit limit"
-                ),
-                (3, 8) => ensure!(
-                    price
-                        .replace(u64::from_le_bytes(value.try_into()?))
-                        .is_none(),
-                    "duplicate compute unit price"
-                ),
-                (1 | 4, 4) => {}
-                _ => anyhow::bail!("unsupported compute budget instruction"),
-            }
-        } else if [
+    for (program, ix) in programs {
+        if [
             ed25519_program::ID,
             secp256k1_program::ID,
             secp256r1_program::ID,
@@ -142,22 +133,11 @@ fn fee_parts(tx: &VersionedTransaction) -> Result<(u64, u64)> {
             signatures += u64::from(ix.data.first().copied().unwrap_or(0));
         }
     }
-    let priority = match price.unwrap_or(0) {
-        0 => 0,
-        // The default limit depends on the bank's builtin classification. Refuse
-        // rather than estimate it.
-        price => {
-            let limit = limit
-                .context("compute unit price without an explicit compute unit limit")?
-                .min(MAX_COMPUTE_UNIT_LIMIT);
-            u64::try_from((u128::from(price) * u128::from(limit)).div_ceil(1_000_000))?
-        }
-    };
     Ok((
         signatures
             .checked_mul(LAMPORTS_PER_SIGNATURE)
             .context("fee overflow")?,
-        priority,
+        budget.get_prioritization_fee(),
     ))
 }
 
@@ -378,6 +358,10 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
         "incomplete slot hashes"
     );
     // Signatures remain verified. Historical blockhashes are outside the local queue.
+    let fee_features = match archive.features.as_deref() {
+        Some(features) => cluster_feature_set(features, archive.anchor_slot)?,
+        None => FeatureSet::all_enabled(),
+    };
     let mut old =
         replay_vm(archive.features.as_deref(), archive.anchor_slot)?.with_blockhash_check(false);
     old.set_sysvar(&archive.clocks[0]);
@@ -496,7 +480,7 @@ pub fn verify(archive: &Archive, baseline: &[u8], rebuilt: &[u8]) -> Result<Evid
                 .with_context(|| {
                     format!("baseline pre-state at {}:{}", record.slot, record.index)
                 })?;
-            let (signature_fee, priority_fee) = fee_parts(tx)
+            let (signature_fee, priority_fee) = fee_parts(tx, &fee_features)
                 .with_context(|| format!("fee at {}:{}", record.slot, record.index))?;
             ensure!(
                 signature_fee.checked_add(priority_fee) == Some(observed.fee),
@@ -812,27 +796,33 @@ mod tests {
             Budget::set_compute_unit_price(1_001),
             transfer.clone(),
         ]);
-        assert_eq!(fee_parts(&signed(&[transfer.clone()])).unwrap(), (5_000, 0));
-        // ceil(1_001 * 200_000 / 1_000_000) lamports.
-        assert_eq!(fee_parts(&priced).unwrap(), (5_000, 201));
-        assert!(fee_parts(&signed(&[
-            Budget::set_compute_unit_price(1),
-            transfer.clone()
-        ]))
-        .is_err());
-        assert!(fee_parts(&signed(&[
+        let active = FeatureSet::all_enabled();
+        let fee = |tx: &VersionedTransaction| fee_parts(tx, &active);
+        assert_eq!(fee(&signed(&[transfer.clone()])).unwrap(), (5_000, 0));
+        assert_eq!(fee(&priced).unwrap(), (5_000, 201));
+        let implicit = signed(&[Budget::set_compute_unit_price(1_000_000), transfer.clone()]);
+        assert_eq!(fee(&implicit).unwrap(), (5_000, 6_000));
+        let stake = anchor_lang::solana_program::instruction::Instruction {
+            program_id: solana_sdk_ids::stake::ID,
+            accounts: vec![],
+            data: vec![],
+        };
+        let priced_stake = signed(&[Budget::set_compute_unit_price(1_000_000), stake]);
+        assert_eq!(fee(&priced_stake).unwrap(), (5_000, 203_000));
+        assert_eq!(
+            fee_parts(&priced_stake, &FeatureSet::default()).unwrap(),
+            (5_000, 6_000)
+        );
+        assert!(fee(&signed(&[
             Budget::set_compute_unit_limit(1),
             Budget::set_compute_unit_limit(2),
-            transfer.clone(),
+            transfer.clone()
         ]))
         .is_err());
         let precompile = solana_ed25519_program::new_ed25519_instruction_with_signature(
             b"m", &[0; 64], &[1; 32],
         );
-        assert_eq!(
-            fee_parts(&signed(&[precompile, transfer])).unwrap(),
-            (10_000, 0)
-        );
+        assert_eq!(fee(&signed(&[precompile, transfer])).unwrap(), (10_000, 0));
 
         // LiteSVM charges the signature fee only, so the debit restores bank parity.
         let mut vm = LiteSVM::new().with_blockhash_check(false);

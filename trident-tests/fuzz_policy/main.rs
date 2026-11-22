@@ -87,6 +87,7 @@ impl FuzzTest {
         match scenario() {
             Scenario::Policy => self.validate_policy_updates(),
             Scenario::Reclaim => self.validate_buffer_reclaim(),
+            Scenario::ReclaimOrphan => self.validate_orphan_buffer_reclaim(),
             Scenario::Transfer => self.validate_authority_transfer(),
             Scenario::Execute => self.validate_upgrade_execution_guards(),
         }
@@ -103,13 +104,17 @@ impl FuzzTest {
         if self.trident.random_from_range(0..=9) == 0 {
             next.verifiers[1] = next.verifiers[0];
         }
-        let valid = (2..=3).contains(&next.verifier_count)
-            && (2..=next.verifier_count).contains(&next.threshold)
+        let active = next.verifiers.get(..usize::from(next.verifier_count));
+        let valid = (1..=next.verifier_count).contains(&next.threshold)
             && next.min_replay_txs > 0
             && next.min_replay_slots > 0
             && next.timelock_seconds > 0
             && next.proposal_expiry_seconds > next.timelock_seconds
-            && next.verifiers[0] != next.verifiers[1];
+            && active.is_some_and(|keys| {
+                keys.iter()
+                    .enumerate()
+                    .all(|(index, key)| *key != Pubkey::default() && !keys[..index].contains(key))
+            });
         let update = Instruction {
             program_id: ID,
             accounts: accounts::QueuePolicy {
@@ -137,6 +142,70 @@ impl FuzzTest {
                 .owner()
                 == &ID,
             valid
+        );
+    }
+
+    fn validate_orphan_buffer_reclaim(&mut self) {
+        let addresses = &self.fuzz_accounts;
+        let buffer = Pubkey::new_from_array([63; 32]);
+        let recipient = Pubkey::new_from_array([64; 32]);
+        let (reservation, _) = Pubkey::find_program_address(
+            &[b"buffer", addresses.config.as_ref(), buffer.as_ref()],
+            &ID,
+        );
+        let reserved = self.trident.random_from_range(0..=1) == 1;
+        let gate_authority = self.trident.random_from_range(0..=1) == 1;
+        let same_spill = self.trident.random_from_range(0..=1) == 1;
+        let spill = if same_spill { buffer } else { recipient };
+        let authority = if gate_authority {
+            addresses.config
+        } else {
+            addresses.governance
+        };
+        let state = loader::UpgradeableLoaderState::Buffer {
+            authority_address: Some(authority),
+        };
+        let mut data = bincode::serialize(&state).unwrap();
+        data.extend_from_slice(&[0; 16]);
+        let mut account = AccountSharedData::new(LAMPORTS_PER_SOL, data.len(), &loader::ID);
+        account.set_data_from_slice(&data);
+        self.trident.set_account_custom(&buffer, &account);
+        self.trident.airdrop(&recipient, LAMPORTS_PER_SOL);
+        if reserved {
+            self.trident.set_account_custom(
+                &reservation,
+                &AccountSharedData::new(LAMPORTS_PER_SOL, 8, &ID),
+            );
+        }
+        let instruction = Instruction {
+            program_id: ID,
+            accounts: accounts::ReclaimOrphanBuffer {
+                governance_authority: addresses.governance,
+                config: addresses.config,
+                buffer,
+                reservation,
+                spill,
+                loader_program: loader::ID,
+            }
+            .to_account_metas(None),
+            data: instruction::ReclaimOrphanBuffer {}.data(),
+        };
+        let valid = !reserved && gate_authority && !same_spill;
+        let result = self
+            .trident
+            .process_transaction(&[instruction], Some("reclaim_orphan_buffer"));
+        assert_eq!(result.is_success(), valid, "{:?}", result.logs());
+        assert_eq!(
+            self.trident.get_account(&buffer).lamports(),
+            if valid { 0 } else { LAMPORTS_PER_SOL }
+        );
+        assert_eq!(
+            self.trident.get_account(&recipient).lamports(),
+            if valid {
+                2 * LAMPORTS_PER_SOL
+            } else {
+                LAMPORTS_PER_SOL
+            }
         );
     }
 
@@ -461,6 +530,7 @@ impl FuzzTest {
 enum Scenario {
     Policy,
     Reclaim,
+    ReclaimOrphan,
     Transfer,
     Execute,
 }
@@ -470,6 +540,7 @@ fn scenario() -> &'static Scenario {
     SCENARIO.get_or_init(|| match std::env::var("CANARY_FUZZ_SCENARIO").as_deref() {
         Err(_) | Ok("propose_config_update") => Scenario::Policy,
         Ok("reclaim_buffer") => Scenario::Reclaim,
+        Ok("reclaim_orphan_buffer") => Scenario::ReclaimOrphan,
         Ok("transfer_program_authority_guards") => Scenario::Transfer,
         Ok("execute_gated_upgrade_guards") => Scenario::Execute,
         Ok(other) => panic!("unknown fuzz scenario: {other}"),

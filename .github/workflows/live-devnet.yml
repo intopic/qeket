@@ -26,6 +26,7 @@ on:
       - 'scripts/worker_build.py'
       - 'scripts/worker_vote.py'
       - 'scripts/solana_tx.py'
+      - 'scripts/requirements-worker.txt'
       - 'scripts/e2e_verifier.py'
       - 'scripts/ci_tools.sh'
       - 'crates/svm-canary-runner/**'
@@ -49,7 +50,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - run: pip install --disable-pip-version-check solders==0.26.0
+      - run: pip install --disable-pip-version-check solders==0.26.0 -r scripts/requirements-worker.txt
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -77,11 +78,6 @@ jobs:
           DEVNET_PAYER="$(python -c 'from solders.keypair import Keypair;print(Keypair().to_json())')" python scripts/live_cycle.py prepare
       - name: Prepare pinned platform tools
         run: bash scripts/ci_tools.sh
-      - name: Install Solana Verify
-        run: |
-          curl -fsSL --retry 3 --retry-all-errors https://github.com/solana-foundation/solana-verifiable-build/releases/download/v0.4.15/solana-verify-0.4.15-linux -o "$HOME/.cargo/bin/solana-verify"
-          echo "251db253040a3c2637f551eb6627aae792da787a5f8dfdedb59874e13f27c2da  $HOME/.cargo/bin/solana-verify" | sha256sum -c -
-          chmod +x "$HOME/.cargo/bin/solana-verify"
       - name: Build the proposer binaries in offline Docker
         run: bash scripts/live_build.sh
       - name: Build gate and replay client
