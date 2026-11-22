@@ -7,7 +7,7 @@
  *   canary propose  --gate G --target T --multisig M --buffer B --elf PROGRAM.so --commit SHA [--vault-index 0]
  *                   [--spill S] [--replay-slots N] [--max-replay-txs 500] [--squads-program P]
  *   canary status   --gate G --target T [--nonce N]
- *   canary execute  --gate G --target T [--nonce N]
+ *   canary execute  --gate G --target T [--nonce N] [--priority-fee MICROLAMPORTS]
  *
  * RPC_URL (or --rpc) selects the cluster. propose and execute sign with the
  * keypair in CANARY_KEYPAIR (JSON array) or the file given by --keypair.
@@ -16,7 +16,7 @@
  */
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
-import { Connection, Keypair, PublicKey, Transaction, TransactionInstruction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, Keypair, PublicKey, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { accounts, instructions, getProposalPda, getTransactionPda, PROGRAM_ID } from "@sqds/multisig";
 import {
   configAddress, createVaultTransaction, executeGatedUpgrade, LOADER, proposalAddress, proposeBufferUpgrade, vaultAddress,
@@ -61,15 +61,37 @@ export type ProposeOptions = Target & {
   multisigPda: PublicKey; vaultIndex: number; squadsProgram?: PublicKey; buffer: PublicKey; spill?: PublicKey;
   elf: Buffer; commit: string; replaySlots?: bigint; maxReplayTxs: number; creator: PublicKey;
   transactionIndex: bigint; recentBlockhash: string;
+  sleep?: (ms: number) => Promise<void>; bufferAttempts?: number;
 };
+
+const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/**
+ * The Solana CLI confirms the buffer write and the authority handoff at "confirmed".
+ * Wait until the finalized bank holds the built program under the gate's authority.
+ */
+export async function waitForBuffer(rpc: Rpc, buffer: PublicKey, config: PublicKey, elf: Buffer,
+                                    sleep = pause, attempts = 45) {
+  let failure: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const info = await rpc.getAccountInfo(buffer, "finalized");
+    try {
+      if (!info || !info.owner.equals(LOADER)) throw new Error(`no loader-v3 buffer at ${buffer.toBase58()}`);
+      checkBuffer(info.data, config, elf);
+      return;
+    } catch (error) {
+      failure = error;
+    }
+    if (attempt < attempts) await sleep(2000);
+  }
+  throw failure;
+}
 
 /** The Squads vault transaction and proposal that ask the multisig to call `propose_buffer_upgrade`. */
 export async function buildProposal(rpc: Rpc, options: ProposeOptions) {
   if (!/^[0-9a-f]{40}$/.test(options.commit)) throw new Error("--commit must be a full 40-character Git commit hash");
   const { address, config } = await readConfig(rpc, options);
-  const buffer = await rpc.getAccountInfo(options.buffer, "finalized");
-  if (!buffer || !buffer.owner.equals(LOADER)) throw new Error(`no loader-v3 buffer at ${options.buffer.toBase58()}`);
-  checkBuffer(buffer.data, address, options.elf);
+  await waitForBuffer(rpc, options.buffer, address, options.elf, options.sleep, options.bufferAttempts);
   const window = options.replaySlots === undefined
     ? await suggestWindow(rpc, options)
     : { replaySlots: options.replaySlots, expectedTxs: null };
@@ -132,9 +154,13 @@ export async function proposalState(rpc: Rpc, input: Target & { nonce?: bigint }
   };
 }
 
-export async function send(rpc: Rpc, signer: Keypair, ixs: TransactionInstruction[]) {
+/** Upgrading verifies the whole new program, which can take hundreds of thousands of CU. */
+export const EXECUTE_COMPUTE_UNITS = 1_400_000;
+
+export async function send(rpc: Rpc, signer: Keypair, ixs: TransactionInstruction[], priorityFee = 0) {
   const { blockhash, lastValidBlockHeight } = await rpc.getLatestBlockhash("finalized");
-  const tx = new Transaction({ feePayer: signer.publicKey, blockhash, lastValidBlockHeight }).add(...ixs);
+  const price = priorityFee > 0 ? [ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })] : [];
+  const tx = new Transaction({ feePayer: signer.publicKey, blockhash, lastValidBlockHeight }).add(...price, ...ixs);
   tx.sign(signer);
   const signature = await rpc.sendRawTransaction(tx.serialize(), { preflightCommitment: "confirmed" });
   const result = await rpc.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
@@ -155,7 +181,7 @@ export async function main(argv: string[], rpcFor = (url: string) => new Connect
   const { values: flags } = parseArgs({
     args: rest, strict: true,
     options: Object.fromEntries(["gate", "target", "multisig", "vault-index", "buffer", "spill", "elf", "commit",
-      "replay-slots", "max-replay-txs", "squads-program", "nonce", "keypair", "rpc"].map(name => [name, { type: "string" as const }])),
+      "replay-slots", "max-replay-txs", "squads-program", "nonce", "keypair", "rpc", "priority-fee"].map(name => [name, { type: "string" as const }])),
   });
   const need = (name: string) => {
     const value = flags[name];
@@ -169,6 +195,8 @@ export async function main(argv: string[], rpcFor = (url: string) => new Connect
   const rpc = rpcFor(url);
   const maxReplayTxs = Number(flags["max-replay-txs"] ?? 500);
   const nonce = flags.nonce === undefined ? undefined : BigInt(flags.nonce as string);
+  const priorityFee = Number(flags["priority-fee"] ?? 0);
+  if (!Number.isSafeInteger(priorityFee) || priorityFee < 0) throw new Error("--priority-fee must be micro-lamports per CU");
   switch (command) {
     case "window":
       return suggestWindow(rpc, { ...target, maxReplayTxs });
@@ -177,7 +205,9 @@ export async function main(argv: string[], rpcFor = (url: string) => new Connect
     case "execute": {
       const state = await proposalState(rpc, { ...target, nonce });
       if (!state.execution.ready) return { ...state.summary, executed: false };
-      const signature = await send(rpc, loadKeypair(flags.keypair as string | undefined), [state.instruction]);
+      const budget = ComputeBudgetProgram.setComputeUnitLimit({ units: EXECUTE_COMPUTE_UNITS });
+      const signature = await send(rpc, loadKeypair(flags.keypair as string | undefined), [budget, state.instruction],
+                                   priorityFee);
       return { ...state.summary, executed: true, signature };
     }
     case "propose": {
@@ -192,7 +222,7 @@ export async function main(argv: string[], rpcFor = (url: string) => new Connect
         transactionIndex: await nextTransactionIndex(rpc, multisigPda),
         recentBlockhash: (await rpc.getLatestBlockhash("finalized")).blockhash,
       });
-      const signature = await send(rpc, signer, built.instructions);
+      const signature = await send(rpc, signer, built.instructions, priorityFee);
       return { ...built.summary, signature };
     }
     default:
