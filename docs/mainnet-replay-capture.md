@@ -1,0 +1,11 @@
+# Replay windows for continuously active programs
+
+The existing capture proves that tracked accounts were unchanged from the inclusive anchor through their finalized RPC read. It refuses a window when a transaction may have written one of those accounts before capture. Increasing the 8 MiB budget alone cannot reconstruct those writes or establish pre-state.
+
+For a busy Mainnet program, start with an immutable, rooted account state source. Capture account versions with transaction ordering and write versions, reconcile the parent-slot chain with finalized blocks, and retain enough history for the proposal window and delayed discovery. The replay start must use the state immediately before the first transaction at or after the anchor. A snapshot at a finalized bank is usable for a forward window that begins in the next produced bank only if the on-chain window and the archive both commit to that boundary.
+
+Discover the complete read and write account set from finalized transactions before building the archive. Fetch those accounts and the ProgramData, ALT tables and sysvars they depend on from the same rooted boundary. Include the pre-state of accounts created or closed in the window and account for relevant writes by transactions outside the selected target set. Use a bounded spill-to-disk archive per job for programs that exceed the in-memory limit. A missing account version, incomplete block coverage or unresolved write must leave the proposal without a vote.
+
+Measure against a representative busy program with windows covering at least 500 to 1,000 successful target transactions. Log capture coverage, refusals, RPC request count, billed credits, snapshot size, replay CPU/RAM, queue time and proposal-to-notification time separately. The block-based capture reduces request count for slots with multiple matches. Its credit and latency savings depend on provider pricing and the number and size of matching blocks.
+
+The build host already reuses an image named for its Dockerfile while that image remains present. A future GHCR publication should pin the resulting image by digest for both the worker and customer Action, retaining the offline build step. Any persistent dependency cache needs a size budget, dedicated storage, cleanup outside builds and isolation from untrusted code.

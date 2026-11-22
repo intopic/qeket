@@ -36,11 +36,35 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo test --workspace --locked --offline
+          python3 -m pip install --disable-pip-version-check -r scripts/requirements-worker.txt
           python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Build and run the local upgrade
         run: python3 scripts/mvp.py --load-test
       - name: Fuzz signed votes against the gate ELF
         run: target/debug/canary-gate fuzz-votes target/sbpf-solana-solana/release/canary_upgrade_gate.so 20000 1795204278 | tee target/mvp/evidence/vote-fuzz.json
+      - name: Run Trident campaigns against the built gate
+        run: |
+          cd trident-tests
+          cargo build --release --locked --bin fuzz_policy
+          export TRIDENT_WITH_EXIT_CODE=1 FUZZING_METRICS=1 CANARY_FUZZ_ITERATIONS=1000000
+          export TRIDENT_FUZZ_SEED=99a3b7907abc9021042f7f221417ce6faa51fc355c6d93d027e836be36ac5075
+          evidence="$GITHUB_WORKSPACE/target/mvp/evidence/trident"
+          mkdir -p "$evidence"
+          sha256sum ../target/sbpf-solana-solana/release/canary_upgrade_gate.so fuzz_policy/main.rs Cargo.lock > "$evidence/sha256.txt"
+          printf '%s\n' "$GITHUB_SHA" > "$evidence/commit.txt"
+          for scenario in propose_config_update reclaim_buffer reclaim_orphan_buffer transfer_program_authority_guards execute_gated_upgrade_guards; do
+            CANARY_FUZZ_SCENARIO="$scenario" FUZZING_JSON="$evidence/$scenario.json" \
+              target/release/fuzz_policy > "$evidence/$scenario.log" 2>&1 || { tail -80 "$evidence/$scenario.log"; exit 1; }
+            python3 - "$evidence/$scenario.json" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          report = json.loads(Path(sys.argv[1]).read_bytes())
+          rows = report["transactions"].values()
+          assert sum(row["transaction_invoked"] for row in rows) >= int(os.environ["CANARY_FUZZ_ITERATIONS"])
+          assert all(row["transaction_panicked"] == 0 for row in rows)
+          PY
+          done
       - name: Preserve verified binaries and replay evidence
         uses: actions/upload-artifact@v4
         with:

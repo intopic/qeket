@@ -538,7 +538,23 @@ def main():
     print(json.dumps(dict(event="worker_started", cluster=cluster, gate=GATE, attestation=attestor is not None,
                           verifier=keypair.address if keypair else None)), flush=True)
     with closing(sqlite3.connect(args.database)) as database:
-        admissions = Admissions(database, policies, notify)
+        def deliver_notice(name, details):
+            target = details.get("target")
+            customer = None
+            if details.get("proposal"):
+                row = database.execute(
+                    "SELECT customer, payload FROM customer_jobs WHERE gate = ? AND proposal = ?",
+                    (GATE, details["proposal"]),
+                ).fetchone()
+                if row:
+                    customer, payload = row
+                    target = json.loads(payload)["target"]
+            policy = admissions.policies.get(target)
+            # A target can change customers while a proposal is in the queue.
+            url = policy.webhook_url if policy and (customer is None or customer == policy.customer) else None
+            notify(name, details, url)
+
+        admissions = Admissions(database, policies, deliver_notice)
         live_jobs = {}
         interrupted_votes = {}
         # Live pre-state is captured near the anchor and cannot be recovered after
@@ -566,11 +582,11 @@ def main():
                 if len(captures) >= 16:
                     reason = "live capture queue is full"
                     admissions.finish(proposal, datetime.now(timezone.utc), "refused", reason)
-                    notify("ReplayFailed", dict(proposal=proposal, reason=reason))
+                    deliver_notice("ReplayFailed", dict(proposal=proposal, reason=reason))
                     return
                 captures[proposal] = capture_pool.submit(capture_prestate, event, policy.seed_accounts)
                 print(json.dumps(dict(event, customer=customer)), flush=True)
-                notify("ProposalCreated", dict(event, customer=customer))
+                deliver_notice("ProposalCreated", dict(event, customer=customer))
 
         def on_lifecycle(name, event):
             refresh_policies()
@@ -584,7 +600,7 @@ def main():
                     else:
                         observe_upgrade(admissions, live_jobs, running, attestor, event["proposal"],
                                         datetime.now(timezone.utc))
-                notify(name, event)
+                deliver_notice(name, event)
 
         next_capture = 0
         last_checkpoint = 0
@@ -596,15 +612,15 @@ def main():
             nonlocal next_capture, balance_check, low_balance, last_checkpoint
             admissions.checkpoint(slot)
             last_checkpoint = time.monotonic()
-            collect_captures(admissions, captures, live_jobs, datetime.now(timezone.utc), notify)
+            collect_captures(admissions, captures, live_jobs, datetime.now(timezone.utc), deliver_notice)
             if time.monotonic() >= next_capture:
                 refresh_policies()
                 if attestor is not None:
                     for proposal in list(attestor.pending_cleanup):
                         attestor.discard(proposal)
                 now = datetime.now(timezone.utc)
-                reconcile_votes(admissions, interrupted_votes, now, notify)
-                check_live_traffic(admissions, live_jobs, slot, now, notify, attestor, executor, running)
+                reconcile_votes(admissions, interrupted_votes, now, deliver_notice)
+                check_live_traffic(admissions, live_jobs, slot, now, deliver_notice, attestor, executor, running)
                 next_capture = time.monotonic() + 30
             if verifier_address and time.monotonic() >= balance_check:
                 balance_check = time.monotonic() + 300

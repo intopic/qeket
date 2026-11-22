@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, Mock, patch
 
 from devnet import from_base58, to_base58
 from solana_tx import (INSTRUCTIONS_SYSVAR, Keypair, anchor_discriminator, attestation_payload,
@@ -128,6 +128,18 @@ class AttestationTest(unittest.TestCase):
             discard_job_files(job)
             self.assertEqual(sorted(p.name for p in job.iterdir()), ["evidence.json"])
 
+    def test_pending_vote_rebroadcasts_until_confirmed(self):
+        clock = [0]
+        confirmed = {"confirmationStatus": "confirmed", "err": None}
+        finalized = {"confirmationStatus": "finalized", "err": None}
+        statuses = [None, None, None, confirmed, confirmed, finalized]
+        rebroadcast = Mock()
+        with patch("worker_vote.time.monotonic", side_effect=lambda: clock[0]), patch(
+                "worker_vote.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), patch(
+                "worker_vote.rpc", side_effect=[{"value": [value]} for value in statuses]):
+            worker_vote.wait_finalized("signature", rebroadcast=rebroadcast)
+        rebroadcast.assert_called_once_with()
+
     def test_gate_refusals_are_final(self):
         event = dict(target=to_base58(bytes([1]) * 32), nonce=0, anchor_slot=1, replay_slots=2,
                      proposal=to_base58(bytes([2]) * 32))
@@ -191,15 +203,25 @@ class AttestationTest(unittest.TestCase):
             def refuse():
                 raise VoteRefused("proposal or customer authorization expired or changed")
 
-            with patch("worker_vote.rpc", side_effect=rpc), patch("worker_vote.wait_finalized") as finalized:
+            with patch("worker_vote.rpc", side_effect=rpc), patch("worker_vote.wait_finalized") as finalized, patch(
+                    "worker_vote.transaction", wraps=transaction) as signed, patch.dict(
+                    os.environ, {"CANARY_VOTE_PRIORITY_FEE": "1200"}):
                 with self.assertRaisesRegex(VoteRefused, "authorization"):
                     worker_vote.submit_vote(event, bundle, evidence, KEYPAIR, gate, refuse, job)
                 # Nothing was signed, recorded or sent.
                 self.assertEqual((sent, list(job.iterdir())), ([], []))
                 self.assertEqual(worker_vote.submit_vote(event, bundle, evidence, KEYPAIR, gate, lambda: None, job),
                                  "sig")
-            finalized.assert_called_once_with("sig")
-        (intent, raw), = sent
+                finalized.assert_called_once_with("sig", rebroadcast=ANY)
+                finalized.call_args.kwargs["rebroadcast"]()
+            signed.assert_called_once()
+            budget, verify, submit = signed.call_args.args[1]
+            self.assertEqual(budget, ("ComputeBudget111111111111111111111111111111", [], struct.pack("<BQ", 3, 1200)))
+            self.assertEqual(verify[0], "Ed25519SigVerify111111111111111111111111111")
+            self.assertEqual(submit[0], gate)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0], sent[1])
+        intent, raw = sent[0]
         # The receipt names the exact transaction, so a restart can settle it.
         self.assertEqual(intent["signature"], to_base58(raw[1:65]))
         self.assertEqual((intent["last_height"], intent["verifier"], intent["buffer"]), (77, KEYPAIR.address,

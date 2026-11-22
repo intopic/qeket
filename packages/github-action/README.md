@@ -8,6 +8,8 @@ Runs the `canary` CLI from `packages/squads-adapter` in a client's repository.
 | `status` | Reports the latest proposal: votes, window, expiry, and whether it can execute. |
 | `execute` | Calls `execute_gated_upgrade` once quorum and the timelock allow. Before that it reports why it waited and exits successfully. |
 
+For `propose` and `execute`, optional `priority-fee` sets the compute-unit price in micro-lamports. It defaults to `0`.
+
 The multisig members still approve the Squads proposal themselves. The Canary verifiers then see the gate's `ProposalCreated` event, rebuild, replay and vote.
 
 ## Example

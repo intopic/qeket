@@ -16,6 +16,7 @@ from devnet import to_base58
 from fly_listener import Admissions, GATE, customer_policies
 from live_capture import EMERGENCY, GATE as EVENT_GATE, UPGRADE, UnsupportedReplayVersion, capture, gate_events
 from worker_http import start_http
+from worker_notify import post_customer, public_address
 
 
 class WorkerTest(unittest.TestCase):
@@ -32,19 +33,68 @@ class WorkerTest(unittest.TestCase):
                 return 104
             if method == "getSignaturesForAddress":
                 return [dict(slot=102, signature=sig, err=None) for sig in ("unrelated", "target-v1")]
-            if method == "getTransaction":
+            if method == "getBlock":
                 self.assertEqual(args[1]["maxSupportedTransactionVersion"], 1)
-                called = other if args[0] == "unrelated" else target
-                return dict(slot=102, version=1, meta=dict(err=None, innerInstructions=[]),
-                            transaction={"message": {"accountKeys": [target, other],
-                                                     "instructions": [{"programIdIndex": [target, other].index(called)}]}})
+                self.assertEqual(args[1]["encoding"], "json")
+                return {"transactions": [
+                    dict(version=1, meta=dict(err=None, innerInstructions=[]),
+                         transaction={"signatures": [sig],
+                                      "message": {"accountKeys": [target, other],
+                                                  "instructions": [{"programIdIndex": index}]}})
+                    for sig, index in [("unrelated", 1), ("target-v1", 0)]
+                ]}
             self.fail(f"unexpected RPC call {method}")
 
         with patch("live_capture.rpc", side_effect=rpc):
             with self.assertRaisesRegex(UnsupportedReplayVersion, "target-v1"):
                 capture(snapshot, 500)
-        self.assertEqual([args[0] for method, args in calls if method == "getTransaction"],
-                         ["unrelated", "target-v1"])
+        self.assertEqual([method for method, _ in calls].count("getBlock"), 1)
+
+    def test_same_slot_records_share_two_block_reads(self):
+        target_bytes = bytes([4]) * 32
+        target = to_base58(target_bytes)
+        signature_bytes = [bytes([value]) * 64 for value in (1, 2)]
+        signatures = list(map(to_base58, signature_bytes))
+        entries = [dict(slot=102, signature=sig, err=None) for sig in reversed(signatures)]
+        decoded = [
+            {"meta": dict(err=None, innerInstructions=[]), "transaction": {
+                "signatures": [sig], "message": {"accountKeys": [target], "instructions": [{"programIdIndex": 0}]},
+            }} for sig in signatures
+        ]
+        encoded = [{"transaction": [base64.b64encode(b"\x01" + raw).decode(), "base64"]}
+                   for raw in signature_bytes]
+        snapshot = dict(target=list(target_bytes), anchor_slot=100, replay_slots=2)
+        calls = []
+        def rpc(method, *args):
+            if method == "getSlot":
+                return 104
+            if method == "getSignaturesForAddress":
+                return entries
+            self.assertEqual(method, "getBlock")
+            mode = args[1]["encoding"]
+            calls.append(mode)
+            return {"blockhash": "finalized", "transactions": decoded if mode == "json" else encoded}
+        with patch("live_capture.rpc", side_effect=rpc):
+            archive = capture(snapshot, 2)
+        self.assertEqual(calls, ["json", "base64"])
+        self.assertEqual([record["index"] for record in archive["records"]], [0, 1])
+        self.assertEqual([bytes.fromhex(record["transaction"])[1:] for record in archive["records"]], signature_bytes)
+
+    def test_customer_webhook_rejects_mixed_dns_and_never_follows_redirects(self):
+        addresses = [(None, None, None, None, (ip, 443)) for ip in ("8.8.8.8", "127.0.0.1")]
+        with patch("worker_notify.socket.getaddrinfo", return_value=addresses):
+            with self.assertRaisesRegex(ValueError, "non-public"):
+                public_address("customer.example", 443)
+        with patch("worker_notify.HTTPSConnection") as connection, patch(
+                "worker_notify.public_address", return_value="8.8.8.8"):
+            conn = connection.return_value
+            conn.port = 443
+            conn.getresponse.return_value.status = 307
+            with self.assertRaises(OSError):
+                post_customer("https://customer.example/events", "{}")
+            connection.assert_called_once_with("customer.example", 443, timeout=3)
+            conn.request.assert_called_once()
+            conn.close.assert_called_once()
 
     def test_finalized_gate_lifecycle_decoding(self):
         proposal = bytes([1]) * 32

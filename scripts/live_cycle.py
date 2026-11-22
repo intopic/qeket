@@ -37,7 +37,7 @@ def prepare():
     PRIVATE.mkdir(mode=0o700, exist_ok=True)
     for name, secret in [("payer", "DEVNET_PAYER"), ("gate", "GATE_PROGRAM_KEYPAIR")]:
         if name == "gate" and not os.environ.get(secret):
-            kp = Keypair.from_seed(hashlib.sha256(bytes(key("payer").sign_message(b"canary-devnet-single-verifier-v1"))).digest())
+            kp = Keypair.from_seed(hashlib.sha256(bytes(key("payer").sign_message(f"canary-devnet-single-verifier:{os.environ['GITHUB_RUN_ID']}".encode()))).digest())
         else:
             kp = Keypair.from_bytes(bytes(json.loads(os.environ[secret])))
         (PRIVATE / name).write_text(kp.to_json())
@@ -90,6 +90,8 @@ def run():
     OUT.mkdir(parents=True, exist_ok=True)
     gate, target, buf, payer, counter, traffic = [key(n).pubkey() for n in ("gate","target","buffer","payer","counter","traffic")]
     live_capture.GATE = str(gate)
+    (OUT / "gate-program-id.txt").write_text(str(gate) + "\n", encoding="utf-8")
+    print(f"Gate program ID: {gate}", flush=True)
     def pda(*seeds, owner=gate):
         return Pubkey.find_program_address(list(map(bytes, seeds)), owner)[0]
     def ix(name, metas, data=b""):
@@ -145,7 +147,7 @@ def run():
     sha = hashlib.sha256(candidate.read_bytes()).digest()
     commit = os.environ["GITHUB_SHA"]
     sig = send("propose_buffer_upgrade",[ix("propose_buffer_upgrade",[meta(payer,True,True),meta(payer,False,True),meta(cfg,True),meta(pd),meta(buf),meta(proposal,True),meta(reservation,True),meta(system)],bytes(payer)+sha+bytes.fromhex(commit)+bytes(1)+pack("<Q",span))])
-    logs = rpc("getTransaction",sig,dict(FINAL,encoding="json",maxSupportedTransactionVersion=0))["meta"]["logMessages"]
+    logs = rpc("getTransaction",sig,dict(FINAL,encoding="json",maxSupportedTransactionVersion=1))["meta"]["logMessages"]
     event, = proposals(logs)
     if event["proposal"] != str(proposal) or event["target"] != str(target) or event["replay_slots"] != span:
         raise ValueError("unexpected proposal event")
@@ -184,7 +186,7 @@ def run():
     for entry in reversed(history):
         if entry["err"] is not None:
             continue
-        logs = rpc("getTransaction", entry["signature"], dict(FINAL, encoding="json", maxSupportedTransactionVersion=0))["meta"]["logMessages"]
+        logs = rpc("getTransaction", entry["signature"], dict(FINAL, encoding="json", maxSupportedTransactionVersion=1))["meta"]["logMessages"]
         if any("Instruction: SubmitVerifiedAttestation" in line for line in logs):
             receipt("worker vote (submit_verified_attestation)", entry["signature"])
     with (OUT / "transactions.md").open("a") as report:
