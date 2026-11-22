@@ -17,7 +17,7 @@ class NoRedirect(HTTPRedirectHandler):
 PUBLIC_V6 = ip_network("2000::/3")
 
 CUSTOMER_NOTICES = {"ProposalCreated", "VoteSubmitted", "ReplayFailed", "CandidateRejected",
-                    "UpgradeExecuted", "EmergencyOverrideTriggered"}
+                    "UpgradeExecuted", "EmergencyOverrideTriggered", "ProposalWithdrawn"}
 
 
 def public_addresses(host, port):

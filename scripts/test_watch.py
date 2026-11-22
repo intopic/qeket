@@ -140,6 +140,75 @@ class WatchTest(unittest.TestCase):
         with patch("live_capture.rpc", side_effect=rpc), self.assertRaisesRegex(RuntimeError, "-32602"):
             live_capture.watch(100, wait=lambda _: None)
 
+    def test_throttled_or_unreachable_endpoint_backs_off_without_stopping(self):
+        """A restart would drop every captured pre-state, so an RPC outage only delays the cursor."""
+        failures = [RuntimeError("getSlot: HTTP 429"), RuntimeError("getSlot: HTTP 503"),
+                    ConnectionResetError("connection reset"), RuntimeError("getSlot: endpoint unavailable")]
+        failures += [RuntimeError("getSlot: HTTP 429")] * 6
+
+        def rpc(method, *params):
+            if failures:
+                raise failures.pop(0)
+            if method == "getSlot":
+                return 120
+            if method == "getSignaturesForAddress":
+                return []
+            raise AssertionError(method)
+
+        checkpoints, waits = [], []
+
+        def checkpoint(cursor):
+            checkpoints.append(cursor)
+            raise Stop
+
+        with patch("live_capture.rpc", side_effect=rpc), patch("builtins.print") as log, self.assertRaises(Stop):
+            live_capture.watch(100, checkpoint=checkpoint, wait=waits.append)
+        # Exponential backoff, capped. The range is read again from the same cursor.
+        self.assertEqual(waits, [2, 4, 8, 16, 32, 60, 60, 60, 60, 60])
+        self.assertEqual(checkpoints, [121])
+        first = log.call_args_list[0].args[0]
+        self.assertIn('"event": "rpc_unavailable"', first)
+        self.assertIn("HTTP 429", first)
+
+    def test_backoff_resets_after_a_complete_read(self):
+        failures = [RuntimeError("getSlot: HTTP 429")]
+        calls = {"getSlot": 0}
+
+        def rpc(method, *params):
+            if method == "getSlot":
+                calls["getSlot"] += 1
+                if calls["getSlot"] == 3:
+                    failures.append(RuntimeError("getSlot: HTTP 429"))
+                if failures:
+                    raise failures.pop(0)
+                return 100 + calls["getSlot"]
+            return []
+
+        checkpoints, waits = [], []
+
+        def checkpoint(cursor):
+            checkpoints.append(cursor)
+            if len(checkpoints) == 2:
+                raise Stop
+
+        with patch("live_capture.rpc", side_effect=rpc), patch("builtins.print"), self.assertRaises(Stop):
+            live_capture.watch(100, checkpoint=checkpoint, wait=waits.append)
+        self.assertEqual(waits, [2, 2])
+
+
+class LifecycleEventTest(unittest.TestCase):
+    def test_cancellation_and_policy_update_are_decoded(self):
+        proposal, config = bytes([7]) * 32, bytes([8]) * 32
+        raws = [live_capture.CANCELLED + proposal, live_capture.POLICY_UPDATED + config + struct.pack("<Q", 1 << 32),
+                # Another program's event with the same length is ignored.
+                bytes(8) + proposal]
+        logs = [f"Program {GATE} invoke [1]"] + ["Program data: " + base64.b64encode(raw).decode() for raw in raws]
+        logs.append(f"Program {GATE} success")
+        self.assertEqual(list(live_capture.gate_events(logs)), [
+            ("ProposalCancelled", {"proposal": live_capture.to_base58(proposal)}),
+            ("PolicyUpdated", {"config": live_capture.to_base58(config), "next_nonce": 1 << 32}),
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

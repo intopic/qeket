@@ -17,6 +17,7 @@ from devnet import check_cluster, from_base58
 from live_capture import GATE, rpc, watch
 from live_prestate import PrestateRefused, capture_prestate, replay_archive
 from worker_build import FEATURE, BuildFailed, build_candidate, remote_build
+from solana_tx import find_program_address
 from worker_http import start_http
 from worker_notify import notify
 from worker_vote import (CandidateRejected, ReplayIncomplete, VoteRefused, attest, discard_job_files, finalized_vote,
@@ -327,7 +328,8 @@ def attest_job(event, bundle, policy, attestor):
     except VoteRefused as exc:
         return "refused", f"vote refused: {exc}", "ReplayFailed"
     except (OSError, RuntimeError) as exc:
-        print(json.dumps(dict(event="attestation_retry", proposal=proposal, error=type(exc).__name__)), flush=True)
+        print(json.dumps(dict(event="attestation_retry", proposal=proposal,
+                              error=f"{type(exc).__name__}: {str(exc)[:300]}")), flush=True)
         return None
     except (ValueError, KeyError, TypeError):
         return "refused", "invalid verifier evidence", "ReplayFailed"
@@ -345,8 +347,9 @@ def verify_job(event, bundle, policy, limit, attestor):
     if "archive" not in bundle:
         try:
             archive = replay_archive(event, bundle, limit)
-        except (OSError, RuntimeError):
-            print(json.dumps(dict(event="traffic_preflight_retry", proposal=event["proposal"])), flush=True)
+        except (OSError, RuntimeError) as exc:
+            print(json.dumps(dict(event="traffic_preflight_retry", proposal=event["proposal"],
+                                  error=f"{type(exc).__name__}: {str(exc)[:300]}")), flush=True)
             return None, None
         except ValueError as exc:
             return None, ("refused", str(exc), "ReplayFailed")
@@ -380,6 +383,41 @@ def observe_upgrade(admissions, live_jobs, running, attestor, proposal, now):
         admissions.record_executed(proposal)
 
 
+def withdrawn_jobs(admissions, name, event):
+    """Active jobs whose proposal can no longer execute, with the reason.
+
+    `cancel_proposal` ends one proposal. Applying a policy update starts a new
+    proposal generation, and the gate refuses every open proposal of the old one.
+    """
+    jobs = admissions.active_jobs()
+    if name == "ProposalCancelled":
+        return [(job["proposal"], "proposal cancelled by governance") for job in jobs
+                if job["proposal"] == event["proposal"]]
+    if name == "PolicyUpdated":
+        return [(job["proposal"], "gate policy changed; the proposal can no longer execute") for job in jobs
+                if job.get("nonce", 0) < event["next_nonce"]
+                and find_program_address([b"gatekeeper_cfg", from_base58(job["target"])], GATE)[0] == event["config"]]
+    return []
+
+
+def observe_withdrawal(admissions, live_jobs, captures, attestor, proposal, now, reason, on_notice):
+    """Close a job whose proposal was withdrawn, so the customer's next proposal is admitted.
+
+    A running replay or vote is stopped by check_live_traffic first, as on expiry.
+    """
+    capture = captures.pop(proposal, None)
+    if capture is not None:
+        capture.cancel()
+    bundle = live_jobs.get(proposal)
+    if bundle is not None:
+        bundle["withdrawn"] = reason
+        return
+    if admissions.finish(proposal, now, "cancelled", reason):
+        if attestor is not None:
+            attestor.discard(proposal)
+        on_notice("ProposalWithdrawn", dict(proposal=proposal, reason=reason))
+
+
 def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attestor=None, executor=None, running=None):
     """Start, collect and close verification jobs. Never waits for a job to finish.
 
@@ -398,7 +436,9 @@ def check_live_traffic(admissions, live_jobs, next_slot, now, on_notice, attesto
             continue
         policy = admissions.policies.get(event["target"])
         outcome = None
-        if policy is None or not policy.active or now >= policy.expires:
+        if bundle.get("withdrawn"):
+            outcome = "cancelled", bundle["withdrawn"], "ProposalWithdrawn"
+        elif policy is None or not policy.active or now >= policy.expires:
             outcome = "refused", "customer inactive", "ReplayFailed"
         elif now.timestamp() > bundle["expires_at"]:
             outcome = "refused", "proposal expired", "ReplayFailed"
@@ -464,6 +504,10 @@ def collect_captures(admissions, captures, live_jobs, now, on_notice):
                 raise PrestateRefused("live pre-state cache is full")
         except Exception as exc:
             reason = str(exc) if isinstance(exc, PrestateRefused) else "unable to read consistent live pre-state"
+            # The customer gets the generic reason. The operator log keeps the
+            # cause, for example a throttled endpoint (HTTP 429).
+            print(json.dumps(dict(event="prestate_capture_failed", proposal=proposal,
+                                  error=f"{type(exc).__name__}: {str(exc)[:300]}")), flush=True)
             if admissions.finish(proposal, now, "refused", reason):
                 on_notice("ReplayFailed", dict(proposal=proposal, reason=reason))
             continue
@@ -592,6 +636,11 @@ def main():
 
         def on_lifecycle(name, event):
             refresh_policies()
+            if name in ("ProposalCancelled", "PolicyUpdated"):
+                for proposal, reason in withdrawn_jobs(admissions, name, event):
+                    observe_withdrawal(admissions, live_jobs, captures, attestor, proposal,
+                                       datetime.now(timezone.utc), reason, deliver_notice)
+                return
             if event["target"] in admissions.policies:
                 if name == "UpgradeExecuted":
                     capture_task = captures.pop(event["proposal"], None)
