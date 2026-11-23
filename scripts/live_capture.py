@@ -9,6 +9,7 @@ import struct
 import time
 import urllib.request
 import urllib.error
+from http.client import HTTPException
 from pathlib import Path
 
 # GENESIS is Devnet's. live_cycle, the Devnet rehearsal, imports it from here.
@@ -18,7 +19,11 @@ GATE = os.environ.get("GATE_PROGRAM_ID", GATE)
 EVENT = hashlib.sha256(b"event:ProposalCreated").digest()[:8]
 UPGRADE = hashlib.sha256(b"event:UpgradeExecuted").digest()[:8]
 EMERGENCY = hashlib.sha256(b"event:EmergencyOverrideTriggered").digest()[:8]
+CANCELLED = hashlib.sha256(b"event:ProposalCancelled").digest()[:8]
+POLICY_UPDATED = hashlib.sha256(b"event:PolicyUpdated").digest()[:8]
 FINAL = {"commitment": "finalized"}
+# Longest wait between reads while the endpoint is throttled or unreachable.
+MAX_RPC_BACKOFF = 60
 
 
 def rpc(method, *params):
@@ -72,6 +77,12 @@ def gate_events(logs):
             elif len(raw) == 104 and raw.startswith(EMERGENCY):
                 yield "EmergencyOverrideTriggered", dict(
                     target=to_base58(raw[8:40]), buffer=to_base58(raw[40:72]), authority=to_base58(raw[72:104]))
+            elif len(raw) == 40 and raw.startswith(CANCELLED):
+                yield "ProposalCancelled", dict(proposal=to_base58(raw[8:40]))
+            elif len(raw) == 48 and raw.startswith(POLICY_UPDATED):
+                # Applying a policy starts a new proposal generation at next_nonce.
+                yield "PolicyUpdated", dict(config=to_base58(raw[8:40]),
+                                            next_nonce=struct.unpack_from("<Q", raw, 40)[0])
 
 
 
@@ -95,6 +106,13 @@ class HistoryLimit(ValueError):
 
 def behind(error):
     return isinstance(error, NodeBehind) or "-32016" in str(error)
+
+
+def unavailable(error):
+    """The endpoint throttled or dropped the request after rpc() retried it. A later read can succeed."""
+    if isinstance(error, (OSError, HTTPException)):
+        return True
+    return re.search(r": (HTTP (429|5\d\d)|endpoint unavailable)$", str(error)) is not None
 
 
 def gate_history(cursor, tip):
@@ -149,12 +167,13 @@ def slot_history(slot):
 def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_lifecycle=None):
     cursor = start if start is not None else rpc("getSlot", FINAL)
     span = 64
+    outages = 0
     while True:
-        tip = min(rpc("getSlot", FINAL), cursor + span - 1)
-        if cursor > tip:
-            wait(1)
-            continue
         try:
+            tip = min(rpc("getSlot", FINAL), cursor + span - 1)
+            if cursor > tip:
+                wait(1)
+                continue
             try:
                 items = gate_history(cursor, tip)
             except HistoryLimit:
@@ -164,12 +183,21 @@ def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_life
                 # One busy slot cannot be split. Its block read is retried
                 # like any other history read.
                 items = slot_history(cursor)
-        except RuntimeError as exc:
-            if not behind(exc):
-                raise
+        except (RuntimeError, OSError, HTTPException) as exc:
             # Retry the same range. The cursor moves only after a complete read.
-            wait(1)
+            if behind(exc):
+                wait(1)
+                continue
+            if not unavailable(exc):
+                raise
+            # A throttled or unreachable endpoint must not stop the listener:
+            # a restart would drop every captured pre-state.
+            outages += 1
+            delay = min(MAX_RPC_BACKOFF, 2 ** min(outages, 6))
+            print(json.dumps(dict(event="rpc_unavailable", error=str(exc)[:200], retry_in=delay)), flush=True)
+            wait(delay)
             continue
+        outages = 0
         for entry, item in items:
             for name, event in gate_events(item["meta"]["logMessages"] or []):
                 event = dict(event, slot=entry["slot"], signature=entry["signature"])

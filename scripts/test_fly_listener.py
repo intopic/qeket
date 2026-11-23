@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 from devnet import to_base58
 from fly_listener import (GATE, LIVE_CACHE_BYTES, Admissions, check_live_traffic, collect_captures, customer_policies,
-                          reconcile_votes)
+                          observe_withdrawal, reconcile_votes, withdrawn_jobs)
 from live_prestate import PrestateRefused
 from worker_build import BuildFailed
 from worker_vote import CandidateRejected, ReplayIncomplete, VoteRefused
@@ -351,6 +351,79 @@ class LiveCaptureTest(unittest.TestCase):
                              self.notice)
             self.assertEqual((live, outcome_of(db, closed)), ({}, ("closed", None)))
             self.assertEqual(self.notice.call_count, 1)
+
+    def test_failed_capture_logs_its_cause_for_the_operator(self):
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger, (broken,) = ledger_for(db, self.now, 1)
+            captures = {broken: settled(error=RuntimeError("getProgramAccounts: HTTP 429"))}
+            with patch("builtins.print") as log:
+                collect_captures(ledger, captures, {}, self.now, self.notice)
+            # The customer sees the generic reason, the operator log the cause.
+            self.assertEqual(outcome_of(db, broken), ("refused", "unable to read consistent live pre-state"))
+            logged = json.loads(log.call_args.args[0])
+            self.assertEqual(logged, dict(event="prestate_capture_failed", proposal=broken,
+                                          error="RuntimeError: getProgramAccounts: HTTP 429"))
+
+
+class WithdrawalTest(unittest.TestCase):
+    """A cancelled or invalidated proposal closes its job, so the customer's next proposal is admitted."""
+
+    def setUp(self):
+        self.now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        self.notice = Mock()
+
+    def test_cancel_before_the_capture_finishes_frees_the_customer(self):
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger, (proposal,) = ledger_for(db, self.now, 1)
+            capture, live = Future(), {}
+            captures = {proposal: capture}
+            jobs = withdrawn_jobs(ledger, "ProposalCancelled", {"proposal": proposal})
+            self.assertEqual(jobs, [(proposal, "proposal cancelled by governance")])
+            for job, reason in jobs:
+                observe_withdrawal(ledger, live, captures, None, job, self.now, reason, self.notice)
+            self.assertTrue(capture.cancelled())
+            self.assertEqual((captures, ledger.active_jobs()), ({}, []))
+            self.assertEqual(outcome_of(db, proposal), ("cancelled", "proposal cancelled by governance"))
+            self.notice.assert_called_once_with(
+                "ProposalWithdrawn", {"proposal": proposal, "reason": "proposal cancelled by governance"})
+            # Unrelated cancellations change nothing.
+            self.assertEqual(withdrawn_jobs(ledger, "ProposalCancelled", {"proposal": to_base58(bytes(32))}), [])
+            target, = ledger.policies
+            later = dict(target=target, proposal=to_base58(bytes([99]) * 32), nonce=1, anchor_slot=200,
+                         replay_slots=10)
+            self.assertEqual(ledger.consume(later, self.now, enqueue=True), "c0")
+
+    def test_cancel_during_a_queued_replay_closes_it_without_a_vote(self):
+        attestor, queue, running = Mock(), QueuedExecutor(), {}
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger, (proposal,) = ledger_for(db, self.now, 1)
+            live = {proposal: {"expires_at": self.now.timestamp() + 600}}
+            check_live_traffic(ledger, live, 111, self.now, self.notice, attestor, queue, running)
+            self.assertIn(proposal, running)
+            observe_withdrawal(ledger, live, {}, attestor, proposal, self.now, "proposal cancelled by governance",
+                               self.notice)
+            # The job closes on the next checkpoint, after its worker stops.
+            self.assertEqual(len(ledger.active_jobs()), 1)
+            check_live_traffic(ledger, live, 112, self.now, self.notice, attestor, queue, running)
+            self.assertTrue(queue.futures[0].cancelled())
+            self.assertEqual((ledger.active_jobs(), live, running), ([], {}, {}))
+            self.assertEqual(outcome_of(db, proposal), ("cancelled", "proposal cancelled by governance"))
+        attestor.assert_not_called()
+        self.notice.assert_called_once_with(
+            "ProposalWithdrawn", {"proposal": proposal, "reason": "proposal cancelled by governance"})
+
+    def test_policy_update_withdraws_the_old_generation_of_that_gate_config(self):
+        from solana_tx import find_program_address
+        from devnet import from_base58
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger, (old, other) = ledger_for(db, self.now, 2)
+            targets = {job["proposal"]: job["target"] for job in ledger.active_jobs()}
+            config = find_program_address([b"gatekeeper_cfg", from_base58(targets[old])], GATE)[0]
+            reason = "gate policy changed; the proposal can no longer execute"
+            self.assertEqual(withdrawn_jobs(ledger, "PolicyUpdated", {"config": config, "next_nonce": 1 << 32}),
+                             [(old, reason)])
+            # A proposal of the new generation stays.
+            self.assertEqual(withdrawn_jobs(ledger, "PolicyUpdated", {"config": config, "next_nonce": 0}), [])
 
 
 class InterruptedVoteTest(unittest.TestCase):
