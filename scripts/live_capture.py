@@ -24,6 +24,8 @@ POLICY_UPDATED = hashlib.sha256(b"event:PolicyUpdated").digest()[:8]
 FINAL = {"commitment": "finalized"}
 # Longest wait between reads while the endpoint is throttled or unreachable.
 MAX_RPC_BACKOFF = 60
+# Widest slot range one history read covers, about 27 minutes of slots.
+MAX_SPAN = 4096
 
 
 def rpc(method, *params):
@@ -165,12 +167,19 @@ def slot_history(slot):
 
 
 def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_lifecycle=None):
+    """Report finalized gate events from `start` on, oldest first.
+
+    Each ProposalCreated event carries `seen_at_slot`, the finalized slot the
+    listener had reached when it read the event. After downtime that can be far
+    past the anchor, too late to capture the live pre-state.
+    """
     cursor = start if start is not None else rpc("getSlot", FINAL)
     span = 64
     outages = 0
     while True:
         try:
-            tip = min(rpc("getSlot", FINAL), cursor + span - 1)
+            head = rpc("getSlot", FINAL)
+            tip = min(head, cursor + span - 1)
             if cursor > tip:
                 wait(1)
                 continue
@@ -202,11 +211,14 @@ def watch(start, on_event=print_event, checkpoint=None, wait=time.sleep, on_life
             for name, event in gate_events(item["meta"]["logMessages"] or []):
                 event = dict(event, slot=entry["slot"], signature=entry["signature"])
                 if name == "ProposalCreated":
-                    on_event(event)
+                    on_event(dict(event, seen_at_slot=head))
                 elif on_lifecycle is not None:
                     on_lifecycle(name, event)
         cursor = tip + 1
-        span = min(span * 2, 64)
+        # Quiet ranges widen, so a cursor left behind by downtime catches up in
+        # a few reads instead of one read per 64 slots. Busy ranges still split
+        # on HistoryLimit.
+        span = min(span * 2, MAX_SPAN)
         if checkpoint is not None:
             checkpoint(cursor)
 
