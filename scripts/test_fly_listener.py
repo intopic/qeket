@@ -365,6 +365,45 @@ class LiveCaptureTest(unittest.TestCase):
                                           error="RuntimeError: getProgramAccounts: HTTP 429"))
 
 
+class MissedCaptureTest(unittest.TestCase):
+    """A proposal read after its live-state window is refused without using the customer's quota."""
+
+    def setUp(self):
+        self.target, self.proposal = [to_base58(bytes([n]) * 32) for n in (1, 2)]
+        self.policies = customer_policies(json.dumps({"client": {"targets": [self.target], "seed_accounts": []}}))
+        self.notice = Mock()
+
+    def event(self, seen_at_slot, target=None):
+        event = dict(target=target or self.target, proposal=self.proposal, nonce=0, anchor_slot=1000,
+                     replay_slots=256)
+        if seen_at_slot is not None:
+            event["seen_at_slot"] = seen_at_slot
+        return event
+
+    def test_late_proposal_is_refused_with_a_notice_and_no_admission(self):
+        from fly_listener import MISSED_CAPTURE, missed_capture
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger = Admissions(db, self.policies)
+            with patch("builtins.print") as log:
+                self.assertTrue(missed_capture(ledger, self.event(1033), self.notice))
+            self.assertEqual(json.loads(log.call_args.args[0])["event"], "proposal_missed")
+            self.notice.assert_called_once_with(
+                "ReplayFailed", {"proposal": self.proposal, "target": self.target, "reason": MISSED_CAPTURE})
+            self.assertEqual(db.execute("SELECT count(*) FROM admissions").fetchone(), (0,))
+            self.assertEqual(ledger.active_jobs(), [])
+
+    def test_proposals_inside_the_window_or_of_other_customers(self):
+        from fly_listener import missed_capture
+        with closing(sqlite3.connect(":memory:")) as db:
+            ledger = Admissions(db, self.policies)
+            # At the drift limit the capture can still succeed.
+            self.assertFalse(missed_capture(ledger, self.event(1032), self.notice))
+            self.assertFalse(missed_capture(ledger, self.event(None), self.notice))
+            # Another gate user's late proposal is skipped silently.
+            self.assertTrue(missed_capture(ledger, self.event(5000, to_base58(bytes([9]) * 32)), self.notice))
+        self.notice.assert_not_called()
+
+
 class WithdrawalTest(unittest.TestCase):
     """A cancelled or invalidated proposal closes its job, so the customer's next proposal is admitted."""
 

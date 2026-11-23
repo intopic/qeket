@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 from devnet import check_cluster, from_base58
 from live_capture import GATE, rpc, watch
-from live_prestate import PrestateRefused, capture_prestate, replay_archive
+from live_prestate import MAX_ANCHOR_DRIFT, PrestateRefused, capture_prestate, replay_archive
 from worker_build import FEATURE, BuildFailed, build_candidate, remote_build
 from solana_tx import find_program_address
 from worker_http import start_http
@@ -383,6 +383,29 @@ def observe_upgrade(admissions, live_jobs, running, attestor, proposal, now):
         admissions.record_executed(proposal)
 
 
+MISSED_CAPTURE = ("this verifier read the proposal after its live-state window had passed "
+                  "and will not vote on it; create a new proposal")
+
+
+def missed_capture(admissions, event, on_notice):
+    """Refuse a proposal read too late for its live pre-state, without using the customer's quota.
+
+    After downtime the listener reads past events. Once the finalized slot is
+    beyond anchor + MAX_ANCHOR_DRIFT, capture_prestate can only refuse, so the
+    job is not admitted. The customer learns that this verifier will not vote.
+    """
+    head = event.get("seen_at_slot")
+    if head is None or head <= event["anchor_slot"] + MAX_ANCHOR_DRIFT:
+        return False
+    policy = admissions.policies.get(event["target"])
+    if policy is None or not policy.active or datetime.now(timezone.utc) >= policy.expires:
+        return True
+    print(json.dumps(dict(event="proposal_missed", proposal=event["proposal"], customer=policy.customer,
+                          anchor_slot=event["anchor_slot"], seen_at_slot=head)), flush=True)
+    on_notice("ReplayFailed", dict(proposal=event["proposal"], target=event["target"], reason=MISSED_CAPTURE))
+    return True
+
+
 def withdrawn_jobs(admissions, name, event):
     """Active jobs whose proposal can no longer execute, with the reason.
 
@@ -621,6 +644,8 @@ def main():
 
         def on_event(event):
             refresh_policies()
+            if missed_capture(admissions, event, deliver_notice):
+                return
             customer = admissions.consume(event, datetime.now(timezone.utc), enqueue=True)
             if customer is not None:
                 policy = admissions.policies[event["target"]]

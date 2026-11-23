@@ -196,6 +196,57 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(waits, [2, 2])
 
 
+class CatchUpTest(unittest.TestCase):
+    def test_long_gap_is_read_in_widening_ranges_without_skipping_slots(self):
+        """A cursor left 50,000 slots behind by downtime catches up in a few reads, not one per 64 slots."""
+        head = 100 + 50_000
+        ranges = []
+
+        def rpc(method, *params):
+            if method == "getSlot":
+                return head
+            if method == "getSignaturesForAddress":
+                ranges.append(params[1]["minContextSlot"])
+                return []
+            raise AssertionError(method)
+
+        checkpoints = []
+
+        def checkpoint(cursor):
+            checkpoints.append(cursor)
+            if cursor > head:
+                raise Stop
+
+        with patch("live_capture.rpc", side_effect=rpc), self.assertRaises(Stop):
+            live_capture.watch(100, checkpoint=checkpoint, wait=lambda _: None)
+        # Each read covers [previous checkpoint, tip]; the tips are contiguous and end at the head.
+        self.assertEqual(checkpoints, [tip + 1 for tip in ranges])
+        widths = [b - a for a, b in zip([100] + checkpoints, checkpoints)]
+        self.assertEqual(widths[:7], [64, 128, 256, 512, 1024, 2048, 4096])
+        self.assertLessEqual(max(widths), live_capture.MAX_SPAN)
+        self.assertEqual(checkpoints[-1], head + 1)
+        self.assertLess(len(ranges), 20)
+
+    def test_proposal_event_records_the_finalized_slot_it_was_read_at(self):
+        def rpc(method, *params):
+            if method == "getSlot":
+                return 150
+            if method == "getSignaturesForAddress":
+                return [{"slot": 120, "signature": "sig", "err": None}]
+            if method == "getTransaction":
+                return {"meta": {"logMessages": proposal_logs(5)}}
+            raise AssertionError(method)
+
+        events = []
+
+        def checkpoint(cursor):
+            raise Stop
+
+        with patch("live_capture.rpc", side_effect=rpc), self.assertRaises(Stop):
+            live_capture.watch(100, on_event=events.append, checkpoint=checkpoint, wait=lambda _: None)
+        self.assertEqual([(e["slot"], e["anchor_slot"], e["seen_at_slot"]) for e in events], [(120, 90, 150)])
+
+
 class LifecycleEventTest(unittest.TestCase):
     def test_cancellation_and_policy_update_are_decoded(self):
         proposal, config = bytes([7]) * 32, bytes([8]) * 32
